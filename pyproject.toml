@@ -21,6 +21,8 @@ dependencies = [
     "apscheduler>=3.10.4",
     "python-multipart>=0.0.9",
     "python-dateutil>=2.9.0",
+    "boto3>=1.34.0",
+    "greenlet>=3.0.0",
 ]
 
 [project.optional-dependencies]

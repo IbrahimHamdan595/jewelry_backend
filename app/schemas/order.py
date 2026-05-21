@@ -5,7 +5,17 @@ from pydantic import BaseModel
 
 
 class OrderItemIn(BaseModel):
-    product_id: str
+    """Single cart line. Exactly one of product_id / coin_type_id / ounce_type_id
+    must be set; `item_kind` defaults to PRODUCT for backward compat.
+
+    For COIN/OUNCE, quantity is capped at 100 server-side (D6).
+    For PRODUCT (atomic 1-of-1), quantity defaults to 1; each value above 1
+    materialises N OrderItem rows in checkout (D11).
+    """
+    item_kind: str = "PRODUCT"
+    product_id: str | None = None
+    coin_type_id: str | None = None
+    ounce_type_id: str | None = None
     quantity: int = 1
 
 
@@ -17,7 +27,11 @@ class CheckoutRequest(BaseModel):
 
 class OrderItemOut(BaseModel):
     id: str
-    product_id: str
+    item_kind: str
+    product_id: str | None
+    coin_type_id: str | None
+    ounce_type_id: str | None
+    quantity: int
     product_code: str
     product_name: str
     karat: str

@@ -6,7 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.jobs.gold_rate_poller import scheduler, start_gold_rate_poller
-from app.api import auth, categories, gold_price, orders, products, reports
+from app.api import (
+    adjustments, auth, buybacks, categories, coins, gold_price, inventory, ledger,
+    lots, melts, orders, ounces, polish, products, reports, suppliers,
+)
 from app.api import settings as settings_router
 from app.api import staff
 
@@ -38,5 +41,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for r in (auth.router, products.router, orders.router, gold_price.router, settings_router.router, staff.router, reports.router, categories.router):
+for r in (
+    auth.router,
+    products.router,
+    orders.router,
+    gold_price.router,
+    settings_router.router,
+    staff.router,
+    reports.router,
+    categories.router,
+    lots.router,
+    adjustments.router,
+    ledger.router,
+    coins.router,
+    ounces.router,
+    buybacks.router,
+    suppliers.router,
+    suppliers.ap_router,
+    melts.router,
+    polish.router,
+    inventory.router,
+):
     app.include_router(r, prefix="/api")

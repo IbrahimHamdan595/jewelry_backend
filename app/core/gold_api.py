@@ -32,7 +32,16 @@ async def _fetch_goldapi() -> Decimal:
 
 async def _fetch_lbma() -> Decimal:
     """Fallback: use LBMA reference (simplified — returns last known value from a public feed)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://goldprice.org/",
+    }
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         r = await client.get("https://data-asg.goldprice.org/dbXRates/USD")
         r.raise_for_status()
         data = r.json()

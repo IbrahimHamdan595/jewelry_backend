@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     seed_admin_password: str = "ChangeMe123!"
     cloudflare_account_id: str = ""
     cloudflare_api_token: str = ""
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""
+    r2_public_url: str = ""
+    discord_webhook_url: str = ""
+    discord_alert_user_id: str = ""
+    gold_alert_failure_threshold: int = 3
 
 
 settings = Settings()
