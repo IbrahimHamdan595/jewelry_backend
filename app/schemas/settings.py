@@ -21,6 +21,9 @@ class SettingsOut(BaseModel):
     lbp_exchange_rate: Decimal
     receipt_footer: str | None
     gold_refresh_minutes: int
+    default_buyback_margin_mode: str
+    default_buyback_margin_value: Decimal
+    buyback_rate_drift_pct_max: Decimal
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -42,6 +45,9 @@ class SettingsUpdate(BaseModel):
     lbp_exchange_rate: Decimal | None = None
     receipt_footer: str | None = None
     gold_refresh_minutes: int | None = None
+    default_buyback_margin_mode: str | None = None
+    default_buyback_margin_value: Decimal | None = None
+    buyback_rate_drift_pct_max: Decimal | None = None
 
 
 class StaffCreate(BaseModel):
