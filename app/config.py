@@ -21,8 +21,11 @@ class Settings(BaseSettings):
     gold_refresh_minutes: int = 15
     seed_admin_email: str = "owner@maisonzahab.com"
     seed_admin_password: str = "ChangeMe123!"
-    cloudflare_account_id: str = ""
-    cloudflare_api_token: str = ""
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""
+    r2_public_url: str = ""   # e.g. https://pub-xxxx.r2.dev or your custom domain
 
 
 settings = Settings()
