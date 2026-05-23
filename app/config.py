@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     # tries to JSON-parse it. Use the cors_origins property everywhere.
     cors_origins_raw: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
 
+    # Cookie settings — in production (HTTPS cross-origin) set both to True/"none" via env vars.
+    # For local dev keep the defaults (False / "lax").
+    cookie_secure: bool = Field(default=False)
+    cookie_samesite: str = Field(default="lax")
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins_raw.split(",") if o.strip()]
