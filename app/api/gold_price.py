@@ -44,7 +44,7 @@ async def history(range: str = "24h", db: AsyncSession = Depends(get_db)):
     return [GoldRateHistoryPoint(rate_24k=float(r.rate_24k), fetched_at=r.fetched_at) for r in rows]
 
 
-@router.post("/refresh")
+@router.post("/refresh", dependencies=[Depends(require_admin)])
 async def force_refresh(db: AsyncSession = Depends(get_db)):
     rate = await fetch_gold_rate()
     db.add(GoldRateHistory(rate_24k=rate.value, source=rate.source))

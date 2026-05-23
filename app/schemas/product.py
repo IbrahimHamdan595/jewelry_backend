@@ -42,6 +42,12 @@ class ProductOut(BaseModel):
     making_charge: Decimal
     photos: list[dict]
     is_active: bool
+    # Phase 4
+    is_used: bool
+    cost_basis_usd: Decimal | None
+    status: str
+    source_ref_type: str | None
+    source_ref_id: str | None
     created_at: datetime
     updated_at: datetime
 

@@ -9,7 +9,7 @@ from app.core.gold_api import get_current_gold_rate
 from app.core.permissions import require_admin
 from app.core.pricing import KARAT_PURITY, calculate_price, generate_item_code
 from app.deps import get_current_user, get_db
-from app.models import Karat, Product, Settings, User
+from app.models import Karat, Product, ProductStatus, Settings, User
 from app.schemas.product import (
     ProductCreate, ProductListOut, ProductLookupOut, ProductOut, ProductUpdate,
 )
@@ -94,10 +94,16 @@ async def upload_product_image(file: UploadFile = File(...)):
 @router.get("/lookup/{code}", response_model=ProductLookupOut)
 async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
     product = (
-        await db.execute(select(Product).where(Product.code == code, Product.is_active.is_(True)))
+        await db.execute(
+            select(Product).where(
+                Product.code == code,
+                Product.is_active.is_(True),
+                Product.status == ProductStatus.AVAILABLE,
+            )
+        )
     ).scalar_one_or_none()
     if not product:
-        raise HTTPException(status_code=404, detail=f"Product '{code}' not found")
+        raise HTTPException(status_code=404, detail=f"Product '{code}' not available")
 
     rate_info = await get_current_gold_rate(db)
     rate_24k = Decimal(str(rate_info["rate"]))
