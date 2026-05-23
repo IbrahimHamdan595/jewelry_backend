@@ -8,7 +8,7 @@ from app.core.gold_api import get_current_gold_rate
 from app.core.ledger import EVENT_COIN_TYPE_CREATED, EVENT_COIN_TYPE_UPDATED, record
 from app.core.permissions import require_admin
 from app.core.pricing import calculate_unit_price, generate_unit_code
-from app.deps import get_db
+from app.deps import get_current_user, get_db
 from app.models import CoinType, Karat, MarginMode, User
 from app.schemas.unit_stock import (
     UnitPriceOut, UnitTypeCreate, UnitTypeListOut, UnitTypeOut, UnitTypeUpdate,
@@ -38,7 +38,7 @@ async def list_coin_types(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     q = select(CoinType)
     if search:
@@ -109,7 +109,7 @@ async def create_coin_type(
 async def get_coin_type(
     coin_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     coin = (await db.execute(select(CoinType).where(CoinType.id == coin_id))).scalar_one_or_none()
     if not coin:
@@ -121,7 +121,7 @@ async def get_coin_type(
 async def coin_price(
     coin_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     coin = (await db.execute(select(CoinType).where(CoinType.id == coin_id))).scalar_one_or_none()
     if not coin:

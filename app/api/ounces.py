@@ -8,7 +8,7 @@ from app.core.gold_api import get_current_gold_rate
 from app.core.ledger import EVENT_OUNCE_TYPE_CREATED, EVENT_OUNCE_TYPE_UPDATED, record
 from app.core.permissions import require_admin
 from app.core.pricing import calculate_unit_price, generate_unit_code
-from app.deps import get_db
+from app.deps import get_current_user, get_db
 from app.models import Karat, MarginMode, OunceType, User
 from app.schemas.unit_stock import (
     UnitPriceOut, UnitTypeCreate, UnitTypeListOut, UnitTypeOut, UnitTypeUpdate,
@@ -38,7 +38,7 @@ async def list_ounce_types(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     q = select(OunceType)
     if search:
@@ -109,7 +109,7 @@ async def create_ounce_type(
 async def get_ounce_type(
     ounce_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     bar = (await db.execute(select(OunceType).where(OunceType.id == ounce_id))).scalar_one_or_none()
     if not bar:
@@ -121,7 +121,7 @@ async def get_ounce_type(
 async def ounce_price(
     ounce_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(get_current_user),
 ):
     bar = (await db.execute(select(OunceType).where(OunceType.id == ounce_id))).scalar_one_or_none()
     if not bar:

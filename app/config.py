@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
     discord_alert_user_id: str = ""
     gold_alert_failure_threshold: int = 3
+    # Cookie flags for the auth cookie. In dev (localhost http), use lax/false.
+    # In prod with frontend on a different domain over HTTPS, use none/true.
+    cookie_secure: bool = False
+    cookie_samesite: str = "lax"
 
 
 settings = Settings()

@@ -1,17 +1,32 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.core.rate_limit import limiter
 from app.core.security import create_access_token, hash_password, verify_password
-from app.deps import get_current_user, get_db
+from app.deps import AUTH_COOKIE_NAME, get_current_user, get_db
 from app.models import User
 from app.schemas.auth import ChangePasswordRequest, LoginRequest, TokenResponse, UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=settings.jwt_expires_minutes * 60,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite,
+        path="/",
+    )
+
+
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def login(request: Request, response: Response, body: LoginRequest, db: AsyncSession = Depends(get_db)):
     user = (
         await db.execute(select(User).where(User.email == body.email))
     ).scalar_one_or_none()
@@ -22,6 +37,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
 
     token = create_access_token(subject=user.id, extra={"role": user.role.value})
+    _set_auth_cookie(response, token)
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
@@ -31,7 +47,8 @@ async def me(user: User = Depends(get_current_user)):
 
 
 @router.post("/logout", status_code=204)
-async def logout():
+async def logout(response: Response):
+    response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
     return None
 
 
