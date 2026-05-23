@@ -11,6 +11,8 @@ snapshot model, and screen do not change.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -93,6 +95,55 @@ def _round_money(value: Decimal) -> Decimal:
 
 def _empty_grams_by_source() -> dict[str, Decimal]:
     return {src: Decimal("0") for src in _SOURCES}
+
+
+# Fields that participate in the integrity hash. Order is fixed — changing it
+# would invalidate every existing snapshot's hash. If you genuinely need to
+# add a new field to the integrity calculation, bump a hash version prefix
+# and migrate stored hashes; do not silently reorder.
+_INTEGRITY_FIELDS: tuple[str, ...] = (
+    "assessment_date",
+    "gold_rate_24k_usd_per_gram",
+    "gold_rate_source",
+    "nisab_grams_used",
+    "total_au_grams",
+    "total_au_value_usd",
+    "zakat_au_grams",
+    "zakat_value_usd",
+    "meets_nisab",
+    "breakdown_by_karat",
+)
+
+
+def _canonical(value):
+    """Stable, order-deterministic serialization for hashing.
+
+    Decimals → str (preserves trailing zeros that quantize() set).
+    Dates / datetimes → ISO string.
+    Dicts → sorted by key recursively.
+    Everything else falls through to default json behavior.
+    """
+    if isinstance(value, Decimal):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _canonical(value[k]) for k in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    return value
+
+
+def compute_integrity_hash(snapshot_fields: dict) -> str:
+    """sha256 over a canonical JSON dump of the integrity-relevant fields.
+
+    Pure function. Order of dict keys, Decimal precision, and date formatting
+    are all normalized so two equivalent snapshots produce the same hash
+    regardless of insertion order or Python representation.
+    """
+    payload = {f: _canonical(snapshot_fields[f]) for f in _INTEGRITY_FIELDS}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _compute_holdings_from_rows(

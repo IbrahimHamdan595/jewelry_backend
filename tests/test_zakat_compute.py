@@ -174,3 +174,63 @@ def test_unknown_karat_raises():
 def test_by_karat_is_returned_in_canonical_order():
     holdings = _compute_holdings_from_rows(products=[], coins=[], ounces=[], lots=[])
     assert [b.karat for b in holdings.by_karat] == [Karat.K18, Karat.K21, Karat.K22, Karat.K24]
+
+
+# ── Integrity hash ────────────────────────────────────────────────────────────
+
+from datetime import date  # noqa: E402
+
+from app.core.zakat import compute_integrity_hash  # noqa: E402
+
+
+def _sample_snapshot_fields():
+    return {
+        "assessment_date": date(2026, 5, 24),
+        "gold_rate_24k_usd_per_gram": Decimal("144.99"),
+        "gold_rate_source": "live",
+        "nisab_grams_used": Decimal("85.000"),
+        "total_au_grams": Decimal("1585.867"),
+        "total_au_value_usd": Decimal("229934.86"),
+        "zakat_au_grams": Decimal("39.647"),
+        "zakat_value_usd": Decimal("5748.42"),
+        "meets_nisab": True,
+        "breakdown_by_karat": {
+            "K18": {"products": "44.000", "lots": "9.800", "au_grams": "40.350"},
+            "K21": {"products": "33.470", "au_grams": "1210.099"},
+        },
+    }
+
+
+def test_integrity_hash_is_deterministic():
+    a = compute_integrity_hash(_sample_snapshot_fields())
+    b = compute_integrity_hash(_sample_snapshot_fields())
+    assert a == b
+    # sha256 hex digest is 64 chars
+    assert len(a) == 64
+
+
+def test_integrity_hash_changes_when_any_field_changes():
+    base = compute_integrity_hash(_sample_snapshot_fields())
+
+    # Tamper with a money field
+    tampered = _sample_snapshot_fields()
+    tampered["zakat_value_usd"] = Decimal("5748.43")  # 1 cent off
+    assert compute_integrity_hash(tampered) != base
+
+    # Tamper with the breakdown
+    tampered2 = _sample_snapshot_fields()
+    tampered2["breakdown_by_karat"]["K18"]["products"] = "44.001"
+    assert compute_integrity_hash(tampered2) != base
+
+
+def test_integrity_hash_ignores_dict_key_order():
+    """Reorder the breakdown keys — hash must stay the same."""
+    base = compute_integrity_hash(_sample_snapshot_fields())
+
+    fields = _sample_snapshot_fields()
+    # Rebuild breakdown_by_karat with reversed key order at every level
+    fields["breakdown_by_karat"] = {
+        "K21": {"au_grams": "1210.099", "products": "33.470"},
+        "K18": {"au_grams": "40.350", "lots": "9.800", "products": "44.000"},
+    }
+    assert compute_integrity_hash(fields) == base
