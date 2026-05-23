@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SettingsOut(BaseModel):
@@ -24,6 +24,7 @@ class SettingsOut(BaseModel):
     default_buyback_margin_mode: str
     default_buyback_margin_value: Decimal
     buyback_rate_drift_pct_max: Decimal
+    nisab_grams: Decimal
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -48,6 +49,7 @@ class SettingsUpdate(BaseModel):
     default_buyback_margin_mode: str | None = None
     default_buyback_margin_value: Decimal | None = None
     buyback_rate_drift_pct_max: Decimal | None = None
+    nisab_grams: Decimal | None = Field(default=None, gt=0)
 
 
 class StaffCreate(BaseModel):

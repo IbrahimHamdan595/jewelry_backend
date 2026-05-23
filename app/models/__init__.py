@@ -1,10 +1,10 @@
 import enum
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String,
+    JSON, Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -289,6 +289,10 @@ class Settings(Base):
     lbp_exchange_rate: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("89500"))
     receipt_footer: Mapped[str | None] = mapped_column(String, nullable=True)
     gold_refresh_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    # Zakat
+    nisab_grams: Mapped[Decimal] = mapped_column(
+        Numeric(10, 3), nullable=False, default=Decimal("85.000")
+    )
     # Phase 3: buyback defaults
     default_buyback_margin_mode: Mapped[BuybackMarginMode] = mapped_column(
         Enum(BuybackMarginMode, name="buybackmarginmode_enum"),
@@ -579,3 +583,41 @@ class SupplierBalance(Base):
     karat: Mapped[str] = mapped_column(String, primary_key=True, default="")
     balance: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False, default=Decimal("0"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ── Zakat ─────────────────────────────────────────────────────────────────────
+
+class ZakatSnapshot(Base):
+    __tablename__ = "zakat_snapshots"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    taken_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    assessment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    taken_by_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Snapshotted inputs
+    gold_rate_24k_usd_per_gram: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    gold_rate_source: Mapped[str] = mapped_column(String, nullable=False)
+    nisab_grams_used: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False)
+
+    # Computed outputs
+    total_au_grams: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
+    total_au_value_usd: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    zakat_au_grams: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False)
+    zakat_value_usd: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
+    meets_nisab: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    # Per-karat structured breakdown (audit trail).
+    # Shape: {"K18": {"products":"...","coins":"...","ounces":"...","lots":"...","total_grams":"...","au_grams":"..."}, ...}
+    breakdown_by_karat: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    # sha256 over canonical JSON of inputs+outputs; recomputed on read for tamper detection.
+    integrity_hash: Mapped[str] = mapped_column(String, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_zakat_snapshots_assessment_date", "assessment_date"),
+        Index("ix_zakat_snapshots_taken_at", "taken_at"),
+    )
