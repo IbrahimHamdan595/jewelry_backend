@@ -24,10 +24,18 @@ class Settings(BaseSettings):
     gold_api_key: str = ""
     gold_api_url: str = "https://www.goldapi.io/api/XAU/USD"
     gold_refresh_minutes: int = 15
-    seed_admin_email: str = "owner@maisonzahab.com"
-    seed_admin_password: str = "ChangeMe123!"
+    seed_admin_email: str = ""
+    seed_admin_password: str = ""
     cloudflare_account_id: str = ""
     cloudflare_api_token: str = ""
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""
+    r2_public_url: str = ""
+    discord_webhook_url: str = ""
+    discord_alert_user_id: str = ""
+    gold_alert_failure_threshold: int = 3
 
 
 settings = Settings()
