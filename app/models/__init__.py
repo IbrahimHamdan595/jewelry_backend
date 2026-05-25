@@ -119,6 +119,29 @@ class DebtUnit(str, enum.Enum):
     GOLD = "GOLD"
 
 
+# Audit phase B2 — physical stock-take workflow.
+class StockTakeStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    SUBMITTED = "SUBMITTED"
+    CLOSED = "CLOSED"
+
+
+class StockTakeLineResolution(str, enum.Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    NO_VARIANCE = "NO_VARIANCE"
+
+
+class StockTakeRefType(str, enum.Enum):
+    """What a stock-take line counts against. Mirrors a subset of
+    AdjustmentTarget by VALUE — but the mapping between the two is
+    explicit (`app/core/stock_take.py::to_adjustment_target`) and tested.
+    DO NOT assume name parity guarantees correctness."""
+    COIN_STOCK = "COIN_STOCK"
+    OUNCE_STOCK = "OUNCE_STOCK"
+
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class User(Base):
@@ -712,4 +735,105 @@ class ZakatSnapshot(Base):
     __table_args__ = (
         Index("ix_zakat_snapshots_assessment_date", "assessment_date"),
         Index("ix_zakat_snapshots_taken_at", "taken_at"),
+    )
+
+
+# ── Stock-take workflow (audit phase B2) ─────────────────────────────────────
+
+class StockTake(Base):
+    """A physical inventory count session.
+
+    AUDIT: stock_takes is a WORKFLOW table — not append-only. Status legitimately
+    moves DRAFT → SUBMITTED → CLOSED. The audit guarantee for inventory
+    mutations lives in the chained ManualAdjustment / ledger events that
+    APPROVED lines emit through `apply_manual_adjustment_core`. The stock-take
+    row itself is the proposer, not the writer.
+    """
+    __tablename__ = "stock_takes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    started_by_user_id: Mapped[str] = mapped_column(
+        String, ForeignKey("users.id"), nullable=False
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[StockTakeStatus] = mapped_column(
+        Enum(StockTakeStatus, name="stocktakestatus_enum"),
+        nullable=False,
+        default=StockTakeStatus.DRAFT,
+    )
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    lines: Mapped[list["StockTakeLine"]] = relationship(
+        back_populates="stock_take", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_stock_takes_status", "status"),
+        Index("ix_stock_takes_started_at", "started_at"),
+    )
+
+
+class StockTakeLine(Base):
+    """One counted line in a stock-take session.
+
+    AUDIT: on APPROVED resolution, `adjustment_id` is the FK to the
+    ManualAdjustment row that posted the variance. That row is the audit
+    source-of-truth for how `on_hand_qty` actually changed; this row is
+    the workflow record that explains why.
+    """
+    __tablename__ = "stock_take_lines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    stock_take_id: Mapped[str] = mapped_column(
+        String, ForeignKey("stock_takes.id", ondelete="CASCADE"), nullable=False
+    )
+    ref_type: Mapped[StockTakeRefType] = mapped_column(
+        Enum(StockTakeRefType, name="stocktakereftype_enum"), nullable=False
+    )
+    ref_id: Mapped[str] = mapped_column(String, nullable=False)
+    counted_qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Snapshot taken at submit time so variance is stable even if a
+    # concurrent sale changes `on_hand_qty` afterwards.
+    expected_qty_at_submit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    variance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolution: Mapped[StockTakeLineResolution] = mapped_column(
+        Enum(StockTakeLineResolution, name="stocktakelineresolution_enum"),
+        nullable=False,
+        default=StockTakeLineResolution.PENDING,
+    )
+    rejection_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # FK to the ManualAdjustment posted on approval. NULL otherwise.
+    adjustment_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("manual_adjustments.id"), nullable=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_by_user_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    stock_take: Mapped["StockTake"] = relationship(back_populates="lines")
+
+    __table_args__ = (
+        Index("ix_stock_take_lines_parent", "stock_take_id"),
+        Index("ix_stock_take_lines_resolution", "resolution"),
+        # A given coin/ounce type can only appear once per stock-take —
+        # the operator counts each type exactly once.
+        Index(
+            "uq_stock_take_lines_unique_per_take",
+            "stock_take_id", "ref_type", "ref_id",
+            unique=True,
+        ),
     )

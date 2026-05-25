@@ -88,6 +88,16 @@ EVENT_GOLD_RATE_REFRESH_TRIGGERED = "GOLD_RATE_REFRESH_TRIGGERED"
 EVENT_STAFF_CREATED = "STAFF_CREATED"
 EVENT_STAFF_UPDATED = "STAFF_UPDATED"
 
+# Audit phase B2 — stock-take workflow events. These are the workflow
+# wrappers; APPROVE additionally emits a COIN_STOCK_ADJUSTED or
+# OUNCE_STOCK_ADJUSTED event via apply_unit_stock_adjustment_core, with
+# stock_take_line_id in the payload for cross-reference.
+EVENT_STOCK_TAKE_STARTED = "STOCK_TAKE_STARTED"
+EVENT_STOCK_TAKE_SUBMITTED = "STOCK_TAKE_SUBMITTED"
+EVENT_STOCK_TAKE_LINE_APPROVED = "STOCK_TAKE_LINE_APPROVED"
+EVENT_STOCK_TAKE_LINE_REJECTED = "STOCK_TAKE_LINE_REJECTED"
+EVENT_STOCK_TAKE_CLOSED = "STOCK_TAKE_CLOSED"
+
 
 def field_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Return only the fields whose value changed, as {key: {from, to}}.

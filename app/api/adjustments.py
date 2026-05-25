@@ -196,21 +196,54 @@ async def _adjust_product(
     return AdjustmentOut.model_validate(adj)
 
 
-async def _adjust_unit_stock(
-    db,
-    body: AdjustmentCreate,
-    user: User,
+async def apply_unit_stock_adjustment_core(
+    db: AsyncSession,
+    *,
     target_type: AdjustmentTarget,
+    target_id: str,
+    delta: Decimal,
     reason: AdjustmentReason,
-) -> AdjustmentOut:
-    """Apply a quantity delta to a coin_types.on_hand_qty or ounce_types row."""
-    # Quantity is integer; reject fractional deltas.
-    if body.delta != body.delta.to_integral_value():
+    notes: str | None,
+    actor_user_id: str,
+    ledger_extra: dict | None = None,
+) -> ManualAdjustment:
+    """The ONLY code path that mutates CoinType.on_hand_qty / OunceType.on_hand_qty.
+
+    AUDIT (B2): the HTTP POST /adjustments handler calls this; the stock-take
+    approval endpoint calls this. ANY future feature that needs to change
+    coin/ounce stock MUST go through here. A code-review red flag if you
+    see another path directly assigning to `on_hand_qty`.
+
+    Behavior:
+      • Locks the target row with FOR UPDATE.
+      • Validates delta is integer and resulting qty >= 0 (raises 422 otherwise).
+      • Mutates on_hand_qty.
+      • Inserts a ManualAdjustment row.
+      • Writes a COIN_STOCK_ADJUSTED / OUNCE_STOCK_ADJUSTED chained ledger
+        event. `ledger_extra` is merged into the payload — used by stock-take
+        approval to record `stock_take_line_id` for cross-reference.
+      • Does NOT commit. Caller owns the transaction so the audit row, the
+        on_hand_qty change, and any sibling workflow rows all commit together
+        (or roll back together).
+
+    Returns the ManualAdjustment row. Caller may want to flush + refresh
+    before using FK fields.
+    """
+    if target_type not in (AdjustmentTarget.COIN_STOCK, AdjustmentTarget.OUNCE_STOCK):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"apply_unit_stock_adjustment_core only handles COIN_STOCK / "
+                f"OUNCE_STOCK; got {target_type!r}."
+            ),
+        )
+
+    if delta != delta.to_integral_value():
         raise HTTPException(
             status_code=422,
             detail="delta must be an integer for COIN_STOCK / OUNCE_STOCK adjustments",
         )
-    delta_int = int(body.delta)
+    delta_int = int(delta)
 
     if target_type == AdjustmentTarget.COIN_STOCK:
         Model = CoinType
@@ -223,11 +256,11 @@ async def _adjust_unit_stock(
 
     row = (
         await db.execute(
-            select(Model).where(Model.id == body.target_id).with_for_update()
+            select(Model).where(Model.id == target_id).with_for_update()
         )
     ).scalar_one_or_none()
     if not row:
-        raise HTTPException(status_code=404, detail=f"{ref_kind} {body.target_id} not found")
+        raise HTTPException(status_code=404, detail=f"{ref_kind} {target_id} not found")
 
     new_qty = row.on_hand_qty + delta_int
     if new_qty < 0:
@@ -244,29 +277,53 @@ async def _adjust_unit_stock(
 
     adj = ManualAdjustment(
         target_type=target_type,
+        target_id=target_id,
+        delta=delta,
+        reason=reason,
+        notes=notes,
+        actor_user_id=actor_user_id,
+    )
+    db.add(adj)
+    await db.flush()
+
+    payload: dict = {
+        "adjustment_id": adj.id,
+        "delta_qty": delta_int,
+        "reason": reason.value,
+        "notes": notes,
+        "qty_before": prev_qty,
+        "qty_after": new_qty,
+    }
+    if ledger_extra:
+        payload.update(ledger_extra)
+
+    await record(
+        db,
+        event_type=event,
+        actor_user_id=actor_user_id,
+        ref_type=ref_kind,
+        ref_id=row.id,
+        payload=payload,
+    )
+    return adj
+
+
+async def _adjust_unit_stock(
+    db,
+    body: AdjustmentCreate,
+    user: User,
+    target_type: AdjustmentTarget,
+    reason: AdjustmentReason,
+) -> AdjustmentOut:
+    """HTTP-handler thin wrapper around `apply_unit_stock_adjustment_core`."""
+    adj = await apply_unit_stock_adjustment_core(
+        db,
+        target_type=target_type,
         target_id=body.target_id,
         delta=body.delta,
         reason=reason,
         notes=body.notes,
         actor_user_id=user.id,
-    )
-    db.add(adj)
-    await db.flush()
-
-    await record(
-        db,
-        event_type=event,
-        actor_user_id=user.id,
-        ref_type=ref_kind,
-        ref_id=row.id,
-        payload={
-            "adjustment_id": adj.id,
-            "delta_qty": delta_int,
-            "reason": reason.value,
-            "notes": body.notes,
-            "qty_before": prev_qty,
-            "qty_after": new_qty,
-        },
     )
     await db.commit()
     await db.refresh(adj)
