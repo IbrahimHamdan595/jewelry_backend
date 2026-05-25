@@ -23,7 +23,7 @@ from app.core.audit_chain import GENESIS_HASH
 from app.db.base import Base
 # Importing app.models triggers all model class registration on Base.metadata.
 import app.models  # noqa: F401
-from app.models import InventoryLedgerChainHead
+from app.models import AuthAuditChainHead, InventoryLedgerChainHead
 
 
 @pytest_asyncio.fixture
@@ -41,9 +41,13 @@ async def db():
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with session_factory() as session:
-        # Mirror the migration's seed step.
+        # Mirror both migrations' seed steps so tests see the same initial
+        # state production does.
         session.add(
             InventoryLedgerChainHead(id=1, latest_entry_hash=GENESIS_HASH, row_count=0)
+        )
+        session.add(
+            AuthAuditChainHead(id=1, latest_entry_hash=GENESIS_HASH, row_count=0)
         )
         await session.commit()
         yield session

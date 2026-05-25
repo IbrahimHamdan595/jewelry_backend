@@ -64,6 +64,20 @@ _CHAINED_FIELDS: tuple[str, ...] = (
     "payload",
 )
 
+# Auth-audit-log chain — separate from the inventory ledger, different
+# field set, INDEPENDENT chain. Do not unify with _CHAINED_FIELDS; their
+# trust models are different (inventory writes are authenticated, auth
+# writes can be unauthenticated failed-login probes).
+_AUTH_CHAINED_FIELDS: tuple[str, ...] = (
+    "event_type",       # LOGIN_SUCCESS | LOGIN_FAILED | LOGOUT | PASSWORD_CHANGED
+    "occurred_at",
+    "user_id",          # nullable — NULL for failed logins of unknown emails
+    "claimed_email",    # the email submitted to /login; "claimed, unverified" for failures
+    "client_ip",
+    "user_agent",
+    "detail",           # free-form: failure reason, etc.
+)
+
 
 def _canonical(value: Any) -> Any:
     """Deterministic serialization for hashing.
@@ -128,6 +142,60 @@ def compute_ledger_entry_hash(*, prev_hash: str, fields: dict[str, Any]) -> str:
     payload["__prev"] = prev_hash
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_auth_entry_hash(*, prev_hash: str, fields: dict[str, Any]) -> str:
+    """Sibling of `compute_ledger_entry_hash` for the auth-audit chain.
+
+    Same recipe (sha256 over canonical JSON of fields + prev_hash), different
+    required field set (`_AUTH_CHAINED_FIELDS`). Kept as a separate function
+    rather than parameterizing the original so the inventory chain in
+    production is mechanically untouched by this addition.
+    """
+    if not isinstance(prev_hash, str) or not prev_hash:
+        raise ValueError(
+            f"prev_hash must be a non-empty string (use GENESIS_HASH for the "
+            f"first row); got {prev_hash!r}"
+        )
+
+    payload = {f: _canonical(fields[f]) for f in _AUTH_CHAINED_FIELDS}
+    payload["__prev"] = prev_hash
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def verify_auth_chain(rows: Iterable[dict]) -> dict:
+    """Walk an auth-audit-log sequence; same return shape as `verify_chain`.
+
+    Caller passes rows in (occurred_at, id) order.
+    """
+    expected_prev = GENESIS_HASH
+    total = 0
+    for row in rows:
+        total += 1
+        recomputed = compute_auth_entry_hash(
+            prev_hash=row["prev_hash"],
+            fields={f: row[f] for f in _AUTH_CHAINED_FIELDS},
+        )
+        if row["prev_hash"] != expected_prev or row["entry_hash"] != recomputed:
+            return {
+                "status": "broken",
+                "total_rows": total,
+                "first_break": {
+                    "id": row["id"],
+                    "expected_prev_hash": expected_prev,
+                    "actual_prev_hash": row["prev_hash"],
+                    "expected_entry_hash": recomputed,
+                    "actual_entry_hash": row["entry_hash"],
+                },
+            }
+        expected_prev = row["entry_hash"]
+
+    return {
+        "status": "intact" if total > 0 else "empty",
+        "total_rows": total,
+        "first_break": None,
+    }
 
 
 def verify_chain(rows: Iterable[dict]) -> dict:

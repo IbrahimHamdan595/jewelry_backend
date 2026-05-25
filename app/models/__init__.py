@@ -380,6 +380,75 @@ class InventoryLedger(Base):
     )
 
 
+class AuthAuditLog(Base):
+    """Authentication & user-management audit log (audit phase A3b).
+
+    Kept separate from `InventoryLedger` because:
+      • Writes can be unauthenticated (failed logins) and high-volume
+        (bot probes). Mixing them with inventory events would noise up
+        every supplier-debt reconciliation query.
+      • Writes are *best effort* (see `app/core/auth_audit.py`): a logging
+        failure must NEVER block a legitimate login. The inventory ledger
+        is the opposite — its writes are inside the caller's transaction
+        and a failure rolls everything back.
+      • Different retention rule (default 18 months, configurable).
+
+    `user_id` is intentionally NOT a foreign key: failed-login attempts
+    may carry a `claimed_email` that doesn't correspond to any real user
+    (or that is a deliberate attack probe). The column captures what was
+    submitted to /login, not a verified identity.
+    """
+    __tablename__ = "auth_audit_log"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # NO FK to users — the claimed email may be garbage. user_id is populated
+    # only when an authenticated event ties to an existing user row.
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    claimed_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    client_ip: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String, nullable=True)
+    detail: Mapped[str | None] = mapped_column(String, nullable=True)
+    # When this row is eligible for deletion by the future pruner. Storing
+    # the absolute timestamp (not a duration) makes the deletion query a
+    # simple `WHERE retention_until_at < now()` and is robust to later
+    # changes in the configured retention window.
+    retention_until_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # Hash chain — same recipe as inventory ledger but a separate chain.
+    prev_hash: Mapped[str] = mapped_column(String, nullable=False)
+    entry_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_auth_audit_log_event_type", "event_type"),
+        Index("ix_auth_audit_log_user_id", "user_id"),
+        Index("ix_auth_audit_log_claimed_email", "claimed_email"),
+        Index("ix_auth_audit_log_occurred_at", "occurred_at"),
+        Index("ix_auth_audit_log_retention_until_at", "retention_until_at"),
+    )
+
+
+class AuthAuditChainHead(Base):
+    """Single-row table tracking the auth-audit chain head — sibling of
+    `InventoryLedgerChainHead`. Independent lock so a burst of failed-login
+    probes can't contend with inventory writes."""
+    __tablename__ = "auth_audit_chain_head"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    latest_entry_hash: Mapped[str] = mapped_column(String, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class InventoryLedgerChainHead(Base):
     """Single-row table tracking the latest entry_hash of the ledger chain.
 

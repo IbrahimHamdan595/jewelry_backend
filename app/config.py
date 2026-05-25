@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     cookie_secure: bool = Field(default=False)
     cookie_samesite: str = Field(default="lax")
 
+    # Audit phase A3b: retention window for auth audit log rows. Stored on
+    # every inserted row as `retention_until_at = now() + this`. NO auto-pruner
+    # is built — actually deleting audit rows requires the A2 maintenance
+    # bypass and is a deliberate, audited operation handled in a later phase.
+    auth_audit_retention_days: int = Field(default=540)  # 18 months
+
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins_raw.split(",") if o.strip()]
