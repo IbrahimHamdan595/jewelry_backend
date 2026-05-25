@@ -1,23 +1,38 @@
-"""Phase 7 — inventory alerts + supplier-balance reconciliation."""
+"""Phase 7 — inventory alerts + supplier-balance reconciliation.
+
+Audit phase B1 adds `/reconcile-units`: replays every event that mutates
+coin/ounce `on_hand_qty` against the stored values, reports drift.
+"""
 
 from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.notify import send_discord_alert
 from app.core.permissions import require_admin
 from app.deps import get_db
 from app.models import (
+    AdjustmentTarget,
+    BuybackKind,
     CoinType,
     DebtUnit,
+    ManualAdjustment,
+    Order,
+    OrderItem,
+    OrderItemKind,
+    OrderStatus,
     OunceType,
     Supplier,
     SupplierBalance,
+    SupplierItemKind,
     SupplierPayment,
     SupplierPurchase,
+    SupplierPurchaseItem,
     User,
+    WalkinBuyback,
 )
 
 router = APIRouter(prefix="/inventory", tags=["inventory"])
@@ -192,6 +207,168 @@ async def reconcile(
 
     return {
         "supplier_balance_drifts": drifts,
+        "drift_count": len(drifts),
+        "discord_alerted": alerted,
+    }
+
+
+# ── Coin / ounce stock reconciliation (audit phase B1) ───────────────────────
+
+
+async def _expected_unit_qty(
+    db: AsyncSession,
+    *,
+    kind: Literal["COIN", "OUNCE"],
+    unit_type_id: str,
+) -> int:
+    """Replay every event that mutated this unit's `on_hand_qty` and return
+    the sum the history implies.
+
+    AUDIT: see plan §B1. Sources:
+      +SupplierPurchaseItem.quantity   (item_kind matches, ref matches)
+      +WalkinBuyback.quantity           (kind matches, ref matches)
+      +ManualAdjustment.delta           (target_type matches, target_id matches)
+      −OrderItem.quantity               (item_kind matches, ref matches,
+                                          Order.status IN (COMPLETED, REFUNDED))
+
+    VOIDED orders are skipped entirely — the sale subtracted and the void
+    restored, so they net to zero. REFUNDED orders subtract (items left and
+    didn't come back; refund is money-side only). No melt term — coins/ounces
+    cannot be melted via current code (confirmed in [app/api/melts.py]).
+    """
+    if kind == "COIN":
+        item_kind = OrderItemKind.COIN
+        buyback_kind = BuybackKind.COIN
+        supplier_kind = SupplierItemKind.COIN
+        adjustment_target = AdjustmentTarget.COIN_STOCK
+        order_item_ref = OrderItem.coin_type_id
+        buyback_ref = WalkinBuyback.coin_type_id
+        purchase_item_ref = SupplierPurchaseItem.coin_type_id
+    else:
+        item_kind = OrderItemKind.OUNCE
+        buyback_kind = BuybackKind.OUNCE
+        supplier_kind = SupplierItemKind.OUNCE
+        adjustment_target = AdjustmentTarget.OUNCE_STOCK
+        order_item_ref = OrderItem.ounce_type_id
+        buyback_ref = WalkinBuyback.ounce_type_id
+        purchase_item_ref = SupplierPurchaseItem.ounce_type_id
+
+    # +: supplier purchases
+    plus_purchases = (
+        await db.execute(
+            select(func.coalesce(func.sum(SupplierPurchaseItem.quantity), 0)).where(
+                SupplierPurchaseItem.item_kind == supplier_kind,
+                purchase_item_ref == unit_type_id,
+            )
+        )
+    ).scalar_one()
+
+    # +: walkin buybacks
+    plus_buybacks = (
+        await db.execute(
+            select(func.coalesce(func.sum(WalkinBuyback.quantity), 0)).where(
+                WalkinBuyback.kind == buyback_kind,
+                buyback_ref == unit_type_id,
+            )
+        )
+    ).scalar_one()
+
+    # +/-: manual adjustments (delta is signed, signed sum is correct)
+    net_adjustments = (
+        await db.execute(
+            select(func.coalesce(func.sum(ManualAdjustment.delta), 0)).where(
+                ManualAdjustment.target_type == adjustment_target,
+                ManualAdjustment.target_id == unit_type_id,
+            )
+        )
+    ).scalar_one()
+
+    # -: order items from COMPLETED + REFUNDED orders (VOIDED excluded)
+    minus_sales = (
+        await db.execute(
+            select(func.coalesce(func.sum(OrderItem.quantity), 0))
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(
+                OrderItem.item_kind == item_kind,
+                order_item_ref == unit_type_id,
+                Order.status.in_((OrderStatus.COMPLETED, OrderStatus.REFUNDED)),
+            )
+        )
+    ).scalar_one()
+
+    expected = (
+        int(plus_purchases)
+        + int(plus_buybacks)
+        + int(net_adjustments)
+        - int(minus_sales)
+    )
+    return expected
+
+
+@router.get("/reconcile-units")
+async def reconcile_units(
+    alert: bool = False,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Verify CoinType.on_hand_qty + OunceType.on_hand_qty against a replay
+    of the event history.
+
+    AUDIT: read-only. Reports drift per type but never mutates. Resolving
+    drift is a separate operation — either find the missing event in the
+    code, or run a physical stock-take (audit phase B2) and post a
+    `MANUAL_ADJUSTMENT` for the variance.
+
+    Perf: O(types × queries-per-type). For the current dev DB scale this
+    is sub-second. At ten thousand types this would need batching into a
+    single grouped query — out of scope today.
+    """
+    drifts: list[dict] = []
+
+    for ct in (await db.execute(select(CoinType))).scalars().all():
+        expected = await _expected_unit_qty(db, kind="COIN", unit_type_id=ct.id)
+        if expected != ct.on_hand_qty:
+            drifts.append({
+                "kind": "COIN",
+                "id": ct.id,
+                "code": ct.code,
+                "name_en": ct.name_en,
+                "stored": ct.on_hand_qty,
+                "computed": expected,
+                "drift": ct.on_hand_qty - expected,
+            })
+
+    for ot in (await db.execute(select(OunceType))).scalars().all():
+        expected = await _expected_unit_qty(db, kind="OUNCE", unit_type_id=ot.id)
+        if expected != ot.on_hand_qty:
+            drifts.append({
+                "kind": "OUNCE",
+                "id": ot.id,
+                "code": ot.code,
+                "name_en": ot.name_en,
+                "stored": ot.on_hand_qty,
+                "computed": expected,
+                "drift": ot.on_hand_qty - expected,
+            })
+
+    alerted = False
+    if drifts and alert:
+        msg = (
+            f"⚠️ Coin/ounce stock drift detected ({len(drifts)} row(s)).\n"
+            + "\n".join(
+                f"  • {d['kind']} {d['code']} ({d['name_en']}): "
+                f"stored={d['stored']}, expected={d['computed']}, drift={d['drift']:+d}"
+                for d in drifts[:10]
+            )
+        )
+        try:
+            await send_discord_alert(msg)
+            alerted = True
+        except Exception:
+            alerted = False
+
+    return {
+        "unit_drifts": drifts,
         "drift_count": len(drifts),
         "discord_alerted": alerted,
     }
