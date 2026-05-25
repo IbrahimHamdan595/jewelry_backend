@@ -293,6 +293,107 @@ top-to-bottom and see what landed when.
 
 **Cadence:** same as the zakat engagement — phased, TDD where the logic warrants tests, hard stop with smoke summary at the end of each phase, no Phase N+1 until Phase N is approved.
 
+## Follow-up: DB role split (defer of audit A2)
+
+Status: NOT YET APPLIED. The A2 migration installed Postgres triggers that
+already block UPDATE/DELETE on the audit tables for everyone (including the
+app), so this is now a defense-in-depth hardening, not a gap that blocks
+the audit. Schedule when you next have ~10 minutes in the Neon console.
+
+### Why this is still worth doing
+
+The triggers can be dropped by any Postgres role that owns the tables —
+today, the app's own role does. A misconfigured cron, a stray
+`alembic downgrade`, or a compromised app credential could still call
+`DROP TRIGGER trg_inventory_ledger_block_update ON inventory_ledger;`
+followed by `UPDATE`. Splitting roles separates "what runs the app at
+request time" from "what owns the schema", so the only credential that
+can disarm the triggers is one a human pulls out of a password manager
+to run migrations — not one sitting in `DATABASE_URL` on a web service.
+
+### Concrete steps (5 minutes once the password manager is open)
+
+**1. Neon — create a low-privilege app role** (Neon console → SQL Editor,
+connected as the database owner):
+
+```sql
+-- Create the runtime role
+CREATE ROLE gold_app LOGIN PASSWORD '<generate-32-char-random>';
+
+-- Schema usage, table reads/inserts on everything
+GRANT USAGE ON SCHEMA public TO gold_app;
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON ALL TABLES IN SCHEMA public TO gold_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO gold_app;
+
+-- Future tables created by migrations: same defaults
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO gold_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO gold_app;
+
+-- THE CRITICAL PART: revoke mutation rights on the audit tables.
+-- The triggers already block these too, but defense-in-depth means even
+-- if a future migration accidentally drops the triggers, gold_app still
+-- can't touch the rows.
+REVOKE UPDATE, DELETE
+  ON inventory_ledger,
+     zakat_snapshots
+  FROM gold_app;
+REVOKE DELETE
+  ON inventory_ledger_chain_head
+  FROM gold_app;
+-- (UPDATE on chain_head stays granted — record() needs to advance the head.)
+```
+
+**2. Render — point the app at the new role.** In the Render dashboard
+for the backend service, update the env var:
+
+```
+DATABASE_URL=postgresql+asyncpg://gold_app:<password>@<host>/<dbname>?ssl=require
+```
+
+(Same host/db, only the user + password change.) Deploy. The app will
+reconnect as `gold_app` on next request.
+
+**3. Keep the existing owner credential for migrations only.** The
+current `DATABASE_URL` value (the owner role) stops living in any
+deployed service. Move it to your password manager under
+`MAISON ZAHAB / Neon / migration owner`. To run migrations:
+
+```bash
+DATABASE_URL='<owner-url>' alembic upgrade head
+```
+
+(Or set a separate `DATABASE_URL_ADMIN` in your local `.env` so you don't
+have to paste the password each time.)
+
+**4. Verify after deploy.** Once Render redeploys with the new
+`DATABASE_URL`, sanity-check from the app:
+
+```
+curl -b cookies.txt https://<backend>.onrender.com/api/ledger/verify
+# expect status=intact, head_matches=true
+```
+
+And confirm the privilege downgrade actually took by trying a write the
+app SHOULDN'T be able to do, e.g. attempting `DROP TRIGGER` from a psql
+session connected as `gold_app`:
+
+```
+ERROR:  must be owner of table inventory_ledger
+```
+
+### What this still doesn't protect against
+
+A Postgres superuser — whoever holds the Neon project owner credentials —
+can do anything, including dropping triggers, granting themselves
+privileges, and editing rows. That credential's custody is a
+process-control item: keep it in a password manager, document who has
+access, rotate on personnel changes.
+
+---
+
 ## What I Need From You Before Phase 1
 
 1. **Sign off (or amend) this ranked list.** If you'd rather re-order, do so — but please don't drop anything in tier A.
