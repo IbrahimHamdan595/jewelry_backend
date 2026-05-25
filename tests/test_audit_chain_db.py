@@ -7,10 +7,11 @@ proves that the chain survives the trip through SQLAlchemy + the DB:
   • the chain-head row advances correctly and stays consistent
   • verify_chain accepts a real DB-fetched sequence
 """
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 import pytest
 
+from app.api.ledger import verify_ledger
 from app.core.audit_chain import GENESIS_HASH, verify_chain
 from app.core.ledger import record
 from app.models import (
@@ -136,3 +137,84 @@ async def test_db_tamper_breaks_chain_at_exact_row(db):
         result["first_break"]["expected_entry_hash"]
         != result["first_break"]["actual_entry_hash"]
     )
+
+
+# ── Verify endpoint end-to-end ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_verify_endpoint_reports_intact_chain(db):
+    user = User(
+        id="u1", email="u@u.u", name="u", password_hash="x",
+        role=Role.ADMIN, is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+
+    for i in range(3):
+        await record(
+            db, event_type="LOT_CREATED", actor_user_id="u1",
+            ref_type="gold_lot", ref_id=f"lot-{i}",
+            payload={"i": i},
+        )
+
+    # Call the endpoint directly. We bypass the FastAPI auth dependency
+    # because we're testing the chain logic, not the dependency wiring.
+    result = await verify_ledger(db=db, _=user)
+
+    assert result["status"] == "intact"
+    assert result["total_rows"] == 3
+    assert result["first_break"] is None
+    assert result["head_row_count"] == 3
+    assert result["head_matches"] is True
+    assert result["head_latest_hash"] == result["computed_latest_hash"]
+
+
+@pytest.mark.asyncio
+async def test_verify_endpoint_detects_raw_sql_tampering(db):
+    """The strongest test: tamper with a row via raw SQL (simulating a DBA
+    going around the application) and confirm the endpoint catches it."""
+    user = User(
+        id="u1", email="u@u.u", name="u", password_hash="x",
+        role=Role.ADMIN, is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+
+    events = []
+    for i in range(5):
+        e = await record(
+            db, event_type="LOT_CREATED", actor_user_id="u1",
+            ref_type="gold_lot", ref_id=f"lot-{i}",
+            payload={"i": i},
+        )
+        events.append(e)
+
+    # Sanity: chain is intact before tampering.
+    intact_result = await verify_ledger(db=db, _=user)
+    assert intact_result["status"] == "intact"
+    assert intact_result["head_matches"] is True
+
+    # Tamper row index 2's payload directly via SQL. JSON is stored as text
+    # in SQLite, so we update the column with a JSON literal.
+    target = events[2]
+    await db.execute(
+        text(
+            "UPDATE inventory_ledger SET payload = :p WHERE id = :id"
+        ),
+        {"p": '{"i": 999}', "id": target.id},
+    )
+    # Raw SQL bypasses the ORM identity map; expire all cached entities so
+    # the next SELECT re-reads from the DB and sees the tampered payload.
+    db.expire_all()
+
+    broken_result = await verify_ledger(db=db, _=user)
+
+    assert broken_result["status"] == "broken"
+    assert broken_result["first_break"]["id"] == target.id
+    # Head still points at the (pre-tamper) latest hash; computed walk produces
+    # a different latest because everything from the tampered row forward got
+    # invalidated in the recompute.
+    # (head_matches may still be True because the LAST row's stored
+    # entry_hash didn't change — the head pointer is unaware that an
+    # earlier link is broken. That's why we need verify_chain to walk.)

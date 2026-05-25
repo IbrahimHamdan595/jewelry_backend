@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 # Sentinel for the row before the first real entry. Any ledger row whose
@@ -67,21 +68,36 @@ _CHAINED_FIELDS: tuple[str, ...] = (
 def _canonical(value: Any) -> Any:
     """Deterministic serialization for hashing.
 
-    Mirrors `app/core/zakat.py::_canonical`:
+    Mirrors `app/core/zakat.py::_canonical` with one important addition:
+    datetimes are normalized to UTC before serialization. A naive datetime
+    is *treated as UTC* (since application code always writes
+    `datetime.now(timezone.utc)`); a tz-aware datetime is converted to UTC.
+
+    This makes the hash invariant to DB-layer datetime handling differences:
+      • Postgres `TIMESTAMPTZ` round-trips a tz-aware datetime in UTC.
+      • SQLite (the test fixture) round-trips the same value as *naive*.
+    Without normalization the two would hash differently, breaking the
+    chain on read.
+
+    Other types:
       • dicts → sorted by key recursively
       • lists/tuples → element-wise canonical
-      • datetimes/dates → ISO 8601 string
-      • Decimal/anything-with-isoformat → str
-      • everything else → passthrough (json.dumps handles primitives)
+      • dates (without time) → ISO 8601 date string
+      • Decimal → str (preserves quantize() trailing zeros)
+      • everything else → passthrough
     """
-    if hasattr(value, "isoformat"):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat()
+    if hasattr(value, "isoformat"):  # date, time, etc.
         return value.isoformat()
     if isinstance(value, dict):
         return {k: _canonical(value[k]) for k in sorted(value)}
     if isinstance(value, (list, tuple)):
         return [_canonical(v) for v in value]
-    # Decimals, UUIDs, etc. get str-ified so json doesn't choke and the
-    # representation is stable.
     if hasattr(value, "__class__") and value.__class__.__name__ in ("Decimal",):
         return str(value)
     return value

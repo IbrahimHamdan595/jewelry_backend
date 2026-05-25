@@ -367,17 +367,16 @@ class InventoryLedger(Base):
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     # Hash chain (audit phase A1). prev_hash is the previous row's entry_hash,
     # or GENESIS_HASH for the first row. entry_hash is sha256 over
-    # (canonical(payload+meta) || prev_hash). Nullable during the rollout;
-    # backfill migration (A1.2) populates and tightens to NOT NULL.
-    prev_hash: Mapped[str | None] = mapped_column(String, nullable=True)
-    entry_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    # (canonical(payload+meta) || prev_hash). NOT NULL + UNIQUE on entry_hash
+    # enforced at the DB layer after the A1.2 backfill.
+    prev_hash: Mapped[str] = mapped_column(String, nullable=False)
+    entry_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("ix_inventory_ledger_event_type", "event_type"),
         Index("ix_inventory_ledger_ref", "ref_type", "ref_id"),
         Index("ix_inventory_ledger_occurred_at", "occurred_at"),
-        Index("ix_inventory_ledger_entry_hash", "entry_hash"),
     )
 
 

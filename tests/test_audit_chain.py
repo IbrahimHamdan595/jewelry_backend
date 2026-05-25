@@ -98,6 +98,40 @@ def test_hash_ignores_dict_key_order_in_payload():
     assert base == reordered
 
 
+def test_hash_normalizes_naive_and_utc_datetimes_identically():
+    """Critical for DB portability: SQLite strips timezone on round-trip;
+    PG keeps it. The hash must treat naive UTC and aware UTC as the same
+    instant, or the chain would break on read against SQLite.
+    """
+    aware = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+    naive = datetime(2026, 5, 25, 12, 0)
+
+    f_aware = _sample_fields()
+    f_aware["occurred_at"] = aware
+    f_naive = _sample_fields()
+    f_naive["occurred_at"] = naive
+
+    h_aware = compute_ledger_entry_hash(prev_hash=GENESIS_HASH, fields=f_aware)
+    h_naive = compute_ledger_entry_hash(prev_hash=GENESIS_HASH, fields=f_naive)
+    assert h_aware == h_naive
+
+
+def test_hash_normalizes_other_timezones_to_utc():
+    """A tz-aware datetime in another zone normalizes to UTC before hashing."""
+    from datetime import timedelta
+    plus_three = datetime(2026, 5, 25, 15, 0, tzinfo=timezone(timedelta(hours=3)))
+    utc = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)  # same instant
+
+    f1 = _sample_fields()
+    f1["occurred_at"] = plus_three
+    f2 = _sample_fields()
+    f2["occurred_at"] = utc
+
+    h1 = compute_ledger_entry_hash(prev_hash=GENESIS_HASH, fields=f1)
+    h2 = compute_ledger_entry_hash(prev_hash=GENESIS_HASH, fields=f2)
+    assert h1 == h2
+
+
 def test_hash_handles_decimal_payload():
     """Decimals should serialize to their str() form, preserving any trailing
     zeros set by quantize()."""
