@@ -80,6 +80,42 @@ EVENT_OUNCE_STOCK_ADJUSTED = "OUNCE_STOCK_ADJUSTED"
 # Zakat
 EVENT_ZAKAT_SNAPSHOT_CREATED = "ZAKAT_SNAPSHOT_CREATED"
 
+# Audit phase A3 — sensitive admin actions that previously wrote no ledger row.
+EVENT_SETTINGS_CHANGED = "SETTINGS_CHANGED"
+EVENT_GOLD_RATE_OVERRIDE_SET = "GOLD_RATE_OVERRIDE_SET"
+EVENT_GOLD_RATE_OVERRIDE_CLEARED = "GOLD_RATE_OVERRIDE_CLEARED"
+EVENT_GOLD_RATE_REFRESH_TRIGGERED = "GOLD_RATE_REFRESH_TRIGGERED"
+EVENT_STAFF_CREATED = "STAFF_CREATED"
+EVENT_STAFF_UPDATED = "STAFF_UPDATED"
+
+
+def field_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return only the fields whose value changed, as {key: {from, to}}.
+
+    Used by audit-trail callers that record SETTINGS_CHANGED / STAFF_UPDATED
+    events so the ledger payload contains exactly what an auditor needs to
+    answer "what changed, and from what to what?" Unchanged fields are
+    omitted to keep the payload small and readable.
+
+    Decimals/datetimes are stringified so the payload survives JSON
+    serialization without precision loss.
+    """
+    def _normalize(v: Any) -> Any:
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        # Decimal, UUID, anything else with a stable str() form
+        if not isinstance(v, (str, int, float, bool, type(None), list, dict)):
+            return str(v)
+        return v
+
+    out: dict[str, dict[str, Any]] = {}
+    for key in set(before) | set(after):
+        b = before.get(key)
+        a = after.get(key)
+        if b != a:
+            out[key] = {"from": _normalize(b), "to": _normalize(a)}
+    return out
+
 
 async def record(
     db: AsyncSession,
