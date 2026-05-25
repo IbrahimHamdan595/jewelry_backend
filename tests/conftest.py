@@ -19,17 +19,21 @@ for the simple cases.
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.audit_chain import GENESIS_HASH
 from app.db.base import Base
 # Importing app.models triggers all model class registration on Base.metadata.
 import app.models  # noqa: F401
+from app.models import InventoryLedgerChainHead
 
 
 @pytest_asyncio.fixture
 async def db():
     """Fresh in-memory DB per test; sessions roll back on teardown.
 
-    Each test gets a clean schema — no cross-test pollution. Tests that need
-    seed data set it up explicitly inside the test body.
+    Each test gets a clean schema — no cross-test pollution. The
+    ledger chain-head row is seeded with GENESIS so any test that calls
+    `record()` finds the same initial state the Alembic migration produces
+    in real deployments.
     """
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
     async with engine.begin() as conn:
@@ -37,6 +41,11 @@ async def db():
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
     async with session_factory() as session:
+        # Mirror the migration's seed step.
+        session.add(
+            InventoryLedgerChainHead(id=1, latest_entry_hash=GENESIS_HASH, row_count=0)
+        )
+        await session.commit()
         yield session
 
     await engine.dispose()

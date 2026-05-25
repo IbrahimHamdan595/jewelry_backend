@@ -1,18 +1,40 @@
 """Inventory ledger helper.
 
 Every state mutation in the inventory layer writes one row here, inside the
-same DB transaction as the state change. The ledger is append-only at the API
-layer (no UPDATE/DELETE endpoints exist). All writes go through `record()`.
+same DB transaction as the state change. All writes go through `record()`.
+
+AUDIT RATIONALE (phase A1)
+--------------------------
+Each appended row is hash-chained to the previous one. `record()`:
+  1. SELECT ... FOR UPDATE locks the singleton `inventory_ledger_chain_head`
+     row so concurrent appends serialize on the same lock (works in Postgres
+     and in the SQLite test fixture; no PG-specific advisory locks needed).
+  2. Computes `entry_hash = sha256(canonical(payload+meta) || prev_hash)` via
+     the pure helper in `app.core.audit_chain`.
+  3. Inserts the ledger row with both `prev_hash` and `entry_hash` populated.
+  4. Advances the head row's `latest_entry_hash` and `row_count`.
+
+All four steps live in the caller's transaction — the head update commits
+atomically with the ledger row and the underlying state change. If the
+caller rolls back, the head row's value also rolls back, preserving chain
+integrity.
+
+The ledger is also append-only at the API layer (no UPDATE/DELETE endpoints
+exist) and database grants are tightened in audit phase A2. Tamper detection
+is exposed via `GET /api/ledger/verify` (audit phase A1.2).
 
 Event type names are documentation-style strings, not a postgres enum, so new
 phases can introduce new event types without a schema migration.
 """
 
+from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import InventoryLedger
+from app.core.audit_chain import compute_ledger_entry_hash
+from app.models import InventoryLedger, InventoryLedgerChainHead
 
 
 # Phase 1 event types. Future phases add: BUYBACK_*, SUPPLIER_*, SALE_*,
@@ -68,14 +90,60 @@ async def record(
     ref_id: str,
     payload: dict[str, Any] | None = None,
 ) -> InventoryLedger:
-    """Append a ledger row. Does NOT commit — caller owns the transaction."""
+    """Append a hash-chained ledger row. Does NOT commit — caller owns the
+    transaction.
+
+    AUDIT: see module docstring. The chain-head row is locked FOR UPDATE so
+    concurrent appends from other transactions block here until this one
+    commits or rolls back, preventing two writers from producing two children
+    of the same parent (which would fork the chain).
+    """
+    # 1. Lock the head row. SELECT ... FOR UPDATE on a single-row table is
+    #    the simplest serialization primitive that works on both PG and the
+    #    SQLite test fixture (where it's a no-op but writes serialize anyway).
+    head = (
+        await db.execute(
+            select(InventoryLedgerChainHead)
+            .where(InventoryLedgerChainHead.id == 1)
+            .with_for_update()
+        )
+    ).scalar_one()
+
+    # 2. Set the timestamp now so it's part of the hash. Without this, the
+    #    DB server_default would set it on INSERT, but at that point the
+    #    hash has already been computed without knowing the exact value.
+    occurred_at = datetime.now(timezone.utc)
+    payload_dict = payload or {}
+
+    # 3. Compute the chain hash over the semantic event.
+    entry_hash = compute_ledger_entry_hash(
+        prev_hash=head.latest_entry_hash,
+        fields={
+            "event_type": event_type,
+            "actor_user_id": actor_user_id,
+            "occurred_at": occurred_at,
+            "ref_type": ref_type,
+            "ref_id": ref_id,
+            "payload": payload_dict,
+        },
+    )
+
+    # 4. Persist the row with chain pointers set.
     entry = InventoryLedger(
         event_type=event_type,
         actor_user_id=actor_user_id,
+        occurred_at=occurred_at,
         ref_type=ref_type,
         ref_id=ref_id,
-        payload=payload or {},
+        payload=payload_dict,
+        prev_hash=head.latest_entry_hash,
+        entry_hash=entry_hash,
     )
     db.add(entry)
+
+    # 5. Advance the head. Both writes flush together; both commit (or roll
+    #    back) atomically with the caller's transaction.
+    head.latest_entry_hash = entry_hash
+    head.row_count = head.row_count + 1
     await db.flush()
     return entry

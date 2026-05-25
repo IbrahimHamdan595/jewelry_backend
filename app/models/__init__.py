@@ -365,12 +365,36 @@ class InventoryLedger(Base):
     ref_type: Mapped[str] = mapped_column(String, nullable=False)
     ref_id: Mapped[str] = mapped_column(String, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    # Hash chain (audit phase A1). prev_hash is the previous row's entry_hash,
+    # or GENESIS_HASH for the first row. entry_hash is sha256 over
+    # (canonical(payload+meta) || prev_hash). Nullable during the rollout;
+    # backfill migration (A1.2) populates and tightens to NOT NULL.
+    prev_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    entry_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("ix_inventory_ledger_event_type", "event_type"),
         Index("ix_inventory_ledger_ref", "ref_type", "ref_id"),
         Index("ix_inventory_ledger_occurred_at", "occurred_at"),
+        Index("ix_inventory_ledger_entry_hash", "entry_hash"),
+    )
+
+
+class InventoryLedgerChainHead(Base):
+    """Single-row table tracking the latest entry_hash of the ledger chain.
+
+    `record()` SELECT ... FOR UPDATE locks this row before computing the next
+    entry_hash, which serializes concurrent ledger appends without needing
+    Postgres-specific advisory locks (and works under the SQLite test fixture).
+    """
+    __tablename__ = "inventory_ledger_chain_head"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    latest_entry_hash: Mapped[str] = mapped_column(String, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
