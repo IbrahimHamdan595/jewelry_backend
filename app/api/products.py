@@ -73,6 +73,9 @@ async def create_product(
         margin_percent=body.margin_percent,
         making_charge=body.making_charge,
         photos=body.photos,
+        on_hand_qty=body.on_hand_qty,
+        min_stock_qty=body.min_stock_qty,
+        status=ProductStatus.AVAILABLE if body.on_hand_qty > 0 else ProductStatus.SOLD,
     )
     db.add(product)
     await db.commit()
@@ -137,6 +140,7 @@ async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User 
         gold_rate_24k=rate_info["rate"],
         purity_rate=priced["purity_rate"],
         final_price=priced["final_price"],
+        on_hand_qty=product.on_hand_qty,
     )
 
 

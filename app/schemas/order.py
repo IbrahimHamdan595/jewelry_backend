@@ -23,6 +23,8 @@ class CheckoutRequest(BaseModel):
     items: list[OrderItemIn]
     payment_method: str
     customer_name: str | None = None
+    # Phase 2 — order-level discount %. Server rejects > Settings.max_discount_percent.
+    discount_percent: Decimal = Decimal("0")
 
 
 class OrderItemOut(BaseModel):
@@ -40,6 +42,9 @@ class OrderItemOut(BaseModel):
     margin_percent: Decimal
     making_charge: Decimal
     final_price: Decimal
+    refunded_qty: int = 0
+    refunded_amount: Decimal = Decimal("0")
+    refunded_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -63,6 +68,8 @@ class OrderOut(BaseModel):
     subtotal: Decimal
     vat_percent: Decimal
     vat_amount: Decimal
+    discount_percent: Decimal = Decimal("0")
+    discount_amount: Decimal = Decimal("0")
     total_usd: Decimal
     total_lbp: Decimal
     lbp_exchange_rate: Decimal
@@ -92,6 +99,13 @@ class OrderSummaryOut(BaseModel):
 
 class VoidRequest(BaseModel):
     reason: str
+
+
+class ItemRefundRequest(BaseModel):
+    """Per-item refund. `quantity` applies to COIN/OUNCE lines (how many units
+    to return); omit it to refund the whole remaining line. PRODUCT lines are
+    atomic 1-of-1, so `quantity` is ignored for them."""
+    quantity: int | None = None
 
 
 class OrderListOut(BaseModel):

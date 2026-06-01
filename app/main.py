@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 
 origins = settings.cors_origins
 app = FastAPI(
-    title="MAISON ZAHAB API",
+    title="Fawaz El Namel API",
     version="1.0.0",
     lifespan=lifespan,
 )

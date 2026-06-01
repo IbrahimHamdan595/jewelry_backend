@@ -17,8 +17,10 @@ from app.models import (
     OrderStatus,
     OunceType,
     Product,
+    ProductStatus,
     Supplier,
     SupplierBalance,
+    SupplierPurchase,
     User,
 )
 
@@ -158,6 +160,30 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(get_cu
             OunceType.on_hand_qty <= OunceType.min_stock_qty,
         )
     )).scalar_one()
+    # Phase 3: products participate in low-stock alerts too.
+    low_product = (await db.execute(
+        select(func.count(Product.id)).where(
+            Product.is_active.is_(True),
+            Product.min_stock_qty.is_not(None),
+            Product.on_hand_qty <= Product.min_stock_qty,
+            Product.status.notin_((ProductStatus.MELTED, ProductStatus.INACTIVE)),
+        )
+    )).scalar_one()
+
+    # Phase 4: recent supplier purchases (for dashboard receipt links).
+    recent_purchases = (await db.execute(
+        select(SupplierPurchase)
+        .options(selectinload(SupplierPurchase.items))
+        .order_by(SupplierPurchase.occurred_at.desc())
+        .limit(5)
+    )).scalars().all()
+    purchase_supplier_ids = {p.supplier_id for p in recent_purchases}
+    supplier_names: dict[str, str] = {}
+    if purchase_supplier_ids:
+        for s in (
+            await db.execute(select(Supplier).where(Supplier.id.in_(purchase_supplier_ids)))
+        ).scalars():
+            supplier_names[s.id] = s.name
 
     # Accounts payable rollup
     ap_rows = (await db.execute(
@@ -197,8 +223,18 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(get_cu
             "pure_gold_by_karat": pure_gold_totals,
             "coins": {"on_hand_total": int(coin_total), "distinct_types": int(coin_distinct)},
             "ounces": {"on_hand_total": int(ounce_total), "distinct_types": int(ounce_distinct)},
-            "low_stock_alerts": int(low_coin + low_ounce),
+            "low_stock_alerts": int(low_coin + low_ounce + low_product),
         },
+        "recent_purchases": [
+            {
+                "id": p.id,
+                "supplier": supplier_names.get(p.supplier_id, "—"),
+                "occurred_at": p.occurred_at.isoformat(),
+                "total_cash_due": float(p.total_cash_due),
+                "item_count": len(p.items),
+            }
+            for p in recent_purchases
+        ],
         "accounts_payable": {
             "total_cash_owed": float(ap_cash),
             "total_grams_owed_by_karat": {k: float(v) for k, v in ap_gold_by_karat.items()},

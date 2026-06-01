@@ -25,6 +25,7 @@ class SettingsOut(BaseModel):
     default_buyback_margin_value: Decimal
     buyback_rate_drift_pct_max: Decimal
     nisab_grams: Decimal
+    max_discount_percent: Decimal
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -50,6 +51,7 @@ class SettingsUpdate(BaseModel):
     default_buyback_margin_value: Decimal | None = None
     buyback_rate_drift_pct_max: Decimal | None = None
     nisab_grams: Decimal | None = Field(default=None, gt=0)
+    max_discount_percent: Decimal | None = Field(default=None, ge=0, le=100)
 
 
 class StaffCreate(BaseModel):

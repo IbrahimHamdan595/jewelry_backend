@@ -46,7 +46,7 @@ async def seed():
             print(f"Created admin: {settings.seed_admin_email}")
 
         # Cashier
-        cashier_email = "cashier@maisonzahab.com"
+        cashier_email = "cashier@fawazelnamel.com"
         existing_cashier = (await db.execute(select(User).where(User.email == cashier_email))).scalar_one_or_none()
         if not existing_cashier:
             db.add(User(
@@ -63,8 +63,8 @@ async def seed():
         if not existing_settings:
             db.add(SettingsModel(
                 id="singleton",
-                store_name="MAISON ZAHAB",
-                store_name_ar="ميزون ذهب",
+                store_name="Fawaz El Namel",
+                store_name_ar="فواز النمل",
                 address="Hamra Street, Beirut, Lebanon",
                 phone="+961 1 123 456",
                 vat_number="VAT-12345",
@@ -72,7 +72,7 @@ async def seed():
                 default_making_charge=Decimal("25"),
                 vat_percent=Decimal("11"),
                 lbp_exchange_rate=Decimal("89500"),
-                receipt_footer="Thank you for shopping at MAISON ZAHAB",
+                receipt_footer="Thank you for shopping at Fawaz El Namel",
                 gold_refresh_minutes=15,
             ))
             print("Created settings singleton")

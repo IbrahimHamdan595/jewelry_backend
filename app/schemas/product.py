@@ -14,6 +14,9 @@ class ProductCreate(BaseModel):
     margin_percent: Decimal
     making_charge: Decimal
     photos: list[dict] = []
+    # Phase 3 — initial stock on hand and optional low-stock threshold.
+    on_hand_qty: int = 1
+    min_stock_qty: int | None = None
 
 
 class ProductUpdate(BaseModel):
@@ -27,6 +30,8 @@ class ProductUpdate(BaseModel):
     making_charge: Decimal | None = None
     photos: list[dict] | None = None
     is_active: bool | None = None
+    on_hand_qty: int | None = None
+    min_stock_qty: int | None = None
 
 
 class ProductOut(BaseModel):
@@ -42,6 +47,9 @@ class ProductOut(BaseModel):
     making_charge: Decimal
     photos: list[dict]
     is_active: bool
+    # Phase 3
+    on_hand_qty: int
+    min_stock_qty: int | None
     # Phase 4
     is_used: bool
     cost_basis_usd: Decimal | None
@@ -66,6 +74,7 @@ class ProductLookupOut(BaseModel):
     gold_rate_24k: float
     purity_rate: Decimal
     final_price: Decimal
+    on_hand_qty: int
 
     model_config = {"from_attributes": True}
 

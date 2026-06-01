@@ -133,6 +133,26 @@ class PurchaseOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PurchaseListItemOut(BaseModel):
+    """Store-wide purchase row for the unified orders page (Phase 5)."""
+    id: str
+    supplier_id: str
+    supplier_name: str
+    occurred_at: datetime
+    payment_mode: str
+    total_cash_due: Decimal
+    total_grams_due_by_karat: dict
+    item_count: int
+    notes: str | None
+
+
+class PurchaseListOut(BaseModel):
+    items: list[PurchaseListItemOut]
+    total: int
+    page: int
+    page_size: int
+
+
 # ── Repayment ──────────────────────────────────────────────────────────────────
 
 

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 class UnitTypeCreate(BaseModel):
-    # Optional: when omitted, the router auto-generates MZB-COIN/OZ-{karat}-NNNN.
+    # Optional: when omitted, the router auto-generates FN-COIN/OZ-{karat}-NNNN.
     code: str | None = None
     name_en: str = Field(min_length=1)
     name_ar: str = ""

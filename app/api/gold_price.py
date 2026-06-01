@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.gold_api import fetch_gold_rate, get_current_gold_rate
+from app.core.daterange import parse_calendar_filter
+from app.core.gold_api import build_rate_history_row, fetch_gold_rate, get_current_gold_rate
 from app.core.ledger import (
     EVENT_GOLD_RATE_OVERRIDE_CLEARED,
     EVENT_GOLD_RATE_OVERRIDE_SET,
@@ -25,29 +26,57 @@ async def current_rate(db: AsyncSession = Depends(get_db)):
     r = info["rate"]
     return GoldRateOut(
         rate_24k=r,
+        rate_22k=round(r * 0.917, 2),
         rate_21k=round(r * 0.875, 2),
         rate_18k=round(r * 0.750, 2),
         source=info["source"],
         fetched_at=info["fetched_at"],
         is_stale=info["is_stale"],
+        market_closed=info.get("market_closed", False),
+    )
+
+
+def _history_point(r: GoldRateHistory) -> GoldRateHistoryPoint:
+    """Map a row to a per-karat point, deriving any karat that predates the
+    Phase 6 backfill (defensive — the migration backfills all existing rows)."""
+    base = float(r.rate_24k)
+    return GoldRateHistoryPoint(
+        rate_24k=base,
+        rate_22k=float(r.rate_22k) if r.rate_22k is not None else round(base * 0.917, 2),
+        rate_21k=float(r.rate_21k) if r.rate_21k is not None else round(base * 0.875, 2),
+        rate_18k=float(r.rate_18k) if r.rate_18k is not None else round(base * 0.750, 2),
+        per_karat_backfilled=bool(r.per_karat_backfilled),
+        fetched_at=r.fetched_at,
     )
 
 
 @router.get("/history", response_model=list[GoldRateHistoryPoint])
-async def history(range: str = "24h", db: AsyncSession = Depends(get_db)):
-    delta_map = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
-    delta = delta_map.get(range, timedelta(hours=24))
-    since = datetime.now(timezone.utc) - delta
+async def history(
+    range: str = "24h",
+    granularity: str = "",
+    date: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """Per-karat rate history (Phase 6 #7).
 
-    rows = (
-        await db.execute(
-            select(GoldRateHistory)
-            .where(GoldRateHistory.fetched_at >= since)
-            .order_by(GoldRateHistory.fetched_at.asc())
-        )
-    ).scalars().all()
+    Two filter modes: a relative `range` (24h/7d/30d, default), or a Beirut-local
+    calendar selection (`granularity`=day|month|year + `date`=YYYY-MM-DD) which
+    takes precedence. Each point carries all four karats' stored series so the
+    chart's karat filter is a client-side pick.
+    """
+    q = select(GoldRateHistory)
+    cal_range = parse_calendar_filter(granularity, date)
+    if cal_range:
+        start, end = cal_range
+        q = q.where(GoldRateHistory.fetched_at >= start, GoldRateHistory.fetched_at < end)
+    else:
+        delta_map = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+        delta = delta_map.get(range, timedelta(hours=24))
+        since = datetime.now(timezone.utc) - delta
+        q = q.where(GoldRateHistory.fetched_at >= since)
 
-    return [GoldRateHistoryPoint(rate_24k=float(r.rate_24k), fetched_at=r.fetched_at) for r in rows]
+    rows = (await db.execute(q.order_by(GoldRateHistory.fetched_at.asc()))).scalars().all()
+    return [_history_point(r) for r in rows]
 
 
 @router.post("/refresh")
@@ -62,7 +91,7 @@ async def force_refresh(
     next scheduled tick.
     """
     rate = await fetch_gold_rate()
-    history_row = GoldRateHistory(rate_24k=rate.value, source=rate.source)
+    history_row = build_rate_history_row(rate.value, rate.source)
     db.add(history_row)
     await db.flush()
     await record(

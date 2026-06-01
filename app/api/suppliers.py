@@ -18,8 +18,11 @@ from app.core.ledger import (
     EVENT_SUPPLIER_UPDATED,
     record,
 )
+from app.core.daterange import parse_calendar_filter
 from app.core.permissions import require_admin
 from app.core.pricing import generate_item_code
+from app.core.receipt import build_supplier_receipt
+from app.schemas.receipt import ReceiptOut
 from app.core.supplier_balance import adjust_balance, get_supplier_balances
 from app.deps import get_db
 from app.models import (
@@ -31,6 +34,7 @@ from app.models import (
     OunceType,
     Product,
     ProductStatus,
+    Settings,
     Supplier,
     SupplierBalance,
     SupplierItemKind,
@@ -49,6 +53,8 @@ from app.schemas.supplier import (
     PaymentOut,
     PurchaseCreate,
     PurchaseItemIn,
+    PurchaseListItemOut,
+    PurchaseListOut,
     PurchaseOut,
     SupplierCreate,
     SupplierDetailOut,
@@ -558,6 +564,120 @@ async def create_purchase(
         )
     ).scalar_one()
     return PurchaseOut.model_validate(purchase)
+
+
+@router.get("/purchases/list", response_model=PurchaseListOut)
+async def list_purchases(
+    granularity: str = "",
+    date: str = "",
+    supplier_id: str = "",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Store-wide supplier purchases for the unified orders page (Phase 5),
+    with Beirut-local calendar filtering."""
+    from sqlalchemy.orm import selectinload
+
+    q = select(SupplierPurchase).options(selectinload(SupplierPurchase.items))
+    if supplier_id:
+        q = q.where(SupplierPurchase.supplier_id == supplier_id)
+    cal_range = parse_calendar_filter(granularity, date)
+    if cal_range:
+        start, end = cal_range
+        q = q.where(SupplierPurchase.occurred_at >= start, SupplierPurchase.occurred_at < end)
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
+    q = q.order_by(SupplierPurchase.occurred_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    purchases = (await db.execute(q)).scalars().all()
+
+    supplier_ids = {p.supplier_id for p in purchases}
+    names: dict[str, str] = {}
+    if supplier_ids:
+        for s in (await db.execute(select(Supplier).where(Supplier.id.in_(supplier_ids)))).scalars():
+            names[s.id] = s.name
+
+    return PurchaseListOut(
+        items=[
+            PurchaseListItemOut(
+                id=p.id,
+                supplier_id=p.supplier_id,
+                supplier_name=names.get(p.supplier_id, "—"),
+                occurred_at=p.occurred_at,
+                payment_mode=p.payment_mode.value,
+                total_cash_due=p.total_cash_due,
+                total_grams_due_by_karat=p.total_grams_due_by_karat,
+                item_count=len(p.items),
+                notes=p.notes,
+            )
+            for p in purchases
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/purchases/{purchase_id}/receipt", response_model=ReceiptOut)
+async def get_purchase_receipt(
+    purchase_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Normalized supplier-purchase receipt for printing (Phase 4)."""
+    from sqlalchemy.orm import selectinload
+
+    purchase = (
+        await db.execute(
+            select(SupplierPurchase)
+            .options(selectinload(SupplierPurchase.items))
+            .where(SupplierPurchase.id == purchase_id)
+        )
+    ).scalar_one_or_none()
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Purchase not found")
+
+    settings = (
+        await db.execute(select(Settings).where(Settings.id == "singleton"))
+    ).scalar_one_or_none()
+    if not settings:
+        raise HTTPException(status_code=500, detail="Settings not configured")
+
+    supplier = (
+        await db.execute(select(Supplier).where(Supplier.id == purchase.supplier_id))
+    ).scalar_one_or_none()
+    cashier = (
+        await db.execute(select(User).where(User.id == purchase.created_by_user_id))
+    ).scalar_one_or_none()
+
+    # Resolve per-item human descriptions from the referenced product/coin/ounce.
+    product_ids = {i.product_id for i in purchase.items if i.product_id}
+    coin_ids = {i.coin_type_id for i in purchase.items if i.coin_type_id}
+    ounce_ids = {i.ounce_type_id for i in purchase.items if i.ounce_type_id}
+    names: dict[str, str] = {}
+    if product_ids:
+        for p in (await db.execute(select(Product).where(Product.id.in_(product_ids)))).scalars():
+            names[p.id] = p.name_en
+    if coin_ids:
+        for c in (await db.execute(select(CoinType).where(CoinType.id.in_(coin_ids)))).scalars():
+            names[c.id] = c.name_en
+    if ounce_ids:
+        for o in (await db.execute(select(OunceType).where(OunceType.id.in_(ounce_ids)))).scalars():
+            names[o.id] = o.name_en
+
+    item_descriptions: dict[str, str] = {}
+    for it in purchase.items:
+        ref = it.product_id or it.coin_type_id or it.ounce_type_id
+        if ref and ref in names:
+            item_descriptions[it.id] = names[ref]
+
+    return build_supplier_receipt(
+        purchase, settings,
+        supplier_name=supplier.name if supplier else None,
+        cashier_name=cashier.name if cashier else None,
+        item_descriptions=item_descriptions,
+    )
 
 
 # ── Repayment ─────────────────────────────────────────────────────────────────

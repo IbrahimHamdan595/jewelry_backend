@@ -33,6 +33,8 @@ class Karat(str, enum.Enum):
 class OrderStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     REFUNDED = "REFUNDED"
+    # Phase 1 (per-item refunds): at least one line refunded but not all.
+    PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
     VOIDED = "VOIDED"
 
 
@@ -187,6 +189,13 @@ class Product(Base):
     making_charge: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     photos: Mapped[list] = mapped_column(JSON, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Phase 3 (product quantity): products are stocked-by-quantity, not 1-of-1.
+    # `status` is kept as a DERIVED compatibility flag: sale/refund/void flows set
+    # it to SOLD when on_hand_qty hits 0 and AVAILABLE when > 0, but they never
+    # overwrite the explicit MELTED / INACTIVE states. min_stock_qty drives
+    # low-stock alerts (NULL = no alert).
+    on_hand_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    min_stock_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Phase 4
     is_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     cost_basis_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
@@ -221,6 +230,11 @@ class Order(Base):
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     vat_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     vat_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # Phase 2 — order-level discount. VAT is charged on the PRE-discount subtotal;
+    # the discount is then subtracted from the grand total. discount_amount is the
+    # resolved USD value of discount_percent applied to subtotal.
+    discount_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=Decimal("0"))
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
     total_usd: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     total_lbp: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     lbp_exchange_rate: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
@@ -263,6 +277,12 @@ class OrderItem(Base):
     margin_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     making_charge: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     final_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # Phase 1 (per-item refunds). refunded_qty counts units returned to stock
+    # (0 or 1 for atomic PRODUCT lines; 0..quantity for COIN/OUNCE lines).
+    # refunded_amount is the cumulative pre-VAT value refunded for this line.
+    refunded_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    refunded_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=Decimal("0"))
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     order: Mapped["Order"] = relationship(back_populates="items")
@@ -274,6 +294,13 @@ class GoldRateHistory(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     rate_24k: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    # Phase 6 (#7): store each karat's value at poll time (exact). Nullable for
+    # pre-Phase-6 rows; those are backfilled via purity multipliers and flagged
+    # with per_karat_backfilled=True (derived, not actually polled per-karat).
+    rate_22k: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    rate_21k: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    rate_18k: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    per_karat_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     source: Mapped[str] = mapped_column(String, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -297,7 +324,7 @@ class Settings(Base):
     __tablename__ = "settings"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: "singleton")
-    store_name: Mapped[str] = mapped_column(String, nullable=False, default="MAISON ZAHAB")
+    store_name: Mapped[str] = mapped_column(String, nullable=False, default="Fawaz El Namel")
     store_name_ar: Mapped[str | None] = mapped_column(String, nullable=True)
     logo_url: Mapped[str | None] = mapped_column(String, nullable=True)
     address: Mapped[str] = mapped_column(String, nullable=False, default="")
@@ -310,6 +337,9 @@ class Settings(Base):
     markup_k24: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=Decimal("0"))
     vat_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=Decimal("11"))
     lbp_exchange_rate: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("89500"))
+    # Phase 2 — max order-level discount % a cashier may apply without override.
+    # Defaults to 0 (discounts disabled until an admin raises the cap).
+    max_discount_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=Decimal("0"))
     receipt_footer: Mapped[str | None] = mapped_column(String, nullable=True)
     gold_refresh_minutes: Mapped[int] = mapped_column(Integer, default=15)
     # Zakat

@@ -25,6 +25,8 @@ from app.models import (
     OrderItemKind,
     OrderStatus,
     OunceType,
+    Product,
+    ProductStatus,
     Supplier,
     SupplierBalance,
     SupplierItemKind,
@@ -46,10 +48,12 @@ async def inventory_alerts(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    """Coin and ounce types whose on_hand_qty is at-or-below their min_stock_qty.
+    """Coin, ounce, and product types whose on_hand_qty is at-or-below their
+    min_stock_qty.
 
     Pure-gold lots are intentionally excluded (working pool, not SKUs).
-    Atomic products are excluded for the same reason (no quantity concept).
+    Products are included as of Phase 3 (they are now stocked-by-quantity);
+    only those with a configured min_stock_qty participate.
     """
     coin_rows = (
         await db.execute(
@@ -66,6 +70,16 @@ async def inventory_alerts(
                 OunceType.is_active.is_(True),
                 OunceType.min_stock_qty.is_not(None),
                 OunceType.on_hand_qty <= OunceType.min_stock_qty,
+            )
+        )
+    ).scalars().all()
+    product_rows = (
+        await db.execute(
+            select(Product).where(
+                Product.is_active.is_(True),
+                Product.min_stock_qty.is_not(None),
+                Product.on_hand_qty <= Product.min_stock_qty,
+                Product.status.notin_((ProductStatus.MELTED, ProductStatus.INACTIVE)),
             )
         )
     ).scalars().all()
@@ -88,6 +102,15 @@ async def inventory_alerts(
             "name_en": o.name_en,
             "on_hand_qty": o.on_hand_qty,
             "min_stock_qty": o.min_stock_qty,
+        })
+    for p in product_rows:
+        below.append({
+            "kind": "PRODUCT",
+            "id": p.id,
+            "code": p.code,
+            "name_en": p.name_en,
+            "on_hand_qty": p.on_hand_qty,
+            "min_stock_qty": p.min_stock_qty,
         })
     return {"below_threshold": below, "total": len(below)}
 

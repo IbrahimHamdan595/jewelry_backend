@@ -19,6 +19,30 @@ class GoldRateResult:
     source: str
 
 
+# Purity multipliers used to derive per-karat values from the 24K feed price.
+# Mirrors app.core.pricing.KARAT_PURITY (kept inline to avoid a circular import).
+_PURITY_22K = Decimal("0.917")
+_PURITY_21K = Decimal("0.875")
+_PURITY_18K = Decimal("0.750")
+
+
+def build_rate_history_row(value: Decimal, source: str) -> "GoldRateHistory":
+    """Build a GoldRateHistory row with all four karats populated (Phase 6).
+
+    The feed only quotes 24K, so the other karats are derived via purity at poll
+    time and stored exactly (per_karat_backfilled=False — these are live points,
+    not the one-time historical backfill)."""
+    value = Decimal(str(value))
+    return GoldRateHistory(
+        rate_24k=value,
+        rate_22k=(value * _PURITY_22K).quantize(Decimal("0.01")),
+        rate_21k=(value * _PURITY_21K).quantize(Decimal("0.01")),
+        rate_18k=(value * _PURITY_18K).quantize(Decimal("0.01")),
+        per_karat_backfilled=False,
+        source=source,
+    )
+
+
 async def _fetch_goldapi() -> Decimal:
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(
@@ -78,6 +102,7 @@ async def get_current_gold_rate(db: AsyncSession) -> dict:
             "source": "override",
             "fetched_at": override.set_at,
             "is_stale": False,
+            "market_closed": False,
         }
 
     latest = (
@@ -90,9 +115,17 @@ async def get_current_gold_rate(db: AsyncSession) -> dict:
         raise RuntimeError("No gold rate available — run the poller or seed a rate")
 
     age_seconds = (datetime.now(timezone.utc) - latest.fetched_at.replace(tzinfo=timezone.utc)).total_seconds()
+    # Phase 6 (#6): sustained staleness == "market closed / feed down". Threshold
+    # mirrors the poller's Discord-alert trigger: failure_threshold × refresh
+    # interval (default 3 × 15 min = 45 min) so the banner and the Discord alert
+    # appear together. Falls back to 45 min if config is unset.
+    refresh_min = settings.gold_refresh_minutes or 15
+    stale_threshold = refresh_min * 60
+    closed_threshold = max(stale_threshold * 2, (settings.gold_alert_failure_threshold or 3) * refresh_min * 60)
     return {
         "rate": float(latest.rate_24k),
         "source": "live",
         "fetched_at": latest.fetched_at,
-        "is_stale": age_seconds > 15 * 60,
+        "is_stale": age_seconds > stale_threshold,
+        "market_closed": age_seconds > closed_threshold,
     }

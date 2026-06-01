@@ -142,7 +142,11 @@ async def generate_order_number(db: AsyncSession, when: datetime) -> str:
 
 
 async def generate_item_code(db: AsyncSession, karat: Karat) -> str:
-    prefix = f"MZB-{KARAT_LABEL[karat]}-"
+    # Store SKU prefix. Historically "MZB" (placeholder brand); new items use
+    # "FN" (Fawaz El Namel). Existing MZB-* codes are intentionally left as-is —
+    # changing the prefix only affects newly generated codes, and numbering is
+    # per-prefix (startswith), so FN-* starts fresh at 0001.
+    prefix = f"FN-{KARAT_LABEL[karat]}-"
     result = await db.execute(
         select(Product.code)
         .where(Product.code.startswith(prefix))
@@ -157,14 +161,15 @@ async def generate_item_code(db: AsyncSession, karat: Karat) -> str:
 async def generate_unit_code(db: AsyncSession, kind: str, karat: Karat) -> str:
     """Auto-generate a code for a coin_type or ounce_type.
 
-    Format: MZB-COIN-{karat}-NNNN or MZB-OZ-{karat}-NNNN. Numbering is per
+    Format: FN-COIN-{karat}-NNNN or FN-OZ-{karat}-NNNN. Numbering is per
     (kind, karat) — so K22 coins and K24 coins each have their own counter.
+    (Legacy items use the old "MZB" prefix; those are left untouched.)
     """
     if kind == "COIN":
-        prefix = f"MZB-COIN-{KARAT_LABEL[karat]}-"
+        prefix = f"FN-COIN-{KARAT_LABEL[karat]}-"
         Model = CoinType
     elif kind == "OUNCE":
-        prefix = f"MZB-OZ-{KARAT_LABEL[karat]}-"
+        prefix = f"FN-OZ-{KARAT_LABEL[karat]}-"
         Model = OunceType
     else:
         raise ValueError(f"unknown unit kind {kind!r}")
@@ -176,6 +181,6 @@ async def generate_unit_code(db: AsyncSession, kind: str, karat: Karat) -> str:
         .limit(1)
     )
     last_code = result.scalar_one_or_none()
-    # Codes like MZB-COIN-22K-0042 → split → ["MZB","COIN","22K","0042"]
+    # Codes like FN-COIN-22K-0042 → rsplit → "0042" (works for legacy MZB-* too)
     last_num = int(last_code.rsplit("-", 1)[-1]) if last_code else 0
     return f"{prefix}{(last_num + 1):04d}"

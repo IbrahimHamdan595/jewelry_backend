@@ -13,7 +13,7 @@
 ## Codebase Findings & Assumptions
 
 ### Backend
-- **ORM:** SQLAlchemy 2.x async (Mapped/mapped_column) — [pyproject.toml](../../pyproject.toml). All models in [app/models/__init__.py](../../app/models/__init__.py).
+- **ORM:** SQLAlchemy 2.x async (Mapped/mapped_column) — [requirements.txt](../../requirements.txt). All models in [app/models/__init__.py](../../app/models/__init__.py).
 - **Migrations:** Alembic, versions in [alembic/versions/](../../alembic/versions/) — 9 existing files following pattern `<hash>_<phase_description>.py`. New migrations append.
 - **Audit ledger:** `InventoryLedger` ([models:354](../../app/models/__init__.py#L354)) — keyed by `event_type`, `ref_type/ref_id`, JSON `payload`. **Zakat snapshots will NOT use this** — they need structured per-karat breakdown columns, so a dedicated `zakat_snapshots` table is correct.
 

@@ -60,11 +60,8 @@ From the `jewelry_backend/` directory:
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# 2. Install dependencies (editable install)
-pip install -e .
-
-# Or, to include dev dependencies (pytest, aiosqlite, etc.)
-pip install -e ".[dev]"
+# 2. Install dependencies (includes pytest, pytest-asyncio, aiosqlite for tests)
+pip install -r requirements.txt
 ```
 
 ## Environment
@@ -246,8 +243,7 @@ jewelry_backend/
 │
 ├── AUDIT_READINESS.md          # Original audit-hardening assessment + role-split recipe
 ├── alembic.ini
-├── pyproject.toml
-├── requirements.txt            # For Render deploys that prefer requirements.txt
+├── requirements.txt            # Runtime + dev/test dependencies
 └── runtime.txt                 # Python version pin for Render
 ```
 

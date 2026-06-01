@@ -167,7 +167,10 @@ def _compute_holdings_from_rows(
     }
 
     for row in products:
-        buckets[row["karat"]][SOURCE_PRODUCTS] += Decimal(row["weight_grams"])
+        # Phase 3: products are stocked-by-quantity. on_hand_qty defaults to 1
+        # so pre-Phase-3 callers (and qty=1 products) are unaffected.
+        qty = int(row.get("on_hand_qty", 1))
+        buckets[row["karat"]][SOURCE_PRODUCTS] += Decimal(row["weight_grams"]) * qty
 
     for row in coins:
         qty = int(row["on_hand_qty"])
@@ -220,8 +223,9 @@ async def compute_zakatable_holdings(db: AsyncSession) -> ZakatHoldings:
     """
     product_rows = (
         await db.execute(
-            select(Product.karat, Product.weight_grams).where(
-                Product.status.in_((ProductStatus.AVAILABLE, ProductStatus.RESERVED))
+            select(Product.karat, Product.weight_grams, Product.on_hand_qty).where(
+                Product.status.in_((ProductStatus.AVAILABLE, ProductStatus.RESERVED)),
+                Product.on_hand_qty > 0,
             )
         )
     ).all()
@@ -251,7 +255,10 @@ async def compute_zakatable_holdings(db: AsyncSession) -> ZakatHoldings:
     ).all()
 
     return _compute_holdings_from_rows(
-        products=({"karat": r.karat, "weight_grams": r.weight_grams} for r in product_rows),
+        products=(
+            {"karat": r.karat, "weight_grams": r.weight_grams, "on_hand_qty": r.on_hand_qty}
+            for r in product_rows
+        ),
         coins=(
             {"karat": r.karat, "weight_grams": r.weight_grams, "on_hand_qty": r.on_hand_qty}
             for r in coin_rows

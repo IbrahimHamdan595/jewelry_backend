@@ -15,6 +15,7 @@ from app.core.ledger import (
     EVENT_LOT_CREATED,
     record,
 )
+from app.core.daterange import parse_calendar_filter
 from app.core.pricing import compute_buyback_price
 from app.deps import get_current_user, get_db
 from app.models import (
@@ -26,13 +27,16 @@ from app.models import (
     Karat,
     LotSource,
     OunceType,
+    Product,
     Settings,
     User,
     WalkinBuyback,
 )
+from app.core.receipt import build_buyback_receipt
 from app.schemas.buyback import (
     BuybackCreate, BuybackListOut, BuybackQuoteOut, BuybackReceiptOut,
 )
+from app.schemas.receipt import ReceiptOut
 
 router = APIRouter(prefix="/buybacks", tags=["buybacks"])
 
@@ -466,6 +470,8 @@ async def _create_used_product_buyback(
 async def list_buybacks(
     kind: str = "",
     cashier_id: str = "",
+    granularity: str = "",
+    date: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -479,6 +485,11 @@ async def list_buybacks(
             raise HTTPException(status_code=422, detail=f"Invalid kind '{kind}'")
     if cashier_id:
         q = q.where(WalkinBuyback.cashier_id == cashier_id)
+    # Phase 5 — calendar filter (Beirut-local day/month/year).
+    cal_range = parse_calendar_filter(granularity, date)
+    if cal_range:
+        start, end = cal_range
+        q = q.where(WalkinBuyback.occurred_at >= start, WalkinBuyback.occurred_at < end)
 
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
     q = q.order_by(WalkinBuyback.occurred_at.desc()).offset((page - 1) * page_size).limit(page_size)
@@ -503,3 +514,37 @@ async def get_buyback(
     if not row:
         raise HTTPException(status_code=404, detail="Buyback not found")
     return BuybackReceiptOut.model_validate(row)
+
+
+@router.get("/{buyback_id}/receipt", response_model=ReceiptOut)
+async def get_buyback_receipt(
+    buyback_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Normalized buyback receipt for printing (Phase 4)."""
+    row = (
+        await db.execute(select(WalkinBuyback).where(WalkinBuyback.id == buyback_id))
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Buyback not found")
+    settings = await _load_settings(db)
+
+    # Resolve a human description for the line and the cashier's name.
+    description: str | None = None
+    if row.coin_type_id:
+        c = (await db.execute(select(CoinType).where(CoinType.id == row.coin_type_id))).scalar_one_or_none()
+        description = c.name_en if c else None
+    elif row.ounce_type_id:
+        o = (await db.execute(select(OunceType).where(OunceType.id == row.ounce_type_id))).scalar_one_or_none()
+        description = o.name_en if o else None
+    elif row.product_id:
+        p = (await db.execute(select(Product).where(Product.id == row.product_id))).scalar_one_or_none()
+        description = p.name_en if p else None
+
+    cashier = (await db.execute(select(User).where(User.id == row.cashier_id))).scalar_one_or_none()
+    return build_buyback_receipt(
+        row, settings,
+        item_description=description,
+        cashier_name=cashier.name if cashier else None,
+    )
