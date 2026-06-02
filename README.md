@@ -1,4 +1,4 @@
-# MAISON ZAHAB — Backend
+# Backend
 
 FastAPI backend for a gold-jewellery point-of-sale + inventory + procurement
 system. Tracks four kinds of gold stock (atomic products, coin types, ounce
