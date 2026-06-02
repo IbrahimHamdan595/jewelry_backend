@@ -141,8 +141,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ## Run with Docker
 
 ```bash
-docker build -t maison-zahab-backend .
-docker run --rm -p 8000:8000 --env-file .env maison-zahab-backend
+docker build -t fawaz-el-namel-backend .
+docker run --rm -p 8000:8000 --env-file .env fawaz-el-namel-backend
 ```
 
 ---

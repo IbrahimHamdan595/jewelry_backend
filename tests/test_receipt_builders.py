@@ -34,8 +34,8 @@ NOW = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
 def _settings() -> Settings:
     return Settings(
         id="singleton",
-        store_name="MAISON ZAHAB",
-        store_name_ar="ميزون ذهب",
+        store_name="Fawaz El Namel",
+        store_name_ar="فواز النمل",
         address="Beirut",
         phone="+961",
         vat_number="VAT-1",
@@ -78,7 +78,7 @@ def test_sale_receipt_shape():
     assert r.reference == "ORD-20260601-001"
     assert r.cashier_name == "Cashier One"
     assert r.party.role == "customer" and r.party.name == "Jane Doe"
-    assert r.store.name == "MAISON ZAHAB"
+    assert r.store.name == "Fawaz El Namel"
     assert len(r.lines) == 1
     assert r.lines[0].quantity == Decimal("2")
     assert r.lines[0].unit_price == Decimal("500.00")  # 1000 / 2

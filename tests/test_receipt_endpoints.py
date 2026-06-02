@@ -31,7 +31,7 @@ from app.schemas.receipt import ReceiptType
 
 async def _common(db):
     admin = User(id="admin1", email="a@x.com", name="Admin", password_hash="x", role=Role.ADMIN)
-    settings = Settings(id="singleton", store_name="MAISON ZAHAB", vat_percent=Decimal("11"),
+    settings = Settings(id="singleton", store_name="Fawaz El Namel", vat_percent=Decimal("11"),
                         lbp_exchange_rate=Decimal("89500"), max_discount_percent=Decimal("0"))
     db.add_all([admin, settings])
     await db.commit()
@@ -56,7 +56,7 @@ async def test_4_1_sales_receipt_shows_customer_and_cashier(db):
     assert receipt.type == ReceiptType.SALE
     assert receipt.cashier_name == "Admin"
     assert receipt.party.role == "customer" and receipt.party.name == "Jane Doe"
-    assert receipt.store.name == "MAISON ZAHAB"
+    assert receipt.store.name == "Fawaz El Namel"
 
 
 @pytest.mark.asyncio

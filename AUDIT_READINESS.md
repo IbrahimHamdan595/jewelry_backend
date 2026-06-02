@@ -1,4 +1,4 @@
-# MAISON ZAHAB — Audit Readiness Assessment
+# Fawaz El Namel — Audit Readiness Assessment
 
 > **Phase 0 deliverable.** No code changes yet. Read this, mark up what you want
 > changed, and approve before implementation starts.
@@ -359,7 +359,7 @@ reconnect as `gold_app` on next request.
 **3. Keep the existing owner credential for migrations only.** The
 current `DATABASE_URL` value (the owner role) stops living in any
 deployed service. Move it to your password manager under
-`MAISON ZAHAB / Neon / migration owner`. To run migrations:
+`Fawaz El Namel / Neon / migration owner`. To run migrations:
 
 ```bash
 DATABASE_URL='<owner-url>' alembic upgrade head

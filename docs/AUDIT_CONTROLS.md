@@ -1,4 +1,4 @@
-# MAISON ZAHAB — Audit Controls Reference
+# Fawaz El Namel — Audit Controls Reference
 
 > **Purpose.** Single-page reference for what audit-grade controls
 > currently exist in the system, the invariants they uphold, and how to
@@ -261,7 +261,7 @@ Deploy. App reconnects as `gold_app` on next request.
 
 ### Step 3 — Keep the owner credential for migrations only
 
-Move the current owner URL out of any deployed service. Store in password manager under `MAISON ZAHAB / Neon / migration owner`. To run a migration:
+Move the current owner URL out of any deployed service. Store in password manager under `Fawaz El Namel / Neon / migration owner`. To run a migration:
 
 ```bash
 DATABASE_URL='<owner-url>' alembic upgrade head
