@@ -287,3 +287,91 @@ async def post_supplier_payment(db: AsyncSession, payment, settings: Settings, a
         db, entry_date=entry_date, memo="Supplier payment",
         source_type=SOURCE_SUPPLIER_PAYMENT, source_id=payment.id, lines=lines, actor_user_id=actor_user_id,
     )
+
+
+async def post_buyback(db: AsyncSession, buyback, settings: Settings, actor_user_id: str):
+    """Gold acquired for cash: DR Metal Inventory (cost+grams), CR Cash (cost),
+    CR Metal Clearing (grams) — the metal counterpart for metal-crosses-money."""
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_BUYBACK, buyback.id):
+        return None
+    entry_date = buyback.occurred_at.date() if buyback.occurred_at else date.today()
+    await ensure_period(db, entry_date)
+    if buyback.karat is None or not buyback.weight_grams:
+        return None  # nothing metal to post (defensive)
+
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+    cash_id = await resolve_account_id(db, "CASH")
+    clearing_id = await resolve_account_id(db, "METAL_CLEARING")
+    k = buyback.karat.value
+    grams = buyback.weight_grams * (buyback.quantity or 1)
+    cost = buyback.buy_price_usd.quantize(_Q_MONEY)
+    lines = [
+        gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost,
+                  metal_debit_grams=grams, karat=k, memo="buyback in"),
+        gl.GLLine(account_id=cash_id, denomination="MONEY", base_credit=cost,
+                  money_credit=cost, memo="buyback cash out"),
+        gl.GLLine(account_id=clearing_id, denomination="DUAL",
+                  metal_credit_grams=grams, karat=k, memo="metal acquired (clearing)"),
+    ]
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="Walk-in buyback",
+        source_type=SOURCE_BUYBACK, source_id=buyback.id, lines=lines, actor_user_id=actor_user_id,
+    )
+
+
+async def post_melt(db: AsyncSession, melt, settings: Settings, actor_user_id: str):
+    """Karat conversion: cost preserved within Metal Inventory; each karat's
+    grams balance through Metal Clearing."""
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_MELT, melt.id):
+        return None
+    entry_date = melt.occurred_at.date() if melt.occurred_at else date.today()
+    await ensure_period(db, entry_date)
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+    clearing_id = await resolve_account_id(db, "METAL_CLEARING")
+    cost = melt.cost_usd.quantize(_Q_MONEY)
+    fk, fg = melt.from_karat.value, melt.from_grams
+    tk, tg = melt.to_karat.value, melt.to_grams
+    lines = [
+        gl.GLLine(account_id=inv_id, denomination="DUAL", base_credit=cost,
+                  metal_credit_grams=fg, karat=fk, memo="melt consume"),
+        gl.GLLine(account_id=clearing_id, denomination="DUAL", metal_debit_grams=fg, karat=fk, memo="melt clearing A"),
+        gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost,
+                  metal_debit_grams=tg, karat=tk, memo="melt result"),
+        gl.GLLine(account_id=clearing_id, denomination="DUAL", metal_credit_grams=tg, karat=tk, memo="melt clearing B"),
+    ]
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="Melt / refining",
+        source_type=SOURCE_MELT, source_id=melt.id, lines=lines, actor_user_id=actor_user_id,
+    )
+
+
+async def post_adjustment(db: AsyncSession, adj, settings: Settings, actor_user_id: str):
+    """Metal inventory loss/theft/gift: DR Adjustment Expense (cost), CR Metal
+    Inventory (cost+grams), DR Metal Clearing (grams)."""
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_ADJUSTMENT, adj.id):
+        return None
+    entry_date = adj.occurred_at.date() if adj.occurred_at else date.today()
+    await ensure_period(db, entry_date)
+    if adj.karat is None or not adj.grams:
+        return None
+    exp_id = await resolve_account_id(db, "ADJUSTMENT_EXPENSE")
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+    clearing_id = await resolve_account_id(db, "METAL_CLEARING")
+    k = adj.karat.value
+    cost = adj.cost_usd.quantize(_Q_MONEY)
+    lines = [
+        gl.GLLine(account_id=exp_id, denomination="MONEY", base_debit=cost, money_debit=cost, memo="inventory loss"),
+        gl.GLLine(account_id=inv_id, denomination="DUAL", base_credit=cost,
+                  metal_credit_grams=adj.grams, karat=k, memo="metal written off"),
+        gl.GLLine(account_id=clearing_id, denomination="DUAL", metal_debit_grams=adj.grams, karat=k, memo="metal loss (clearing)"),
+    ]
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="Inventory adjustment",
+        source_type=SOURCE_ADJUSTMENT, source_id=adj.id, lines=lines, actor_user_id=actor_user_id,
+    )
