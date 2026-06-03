@@ -258,3 +258,46 @@ async def post_entry(
     )
     await db.flush()
     return entry
+
+
+async def reverse_entry(
+    db: AsyncSession,
+    *,
+    original_entry_id: str,
+    actor_user_id: str,
+    entry_date: date,
+    memo: str = "",
+) -> GLJournalEntry:
+    """Post a reversing entry: every original line's debit/credit swapped, in
+    both the money and metal dimensions. Sets reverses_entry_id (design §3.4).
+    Reversal is the ONLY correction mechanism — posted entries are immutable."""
+    original = (
+        await db.execute(select(GLJournalEntry).where(GLJournalEntry.id == original_entry_id))
+    ).scalar_one_or_none()
+    if original is None:
+        raise HTTPException(status_code=404, detail="Entry to reverse not found")
+
+    orig_lines = (
+        await db.execute(
+            select(GLJournalLine).where(GLJournalLine.entry_id == original_entry_id)
+            .order_by(GLJournalLine.line_no)
+        )
+    ).scalars().all()
+
+    swapped = [
+        GLLine(
+            account_id=l.account_id, denomination="",  # re-resolved in post_entry
+            base_debit=l.base_credit, base_credit=l.base_debit,
+            money_debit=l.money_credit, money_credit=l.money_debit,
+            currency=l.currency, fx_rate=l.fx_rate,
+            metal_debit_grams=l.metal_credit_grams, metal_credit_grams=l.metal_debit_grams,
+            karat=l.karat, memo=f"reversal of {l.memo}" if l.memo else "reversal",
+        )
+        for l in orig_lines
+    ]
+
+    return await post_entry(
+        db, entry_date=entry_date, memo=memo or f"Reversal of {original.entry_no}",
+        source_type=SOURCE_REVERSAL, source_id=original.id,
+        lines=swapped, actor_user_id=actor_user_id, reverses_entry_id=original.id,
+    )
