@@ -4,6 +4,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import kpis as kpis_core
 from app.core import statements
 from app.core.permissions import require_accounting
 from app.core.xlsx import Sheet, build_xlsx_response
@@ -76,6 +77,30 @@ def _acct_sheets(d: dict) -> list[Sheet]:
                   rows=rows, title=f"{d['code']} {d['name']} — {d['start']} → {d['end']}")]
 
 
+_KPI_ROWS = [
+    ("dsi", "DSI (days)", lambda d: f"avg inv {d['avg_inventory']} / COGS {d['cogs']}"),
+    ("inventory_turnover", "Inventory turnover", lambda d: f"COGS {d['cogs']} / avg inv {d['avg_inventory']}"),
+    ("dpo", "DPO (days)", lambda d: f"avg AP {d['avg_ap']} / COGS {d['cogs']}"),
+    ("gross_margin", "Gross margin (%)", lambda d: f"gross {d['gross_profit']} / rev {d['revenue']}"),
+    ("net_margin", "Net margin (%)", lambda d: f"net {d['net_profit']} / rev {d['revenue']}"),
+    ("metal_turnover", "Metal turnover (grams)", lambda d: f"metal COGS {d['metal_cogs_grams']}g / avg {d['avg_metal_grams']}g"),
+    ("dso", "DSO (days)", lambda d: f"avg AR {d['avg_ar']} / credit sales {d['credit_sales']}"),
+    ("ccc", "Cash Conversion Cycle (days)", lambda d: f"DSO {d['dso']} + DSI {d['dsi']} − DPO {d['dpo']}"),
+    ("current_ratio", "Current ratio", lambda d: f"assets {d['current_assets']} / liab {d['current_liabilities']}"),
+    ("quick_ratio", "Quick ratio", lambda d: f"(assets {d['current_assets']} − inv {d['inventory']}) / liab {d['current_liabilities']}"),
+]
+
+
+def _kpis_sheets(d: dict) -> list[Sheet]:
+    rows = []
+    for key, label, inputs in _KPI_ROWS:
+        kd = d[key]
+        value = kd["value"]
+        rows.append([label, ("n/a" if value is None else value), inputs(kd)])
+    return [Sheet(name="KPIs", headers=["KPI", "Value", "Inputs"], rows=rows,
+                  title=f"Financial KPIs {d['start']} → {d['end']} ({d['days']} days)")]
+
+
 @router.get("/income-statement")
 async def income_statement(start: date, end: date, format: str = Query(None),
                            db: AsyncSession = Depends(get_db),
@@ -113,4 +138,14 @@ async def account_statement(account_id: str, start: date, end: date, format: str
     data = await statements.account_statement(db, account_id=account_id, start=start, end=end)
     if format == "xlsx":
         return build_xlsx_response(_acct_sheets(data), filename=f"account-{data['code']}-{start}-{end}")
+    return _S(data)
+
+
+@router.get("/kpis")
+async def kpis(start: date, end: date, format: str = Query(None),
+               db: AsyncSession = Depends(get_db),
+               _: User = Depends(require_accounting)):
+    data = await kpis_core.compute_kpis(db, start=start, end=end)
+    if format == "xlsx":
+        return build_xlsx_response(_kpis_sheets(data), filename=f"kpis-{start}-{end}")
     return _S(data)
