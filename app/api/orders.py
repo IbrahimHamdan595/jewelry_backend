@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core import gl_postings
 from app.core.gold_api import get_current_gold_rate
 from app.core.ledger import (
     EVENT_ORDER_ITEM_REFUND,
@@ -377,6 +378,9 @@ async def create_order(
             payload=rec["payload"],
         )
 
+    # Module 1 auto-posting (no-op unless the settings flag is ON).
+    await gl_postings.post_sale(db, order, settings, user.id)
+
     await db.commit()
     await db.refresh(order)
 
@@ -586,6 +590,11 @@ async def void_order(
             payload=rp["payload"],
         )
 
+    # Module 1 auto-posting: full reversal of the sale entry (no-op if flag OFF).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_order_refund(db, order, _settings, user.id, refunded_item=None)
+
     await db.commit()
     await db.refresh(order)
     return OrderOut.model_validate(order)
@@ -595,7 +604,7 @@ async def void_order(
 async def refund_order(
     order_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    user: User = Depends(require_admin),
 ):
     order = (
         await db.execute(
@@ -610,6 +619,12 @@ async def refund_order(
         raise HTTPException(status_code=400, detail="Only completed orders can be refunded")
 
     order.status = OrderStatus.REFUNDED
+
+    # Module 1 auto-posting: full reversal of the sale entry (no-op if flag OFF).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_order_refund(db, order, _settings, user.id, refunded_item=None)
+
     await db.commit()
     await db.refresh(order)
     return OrderOut.model_validate(order)
@@ -769,6 +784,16 @@ async def refund_order_item(
             **stock_payload,
         },
     )
+
+    # Module 1 auto-posting: reverse only this refund event's portion (no-op if
+    # flag OFF). refund_seq = the new cumulative refunded_qty makes the source id
+    # unique per refund event on this line.
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_order_refund(
+            db, order, _settings, user.id,
+            refunded_item=item, refund_value=refund_value, refund_qty=qty, refund_seq=item.refunded_qty,
+        )
 
     await db.commit()
     order_with_relations = (
