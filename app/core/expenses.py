@@ -15,7 +15,7 @@ from app.core import gl
 from app.core.ar import _next_doc_no
 from app.core.gl_postings import auto_post_enabled
 from app.models import (
-    AccountType, GLAccount, GLJournalEntry, GLJournalLine, Settings,
+    AccountType, GLAccount, GLJournalEntry, GLJournalLine, Settings, TaxCode,
     VendorBill, VendorBillLine, VendorBillStatus, VendorPayment, VendorPaymentAllocation,
 )
 
@@ -47,7 +47,8 @@ async def _resolve_expense_account(db: AsyncSession, line: dict) -> str:
 
 async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: str | None,
                            bill_date: date, due_date, lines: list[dict], payment_system_key: str | None,
-                           memo: str, settings: Settings, actor_user_id: str) -> VendorBill:
+                           memo: str, settings: Settings, actor_user_id: str,
+                           tax_code_id: str | None = None) -> VendorBill:
     if not lines:
         raise HTTPException(422, "A bill needs at least one line")
     resolved = []  # (expense_account_id, amount, description)
@@ -57,13 +58,25 @@ async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: s
         amt = Decimal(str(ln["amount"])).quantize(_Q_MONEY)
         resolved.append((acct_id, amt, ln.get("description", "")))
         total += amt
-    total = total.quantize(_Q_MONEY)
+
+    # Module 6 — input VAT. Lines are NET; VAT is added on top per the tax code.
+    subtotal = total.quantize(_Q_MONEY)
+    vat = ZERO
+    if tax_code_id:
+        tc = (await db.execute(select(TaxCode).where(TaxCode.id == tax_code_id))).scalar_one_or_none()
+        if tc is None:
+            raise HTTPException(422, "Tax code not found")
+        vat = (subtotal * tc.rate / Decimal(100)).quantize(_Q_MONEY)
+    total = (subtotal + vat).quantize(_Q_MONEY)
 
     entry = None
     if auto_post_enabled(settings):
         credit_id = (await _resolve(db, payment_system_key)) if payment_system_key else (await _resolve(db, "VENDOR_AP"))
         gl_lines = [gl.GLLine(account_id=aid, denomination="MONEY", base_debit=amt, money_debit=amt, memo=desc or "expense")
                     for aid, amt, desc in resolved]
+        if vat > 0:
+            vat_id = await _resolve(db, "VAT_RECEIVABLE")
+            gl_lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY", base_debit=vat, money_debit=vat, memo="input VAT"))
         gl_lines.append(gl.GLLine(account_id=credit_id, denomination="MONEY",
                                   base_credit=total, money_credit=total,
                                   memo=("paid" if payment_system_key else "vendor AP")))
@@ -72,7 +85,8 @@ async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: s
 
     paid_now = payment_system_key is not None
     bill = VendorBill(bill_no=await _next_doc_no(db, "BILL", bill_date), vendor_name=vendor_name,
-                      supplier_id=supplier_id, bill_date=bill_date, due_date=due_date, total=total,
+                      supplier_id=supplier_id, bill_date=bill_date, due_date=due_date,
+                      subtotal=subtotal, vat_amount=vat, total=total, tax_code_id=tax_code_id,
                       amount_paid=(total if paid_now else ZERO),
                       status=(VendorBillStatus.PAID if paid_now else VendorBillStatus.OPEN),
                       payment_system_key=payment_system_key, gl_entry_id=(entry.id if entry else None), memo=memo)
