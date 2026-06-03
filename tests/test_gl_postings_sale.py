@@ -126,3 +126,27 @@ async def test_post_sale_idempotent(db):
     from app.models import GLJournalEntry
     entries = (await db.execute(select(GLJournalEntry))).scalars().all()
     assert len(entries) == 1
+
+
+from app.core.gl_postings import post_order_refund
+
+
+@pytest.mark.asyncio
+async def test_full_void_reverses_sale(db):
+    await _seeded(db)
+    order = await _make_order(db)
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    rev = await post_order_refund(db, order, _settings(on=True), "u1", refunded_item=None)
+    assert rev is not None and rev.reverses_entry_id is not None
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["total_base_debit"] == tb["total_base_credit"]
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CASH"]["net_base"] == D("0.00")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")
+
+
+@pytest.mark.asyncio
+async def test_full_void_flag_off_noop(db):
+    await _seeded(db)
+    order = await _make_order(db)
+    assert await post_order_refund(db, order, _settings(on=False), "u1", refunded_item=None) is None

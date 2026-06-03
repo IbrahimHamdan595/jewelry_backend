@@ -142,3 +142,68 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
         db, entry_date=entry_date, memo=f"Sale {order.order_number}",
         source_type=SOURCE_ORDER, source_id=order.id, lines=lines, actor_user_id=actor_user_id,
     )
+
+
+class _RefundItemView:
+    """Adapts an OrderItem to the shape _cogs_cost_for_item expects, with
+    quantity = the refunded qty (so cost is the refunded portion)."""
+    def __init__(self, item):
+        self.item_kind = item.item_kind
+        self.product_id = item.product_id
+        self.karat = item.karat
+        self.weight_grams = item.weight_grams
+        self.gold_rate_at_sale = item.gold_rate_at_sale
+        self.quantity = item.refunded_qty or 1
+
+
+async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
+                            *, refunded_item=None, refund_seq: int = 0):
+    """Full void/refund → reverse the original ORDER entry. Per-item refund →
+    a targeted reversing entry for just that line's revenue + VAT share + COGS."""
+    if not auto_post_enabled(settings):
+        return None
+    original = await find_live_entry(db, SOURCE_ORDER, order.id)
+    if original is None:
+        return None  # nothing was posted (e.g. flag was off at sale time)
+
+    if refunded_item is None:
+        if await find_live_entry(db, SOURCE_ORDER_REFUND, order.id):
+            return None
+        return await gl.reverse_entry(
+            db, original_entry_id=original.id, actor_user_id=actor_user_id,
+            entry_date=date.today(), memo=f"Void {order.order_number}",
+        )
+
+    # Partial per-item refund: reverse only this line's portion.
+    src_id = f"{refunded_item.id}:{refund_seq}"
+    if await find_live_entry(db, SOURCE_ORDER_REFUND, src_id):
+        return None
+    line_value = refunded_item.refunded_amount  # pre-VAT value just refunded
+    vat_share = (line_value * settings.vat_percent / Decimal(100)).quantize(_Q_MONEY)
+    making_share = (refunded_item.making_charge * (refunded_item.refunded_qty or 1)).quantize(_Q_MONEY)
+    sales_share = (line_value - making_share).quantize(_Q_MONEY)
+    cash_back = (line_value + vat_share).quantize(_Q_MONEY)
+    grams = refunded_item.weight_grams * (refunded_item.refunded_qty or 1)
+    cost = await _cogs_cost_for_item(db, _RefundItemView(refunded_item))
+
+    cash_id = await resolve_account_id(db, "CASH")
+    rev_id = await resolve_account_id(db, "SALES_REVENUE")
+    making_id = await resolve_account_id(db, "MAKING_CHARGE_REVENUE")
+    vat_id = await resolve_account_id(db, "VAT_PAYABLE")
+    cogs_id = await resolve_account_id(db, "METAL_COGS")
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+
+    lines = [
+        gl.GLLine(account_id=rev_id, denomination="MONEY", base_debit=sales_share, money_debit=sales_share, memo="refund revenue"),
+        gl.GLLine(account_id=vat_id, denomination="MONEY", base_debit=vat_share, money_debit=vat_share, memo="refund VAT"),
+        gl.GLLine(account_id=cash_id, denomination="MONEY", base_credit=cash_back, money_credit=cash_back, memo="refund cash out"),
+        gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost, metal_debit_grams=grams, karat=refunded_item.karat.value, memo="metal back"),
+        gl.GLLine(account_id=cogs_id, denomination="DUAL", base_credit=cost, metal_credit_grams=grams, karat=refunded_item.karat.value, memo="reverse COGS"),
+    ]
+    if making_share > 0:
+        lines.insert(2, gl.GLLine(account_id=making_id, denomination="MONEY",
+                                  base_debit=making_share, money_debit=making_share, memo="refund making"))
+    return await gl.post_entry(
+        db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
+        source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
+    )
