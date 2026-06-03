@@ -146,20 +146,23 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
 
 class _RefundItemView:
     """Adapts an OrderItem to the shape _cogs_cost_for_item expects, with
-    quantity = the refunded qty (so cost is the refunded portion)."""
-    def __init__(self, item):
+    quantity = the units refunded in THIS event (so cost is that portion)."""
+    def __init__(self, item, qty):
         self.item_kind = item.item_kind
         self.product_id = item.product_id
         self.karat = item.karat
         self.weight_grams = item.weight_grams
         self.gold_rate_at_sale = item.gold_rate_at_sale
-        self.quantity = item.refunded_qty or 1
+        self.quantity = qty
 
 
 async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
-                            *, refunded_item=None, refund_seq: int = 0):
+                            *, refunded_item=None, refund_value=None, refund_qty=None,
+                            refund_seq: int = 0):
     """Full void/refund → reverse the original ORDER entry. Per-item refund →
-    a targeted reversing entry for just that line's revenue + VAT share + COGS."""
+    a targeted reversing entry for only the units refunded in THIS event, using
+    the explicit incremental `refund_value` (pre-VAT) and `refund_qty` (so a
+    second partial refund on the same line does not double-count)."""
     if not auto_post_enabled(settings):
         return None
     original = await find_live_entry(db, SOURCE_ORDER, order.id)
@@ -174,17 +177,18 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
             entry_date=date.today(), memo=f"Void {order.order_number}",
         )
 
-    # Partial per-item refund: reverse only this line's portion.
+    # Partial per-item refund: reverse only this event's portion.
     src_id = f"{refunded_item.id}:{refund_seq}"
     if await find_live_entry(db, SOURCE_ORDER_REFUND, src_id):
         return None
-    line_value = refunded_item.refunded_amount  # pre-VAT value just refunded
+    qty = refund_qty or 1
+    line_value = Decimal(str(refund_value))  # pre-VAT value refunded in this event
     vat_share = (line_value * settings.vat_percent / Decimal(100)).quantize(_Q_MONEY)
-    making_share = (refunded_item.making_charge * (refunded_item.refunded_qty or 1)).quantize(_Q_MONEY)
+    making_share = (refunded_item.making_charge * qty).quantize(_Q_MONEY)
     sales_share = (line_value - making_share).quantize(_Q_MONEY)
     cash_back = (line_value + vat_share).quantize(_Q_MONEY)
-    grams = refunded_item.weight_grams * (refunded_item.refunded_qty or 1)
-    cost = await _cogs_cost_for_item(db, _RefundItemView(refunded_item))
+    grams = refunded_item.weight_grams * qty
+    cost = await _cogs_cost_for_item(db, _RefundItemView(refunded_item, qty))
 
     cash_id = await resolve_account_id(db, "CASH")
     rev_id = await resolve_account_id(db, "SALES_REVENUE")

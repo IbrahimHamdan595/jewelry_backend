@@ -150,3 +150,37 @@ async def test_full_void_flag_off_noop(db):
     await _seeded(db)
     order = await _make_order(db)
     assert await post_order_refund(db, order, _settings(on=False), "u1", refunded_item=None) is None
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_reverses_only_that_event(db):
+    await _seeded(db)
+    # Order with a 2-unit coin line @ 50 each = 100 subtotal, vat 11.
+    order = Order(
+        order_number="ORD-2", cashier_id="u1", payment_method=PaymentMethod.CASH,
+        subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"), discount_percent=D("0"),
+        discount_amount=D("0"), total_usd=D("111"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+    )
+    item = OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="Coin",
+                     karat=Karat.K21, weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"),
+                     margin_percent=D("0"), making_charge=D("0"), final_price=D("100"), quantity=2)
+    order.items = [item]
+    db.add(order); await db.flush()
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+
+    # Refund 1 of 2 units: pre-VAT value 50, qty 1.
+    rev = await post_order_refund(db, order, _settings(on=True), "u1",
+                                  refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
+    assert rev is not None
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] and tb["metal_balanced"]
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    # Net cash = 111 in − (50 + 5.50 vat) out = 55.50; net inventory grams =
+    # -20 (2 coins @10g sold) + 10 (one coin back) = -10
+    assert accts["CASH"]["net_base"] == D("55.50")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("-10.000")
+
+    # Idempotent on the same refund_seq.
+    again = await post_order_refund(db, order, _settings(on=True), "u1",
+                                    refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
+    assert again is None
