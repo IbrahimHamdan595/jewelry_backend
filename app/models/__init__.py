@@ -389,6 +389,12 @@ class Settings(Base):
     buyback_rate_drift_pct_max: Mapped[Decimal] = mapped_column(
         Numeric(5, 2), nullable=False, default=Decimal("2")
     )
+    # Accounting (Module 1) — master switch for real-time auto-posting to the GL.
+    # Default OFF so operations behave exactly as before until accounting is set
+    # up (CoA seeded + opening balances). Flip ON to post every operation.
+    accounting_auto_post_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

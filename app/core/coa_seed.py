@@ -47,6 +47,9 @@ SYSTEM_ACCOUNTS: list[tuple] = [
     ("5000", "Metal COGS",            EXP, DU, DR, "USD", "METAL_COGS"),
     ("5100", "Making COGS",           EXP, M,  DR, "USD", "MAKING_COGS"),
     ("6900", "FX Gain/Loss",          EXP, M,  DR, "USD", "FX_GAIN_LOSS"),
+    # Module 1 (auto-posting) additions:
+    ("1250", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),
+    ("5200", "Inventory Adjustment Expense", EXP, M, DR, "USD", "ADJUSTMENT_EXPENSE"),
 ]
 
 
