@@ -239,33 +239,47 @@ async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings,
         )
     ).scalars().all()
 
+    cash_id = await resolve_account_id(db, "CASH")
     lines: list[gl.GLLine] = []
 
-    # Gold rows: per karat grams + cost from gold items.
+    # Gold item cost per karat (for valuing the net metal owed).
     gold_cost_by_karat: dict[str, Decimal] = {}
-    gold_grams_by_karat: dict[str, Decimal] = {}
     for it in items:
         if it.item_kind == SupplierItemKind.PURE_GOLD and it.karat is not None:
             k = it.karat.value
-            gold_grams_by_karat[k] = gold_grams_by_karat.get(k, ZERO) + (it.weight_grams or ZERO)
             gold_cost_by_karat[k] = gold_cost_by_karat.get(k, ZERO) + (it.unit_cost_usd or ZERO)
-    for k, grams in gold_grams_by_karat.items():
-        cost = gold_cost_by_karat.get(k, ZERO).quantize(_Q_MONEY)
-        lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
-                               base_debit=cost, metal_debit_grams=grams, karat=k, memo="gold purchase"))
-        lines.append(gl.GLLine(account_id=metal_ap_id, denomination="DUAL",
-                               base_credit=cost, metal_credit_grams=grams, karat=k, memo="metal AP"))
 
-    # Non-gold (product/coin/ounce) rows: money cost → Product Inventory vs AP.
-    cash_cost = sum(
-        ((it.unit_cost_usd or ZERO) for it in items
-         if it.item_kind != SupplierItemKind.PURE_GOLD), ZERO
-    ).quantize(_Q_MONEY)
-    if cash_cost > 0:
+    # Cash side (NET owed): DR Product Inventory full; CR AP net owed; CR Cash paid.
+    # M1 over-credited AP by the pay-at-creation portion; this nets it so GL AP
+    # ties to SupplierBalance (Module 4).
+    total_cash_due = (purchase.total_cash_due or ZERO)
+    cash_paid = (purchase.cash_paid_at_creation or ZERO)
+    cash_owed = (total_cash_due - cash_paid).quantize(_Q_MONEY)
+    if total_cash_due > 0:
         lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
-                               base_debit=cash_cost, money_debit=cash_cost, memo="product purchase"))
-        lines.append(gl.GLLine(account_id=ap_id, denomination="MONEY",
-                               base_credit=cash_cost, money_credit=cash_cost, memo="AP"))
+                               base_debit=total_cash_due.quantize(_Q_MONEY),
+                               money_debit=total_cash_due.quantize(_Q_MONEY), memo="product purchase"))
+        if cash_owed > 0:
+            lines.append(gl.GLLine(account_id=ap_id, denomination="MONEY",
+                                   base_credit=cash_owed, money_credit=cash_owed, memo="AP (net owed)"))
+        if cash_paid > 0:
+            lines.append(gl.GLLine(account_id=cash_id, denomination="MONEY",
+                                   base_credit=cash_paid.quantize(_Q_MONEY),
+                                   money_credit=cash_paid.quantize(_Q_MONEY), memo="paid at creation"))
+
+    # Gold side (NET owed per karat): DR Metal Inventory; CR Metal AP net grams.
+    total_due = {k: Decimal(str(v)) for k, v in (purchase.total_grams_due_by_karat or {}).items()}
+    paid = {k: Decimal(str(v)) for k, v in (purchase.grams_paid_at_creation_by_karat or {}).items()}
+    for k, due in total_due.items():
+        net = due - paid.get(k, ZERO)
+        if net <= 0:
+            continue
+        gc = gold_cost_by_karat.get(k, ZERO)
+        net_cost = (gc * net / due).quantize(_Q_MONEY) if due > 0 else ZERO
+        lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
+                               base_debit=net_cost, metal_debit_grams=net, karat=k, memo="gold purchase (net)"))
+        lines.append(gl.GLLine(account_id=metal_ap_id, denomination="DUAL",
+                               base_credit=net_cost, metal_credit_grams=net, karat=k, memo="metal AP (net owed)"))
 
     if not lines:
         return None
