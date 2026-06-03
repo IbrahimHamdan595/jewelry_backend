@@ -90,3 +90,46 @@ async def test_vat_return_nets_output_minus_input(db):
     assert ret["cash_split"]["cash_75"] == D("67.50") and ret["cash_split"]["transfer_25"] == D("22.50")
     q1 = await tax.compute_vat_return(db, year=2026, quarter=1)
     assert q1["output_vat"] == D("0.00") and q1["net_payable"] == D("0.00")
+
+
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+
+@pytest_asyncio.fixture
+async def client(db):
+    from app.main import app
+    from app.deps import get_db, get_current_user
+    from app.models import User, Role
+    admin = User(id="u-admin", email="a@x.com", name="A", password_hash="x", role=Role.ADMIN, is_active=True)
+    db.add(admin)
+    db.add(Settings(id="singleton", accounting_auto_post_enabled=True))
+    await seed_chart_of_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=5, status=PeriodStatus.OPEN))
+    await db.flush()
+
+    async def _get_db():
+        yield db
+
+    async def _get_user():
+        return admin
+
+    app.dependency_overrides[get_db] = _get_db
+    app.dependency_overrides[get_current_user] = _get_user
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_tax_api_seed_bill_and_return(client):
+    assert (await client.post("/api/accounting/tax/seed-codes")).json()["created"] == 3
+    codes = (await client.get("/api/accounting/tax/codes")).json()["items"]
+    std = next(c for c in codes if c["code"] == "STANDARD")
+    r = await client.post("/api/accounting/expenses/bills", json={
+        "vendor_name": "L", "bill_date": "2026-05-03", "tax_code_id": std["id"],
+        "lines": [{"description": "rent", "expense_system_key": "RENT_EXPENSE", "amount": "1000"}]})
+    assert r.status_code == 200, r.text
+    ret = (await client.get("/api/accounting/tax/vat-return?year=2026&quarter=2")).json()
+    assert ret["input_vat"] == "110.00" and ret["direction"] == "REFUNDABLE"

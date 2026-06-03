@@ -18,6 +18,7 @@ class VendorBillCreate(BaseModel):
     due_date: date | None = None
     memo: str = ""
     payment_system_key: str | None = None  # CASH/BANK ⇒ paid now; None ⇒ on credit
+    tax_code_id: str | None = None  # Module 6 — input VAT
     lines: list[BillLineIn] = Field(min_length=1)
 
 

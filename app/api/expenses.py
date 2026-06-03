@@ -40,7 +40,8 @@ async def create_bill(body: VendorBillCreate, db: AsyncSession = Depends(get_db)
     bill = await expenses.post_vendor_bill(
         db, vendor_name=body.vendor_name, supplier_id=body.supplier_id, bill_date=body.bill_date,
         due_date=body.due_date, lines=[l.model_dump() for l in body.lines],
-        payment_system_key=body.payment_system_key, memo=body.memo, settings=await _settings(db), actor_user_id=user.id)
+        payment_system_key=body.payment_system_key, memo=body.memo, settings=await _settings(db),
+        actor_user_id=user.id, tax_code_id=body.tax_code_id)
     await db.commit()
     return {"id": bill.id, "bill_no": bill.bill_no, "total": str(bill.total), "status": bill.status.value}
 
