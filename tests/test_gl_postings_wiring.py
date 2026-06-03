@@ -72,3 +72,32 @@ async def test_sale_with_flag_on_posts_balanced_entry(client, db):
     from datetime import date
     tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
     assert tb["balanced"] and tb["metal_balanced"]
+
+
+@pytest.mark.asyncio
+async def test_posting_failure_propagates(db):
+    """If post_entry raises (e.g. a system account missing), the mapper raises so
+    the operation's transaction rolls back — no partial GL entry survives."""
+    from decimal import Decimal as D
+    from app.core import gl_postings
+    from app.models import (
+        Order, OrderItem, OrderItemKind, PaymentMethod, Karat, GLAccount, GLJournalEntry,
+    )
+    await seed_chart_of_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    await db.flush()
+    # Remove a required account so posting fails.
+    sales = (await db.execute(select(GLAccount).where(GLAccount.system_key == "SALES_REVENUE"))).scalar_one()
+    await db.delete(sales)
+    await db.flush()
+    order = Order(order_number="ORD-X", cashier_id="u1", payment_method=PaymentMethod.CASH,
+                  subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"), discount_percent=D("0"),
+                  discount_amount=D("0"), total_usd=D("111"), total_lbp=D("0"), lbp_exchange_rate=D("89500"))
+    order.items = [OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="C",
+                             karat=Karat.K21, weight_grams=D("10"), gold_rate_at_sale=D("60"),
+                             margin_percent=D("0"), making_charge=D("0"), final_price=D("100"), quantity=1)]
+    db.add(order)
+    await db.flush()
+    s = Settings(id="singleton2", accounting_auto_post_enabled=True)
+    with pytest.raises(Exception):
+        await gl_postings.post_sale(db, order, s, "u1")
