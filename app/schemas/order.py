@@ -23,6 +23,8 @@ class CheckoutRequest(BaseModel):
     items: list[OrderItemIn]
     payment_method: str
     customer_name: str | None = None
+    # Module 3 — required when payment_method == CREDIT (sale on account → AR).
+    customer_id: str | None = None
     # Phase 2 — order-level discount %. Server rejects > Settings.max_discount_percent.
     discount_percent: Decimal = Decimal("0")
 

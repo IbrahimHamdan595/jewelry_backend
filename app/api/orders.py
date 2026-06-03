@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core import gl_postings
+from app.core import ar, gl_postings
 from app.core.gold_api import get_current_gold_rate
 from app.core.ledger import (
     EVENT_ORDER_ITEM_REFUND,
@@ -348,11 +348,25 @@ async def create_order(
     total_usd = subtotal + vat_amount - discount_amount
     total_lbp = (total_usd * settings.lbp_exchange_rate).quantize(Decimal("0.01"))
 
+    # Module 3 — credit sale on account: require + validate a customer, enforce
+    # the credit limit BEFORE posting.
+    if payload.payment_method == "CREDIT":
+        if not payload.customer_id:
+            raise HTTPException(status_code=422, detail="Credit sale requires a customer_id")
+        from app.models import Customer
+        credit_customer = (
+            await db.execute(select(Customer).where(Customer.id == payload.customer_id))
+        ).scalar_one_or_none()
+        if credit_customer is None:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        await ar.check_credit_limit(db, credit_customer, total_usd)
+
     order = Order(
         order_number=order_number,
         cashier_id=user.id,
         payment_method=PaymentMethod(payload.payment_method),
         customer_name=payload.customer_name,
+        customer_id=payload.customer_id,
         subtotal=subtotal,
         vat_percent=settings.vat_percent,
         vat_amount=vat_amount,
@@ -379,7 +393,13 @@ async def create_order(
         )
 
     # Module 1 auto-posting (no-op unless the settings flag is ON).
-    await gl_postings.post_sale(db, order, settings, user.id)
+    sale_entry = await gl_postings.post_sale(db, order, settings, user.id)
+
+    # Module 3 — credit sale: create the AR subledger invoice (linked to the order
+    # + the GL entry, which is None if the auto-post flag is OFF).
+    if order.payment_method == PaymentMethod.CREDIT:
+        await ar.create_invoice_from_order(db, order=order, customer_id=order.customer_id,
+                                           gl_entry=sale_entry, actor_user_id=user.id)
 
     await db.commit()
     await db.refresh(order)
