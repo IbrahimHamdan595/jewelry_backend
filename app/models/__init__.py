@@ -21,6 +21,10 @@ def _uid() -> str:
 class Role(str, enum.Enum):
     ADMIN = "ADMIN"
     CASHIER = "CASHIER"
+    # Accounting section (design §3.5). Only ACCOUNTANT is wired now; MANAGER
+    # is reserved for a future approvals/oversight role.
+    ACCOUNTANT = "ACCOUNTANT"
+    MANAGER = "MANAGER"
 
 
 class Karat(str, enum.Enum):
@@ -28,6 +32,33 @@ class Karat(str, enum.Enum):
     K21 = "K21"
     K22 = "K22"
     K24 = "K24"
+
+
+# ── Accounting (GL Core, Module 0) ────────────────────────────────────────────
+
+class AccountType(str, enum.Enum):
+    ASSET = "ASSET"
+    LIABILITY = "LIABILITY"
+    EQUITY = "EQUITY"
+    INCOME = "INCOME"
+    EXPENSE = "EXPENSE"
+
+
+class Denomination(str, enum.Enum):
+    """What a GL account can carry on its lines (design §3.2)."""
+    MONEY = "MONEY"   # cash, bank, revenue, VAT, expenses, AR control
+    METAL = "METAL"   # pure-gram memo/position accounts
+    DUAL = "DUAL"     # metal inventory / metal AP / metal COGS — money AND grams
+
+
+class NormalBalance(str, enum.Enum):
+    DEBIT = "DEBIT"
+    CREDIT = "CREDIT"
+
+
+class PeriodStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
 
 
 class OrderStatus(str, enum.Enum):
