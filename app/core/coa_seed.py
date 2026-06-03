@@ -51,6 +51,15 @@ SYSTEM_ACCOUNTS: list[tuple] = [
     # Module 1 (auto-posting) additions:
     ("1250", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),
     ("5200", "Inventory Adjustment Expense", EXP, M, DR, "USD", "ADJUSTMENT_EXPENSE"),
+    # Module 5 (Expenses & Purchasing):
+    ("2400", "Vendor Payables",       L,  M,  CR, "USD", "VENDOR_AP"),
+    ("6000", "Rent Expense",          EXP, M, DR, "USD", "RENT_EXPENSE"),
+    ("6100", "Utilities Expense",     EXP, M, DR, "USD", "UTILITIES_EXPENSE"),
+    ("6200", "Salaries Expense",      EXP, M, DR, "USD", "SALARIES_EXPENSE"),
+    ("6300", "Marketing Expense",     EXP, M, DR, "USD", "MARKETING_EXPENSE"),
+    ("6400", "Bank Charges",          EXP, M, DR, "USD", "BANK_CHARGES_EXPENSE"),
+    ("6500", "Office Supplies",       EXP, M, DR, "USD", "OFFICE_EXPENSE"),
+    ("6800", "Miscellaneous Expense", EXP, M, DR, "USD", "MISC_EXPENSE"),
 ]
 
 

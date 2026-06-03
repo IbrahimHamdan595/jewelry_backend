@@ -88,6 +88,15 @@ class ARInvoiceStatus(str, enum.Enum):
     VOID = "VOID"
 
 
+# ── Expenses & Purchasing (Module 5) ──────────────────────────────────────────
+
+class VendorBillStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    VOID = "VOID"
+
+
 class OrderStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     REFUNDED = "REFUNDED"
@@ -1206,4 +1215,63 @@ class ARReceiptAllocation(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     receipt_id: Mapped[str] = mapped_column(String, ForeignKey("ar_receipts.id", ondelete="CASCADE"), nullable=False)
     invoice_id: Mapped[str] = mapped_column(String, ForeignKey("ar_invoices.id"), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+
+
+# ── Expenses & Purchasing (Module 5) ──────────────────────────────────────────
+
+class VendorBill(Base):
+    __tablename__ = "vendor_bills"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    bill_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    vendor_name: Mapped[str] = mapped_column(String, nullable=False)
+    supplier_id: Mapped[str | None] = mapped_column(String, ForeignKey("suppliers.id"), nullable=True)
+    bill_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    amount_paid: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    status: Mapped[VendorBillStatus] = mapped_column(
+        Enum(VendorBillStatus, name="vendor_bill_status_enum"), nullable=False, default=VendorBillStatus.OPEN
+    )
+    payment_system_key: Mapped[str | None] = mapped_column(String, nullable=True)  # set ⇒ paid now
+    gl_entry_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_entries.id"), nullable=True)
+    memo: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_vendor_bills_vendor_status", "vendor_name", "status"),)
+
+
+class VendorBillLine(Base):
+    __tablename__ = "vendor_bill_lines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    bill_id: Mapped[str] = mapped_column(String, ForeignKey("vendor_bills.id", ondelete="CASCADE"), nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=False, default="")
+    expense_account_id: Mapped[str] = mapped_column(String, ForeignKey("gl_accounts.id"), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+
+
+class VendorPayment(Base):
+    __tablename__ = "vendor_payments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    payment_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    vendor_name: Mapped[str] = mapped_column(String, nullable=False)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    payment_system_key: Mapped[str] = mapped_column(String, nullable=False, default="CASH")
+    unapplied_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    gl_entry_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_entries.id"), nullable=True)
+    memo: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class VendorPaymentAllocation(Base):
+    __tablename__ = "vendor_payment_allocations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    payment_id: Mapped[str] = mapped_column(String, ForeignKey("vendor_payments.id", ondelete="CASCADE"), nullable=False)
+    bill_id: Mapped[str] = mapped_column(String, ForeignKey("vendor_bills.id"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
