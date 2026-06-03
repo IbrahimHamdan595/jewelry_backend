@@ -145,3 +145,116 @@ async def _next_entry_no(db: AsyncSession, entry_date: date) -> str:
     row.last_seq = row.last_seq + 1
     await db.flush()
     return f"JE-{day_key}-{row.last_seq:03d}"
+
+
+async def _resolve_denominations(db: AsyncSession, lines: list[GLLine]) -> None:
+    """Overwrite each line's `denomination` with the account's DB value, and
+    require the account to exist and be active. Authority lives in the DB, not
+    the caller (prevents a caller smuggling a metal component onto a MONEY
+    account)."""
+    ids = {ln.account_id for ln in lines}
+    rows = (await db.execute(select(GLAccount).where(GLAccount.id.in_(ids)))).scalars().all()
+    by_id = {a.id: a for a in rows}
+    for ln in lines:
+        acct = by_id.get(ln.account_id)
+        if acct is None:
+            raise HTTPException(status_code=422, detail=f"Unknown GL account {ln.account_id}")
+        if not acct.is_active:
+            raise HTTPException(status_code=422, detail=f"GL account {acct.code} is inactive")
+        ln.denomination = acct.denomination.value
+
+
+def _line_to_hash_dict(ln: GLLine) -> dict:
+    return {
+        "account_id": ln.account_id,
+        "money_debit": ln.money_debit, "money_credit": ln.money_credit,
+        "currency": ln.currency, "fx_rate": ln.fx_rate,
+        "base_debit": ln.base_debit, "base_credit": ln.base_credit,
+        "metal_debit_grams": ln.metal_debit_grams, "metal_credit_grams": ln.metal_credit_grams,
+        "karat": ln.karat, "memo": ln.memo,
+    }
+
+
+async def post_entry(
+    db: AsyncSession,
+    *,
+    entry_date: date,
+    memo: str,
+    source_type: str,
+    source_id: str | None,
+    lines: list[GLLine],
+    actor_user_id: str,
+    reverses_entry_id: str | None = None,
+    occurred_at: datetime | None = None,
+) -> GLJournalEntry:
+    """Post a balanced journal entry inside the caller's transaction (no commit).
+
+    Order (design §3.4): resolve OPEN period → resolve denominations from DB →
+    validate balance → lock chain head → allocate entry_no → compute hash →
+    insert header+lines → advance head → record GL_ENTRY_POSTED audit event.
+
+    Lock ordering note: the GL chain head is locked BEFORE InventoryLedger's
+    head (inside ledger.record). Always acquire GL-head-then-inventory-head to
+    avoid deadlocks.
+    """
+    period = await _resolve_open_period(db, entry_date)
+    await _resolve_denominations(db, lines)
+
+    errors = validate_balanced(lines)
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+
+    head = (
+        await db.execute(
+            select(GLJournalChainHead).where(GLJournalChainHead.id == 1).with_for_update()
+        )
+    ).scalar_one()
+
+    entry_no = await _next_entry_no(db, entry_date)
+    occurred = occurred_at or datetime.now(timezone.utc)
+
+    header = {
+        "entry_no": entry_no, "entry_date": entry_date, "memo": memo,
+        "source_type": source_type, "source_id": source_id,
+        "reverses_entry_id": reverses_entry_id, "actor_user_id": actor_user_id,
+        "occurred_at": occurred,
+    }
+    line_dicts = [_line_to_hash_dict(ln) for ln in lines]
+    entry_hash = compute_gl_entry_hash(prev_hash=head.latest_entry_hash, header=header, lines=line_dicts)
+
+    entry = GLJournalEntry(
+        entry_no=entry_no, entry_date=entry_date, period_id=period.id, memo=memo,
+        source_type=source_type, source_id=source_id, reverses_entry_id=reverses_entry_id,
+        actor_user_id=actor_user_id, occurred_at=occurred,
+        prev_hash=head.latest_entry_hash, entry_hash=entry_hash,
+    )
+    db.add(entry)
+    await db.flush()
+
+    for i, ln in enumerate(lines):
+        db.add(GLJournalLine(
+            entry_id=entry.id, line_no=i, account_id=ln.account_id,
+            money_debit=ln.money_debit, money_credit=ln.money_credit,
+            currency=ln.currency, fx_rate=ln.fx_rate,
+            base_debit=ln.base_debit, base_credit=ln.base_credit,
+            metal_debit_grams=ln.metal_debit_grams, metal_credit_grams=ln.metal_credit_grams,
+            karat=ln.karat, memo=ln.memo,
+        ))
+
+    head.latest_entry_hash = entry_hash
+    head.row_count = head.row_count + 1
+
+    await ledger.record(
+        db,
+        event_type=ledger.EVENT_GL_ENTRY_POSTED,
+        actor_user_id=actor_user_id,
+        ref_type="gl_journal_entry",
+        ref_id=entry.id,
+        payload={
+            "entry_no": entry_no, "source_type": source_type, "source_id": source_id,
+            "line_count": len(lines),
+            "base_debit_total": str(sum((ln.base_debit for ln in lines), ZERO)),
+        },
+    )
+    await db.flush()
+    return entry
