@@ -100,3 +100,48 @@ def validate_balanced(lines: list[GLLine]) -> list[str]:
             errors.append(f"metal line on {ln.account_id} requires a karat")
 
     return errors
+
+
+async def _resolve_open_period(db: AsyncSession, entry_date: date) -> GLPeriod:
+    """Find the monthly period for `entry_date` and require it OPEN."""
+    period = (
+        await db.execute(
+            select(GLPeriod).where(
+                GLPeriod.year == entry_date.year,
+                GLPeriod.period_no == entry_date.month,
+            )
+        )
+    ).scalar_one_or_none()
+    if period is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No accounting period for {entry_date.year}-{entry_date.month:02d}. "
+                   f"Open it first.",
+        )
+    if period.status != PeriodStatus.OPEN:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Accounting period {entry_date.year}-{entry_date.month:02d} is CLOSED.",
+        )
+    return period
+
+
+async def _next_entry_no(db: AsyncSession, entry_date: date) -> str:
+    """Allocate JE-YYYYMMDD-NNN via a per-day counter row locked FOR UPDATE.
+
+    During posting this runs while the chain-head lock is already held, so the
+    initial INSERT of a new day_key never races; the FOR UPDATE here also makes
+    direct callers safe."""
+    day_key = entry_date.strftime("%Y%m%d")
+    row = (
+        await db.execute(
+            select(GLEntrySequence).where(GLEntrySequence.day_key == day_key).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = GLEntrySequence(day_key=day_key, last_seq=0)
+        db.add(row)
+        await db.flush()
+    row.last_seq = row.last_seq + 1
+    await db.flush()
+    return f"JE-{day_key}-{row.last_seq:03d}"
