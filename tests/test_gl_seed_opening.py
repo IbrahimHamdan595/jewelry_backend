@@ -60,3 +60,50 @@ async def test_opening_balances_balances_with_equity(db):
     # Opening equity is the balancing plug.
     eq = next(a for a in tb["accounts"] if a["system_key"] == "OPENING_BALANCE_EQUITY")
     assert eq["net_base"] != D("0")
+
+
+@pytest.mark.asyncio
+async def test_opening_entry_hash_chain_verifies(db):
+    """Regression: the hash chain must verify after an OPENING entry, which
+    carries metal/DUAL lines. (A money-only entry verifying is not enough —
+    metal lines round-trip grams + karat through the hash.)"""
+    from app.core.audit_chain import verify_gl_chain
+    from app.models import GLJournalEntry, GLJournalLine
+
+    await seed_chart_of_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    db.add(GoldLot(karat=Karat.K21, weight_grams=D("100"), weight_remaining_grams=D("100"),
+                   source=LotSource.SEED, cost_basis_usd=D("5000")))
+    sup = Supplier(name="ACME Gold")
+    db.add(sup)
+    await db.flush()
+    db.add(SupplierBalance(supplier_id=sup.id, unit=DebtUnit.GOLD, karat="K21", balance=D("30")))
+    await db.flush()
+
+    await post_opening_balances(
+        db, as_of=date(2026, 6, 1), actor_user_id="u1",
+        cash_lines=[{"system_key": "CASH", "amount": D("1500")}],
+    )
+
+    entries = (await db.execute(
+        select(GLJournalEntry).order_by(GLJournalEntry.occurred_at, GLJournalEntry.id)
+    )).scalars().all()
+    rows = []
+    for e in entries:
+        lines = (await db.execute(
+            select(GLJournalLine).where(GLJournalLine.entry_id == e.id).order_by(GLJournalLine.line_no)
+        )).scalars().all()
+        rows.append({
+            "id": e.id, "prev_hash": e.prev_hash, "entry_hash": e.entry_hash,
+            "entry_no": e.entry_no, "entry_date": e.entry_date, "memo": e.memo,
+            "source_type": e.source_type, "source_id": e.source_id,
+            "reverses_entry_id": e.reverses_entry_id, "actor_user_id": e.actor_user_id,
+            "occurred_at": e.occurred_at,
+            "lines": [{
+                "account_id": l.account_id, "money_debit": l.money_debit, "money_credit": l.money_credit,
+                "currency": l.currency, "fx_rate": l.fx_rate, "base_debit": l.base_debit,
+                "base_credit": l.base_credit, "metal_debit_grams": l.metal_debit_grams,
+                "metal_credit_grams": l.metal_credit_grams, "karat": l.karat, "memo": l.memo,
+            } for l in lines],
+        })
+    assert verify_gl_chain(rows)["status"] == "intact"
