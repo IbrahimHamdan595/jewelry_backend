@@ -12,9 +12,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import gl
+from app.core.pricing import KARAT_PURITY
 from app.models import (
-    AccountType, DebtUnit, Denomination, GLAccount, GoldLot, NormalBalance,
-    SupplierBalance,
+    AccountType, CoinType, DebtUnit, Denomination, GLAccount, GoldLot, NormalBalance,
+    OunceType, Product, ProductStatus, SupplierBalance,
 )
 
 A, L, EQ, INC, EXP = (
@@ -86,6 +87,7 @@ async def post_opening_balances(
     as_of: date,
     actor_user_id: str,
     cash_lines: list[dict] | None = None,
+    gold_rate_24k: Decimal | None = None,
 ):
     """One-time OPENING entry seeded from current state, balanced against
     OPENING_BALANCE_EQUITY (design §3.5):
@@ -124,6 +126,41 @@ async def post_opening_balances(
         equity_credit += lot.cost_basis_usd
         metal_net_by_karat[kar] = metal_net_by_karat.get(kar, Decimal("0")) + lot.weight_remaining_grams
 
+    # 1b. Finished-goods metal (products/coins/ounces) → Metal Inventory, DR.
+    # Without this, selling finished goods drives METAL_INVENTORY negative since
+    # only raw lots were loaded above (M1 concern #1). Cost: tracked cost when
+    # present, else a gold-rate proxy (gold_rate_24k × pure grams).
+    rate = Decimal(str(gold_rate_24k)) if gold_rate_24k is not None else Decimal("0")
+
+    def _fg_cost(weight, karat, qty, tracked):
+        if tracked is not None:
+            return (tracked * qty).quantize(Decimal("0.01"))
+        return (rate * weight * KARAT_PURITY[karat] * qty).quantize(Decimal("0.01"))
+
+    products = (await db.execute(
+        select(Product).where(Product.status.in_((ProductStatus.AVAILABLE, ProductStatus.RESERVED)),
+                              Product.on_hand_qty > 0)
+    )).scalars().all()
+    for p in products:
+        kar = p.karat.value
+        grams = p.weight_grams * p.on_hand_qty
+        cost = _fg_cost(p.weight_grams, p.karat, p.on_hand_qty, p.cost_basis_usd)
+        lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost,
+                               metal_debit_grams=grams, karat=kar, memo=f"opening product {p.code}"))
+        equity_credit += cost
+        metal_net_by_karat[kar] = metal_net_by_karat.get(kar, Decimal("0")) + grams
+
+    for model, label in ((CoinType, "coin"), (OunceType, "ounce")):
+        rows = (await db.execute(select(model).where(model.on_hand_qty > 0))).scalars().all()
+        for r in rows:
+            kar = r.karat.value
+            grams = r.weight_grams * r.on_hand_qty
+            cost = _fg_cost(r.weight_grams, r.karat, r.on_hand_qty, None)
+            lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost,
+                                   metal_debit_grams=grams, karat=kar, memo=f"opening {label} {r.code}"))
+            equity_credit += cost
+            metal_net_by_karat[kar] = metal_net_by_karat.get(kar, Decimal("0")) + grams
+
     # 2. Supplier balances → AP (cash) and Metal AP (grams), CR liabilities.
     sup_balances = (await db.execute(select(SupplierBalance))).scalars().all()
     for bal in sup_balances:
@@ -141,9 +178,12 @@ async def post_opening_balances(
                                    memo="opening metal AP"))
             metal_net_by_karat[kar] = metal_net_by_karat.get(kar, Decimal("0")) - bal.balance
 
-    # 3. Manual cash/bank, DR.
+    # 3. Manual cash/bank, DR. Each cash line resolves by account_id or system_key.
     for cl in cash_lines:
-        acct_id = await _key_to_account_id(db, cl["system_key"])
+        if cl.get("account_id"):
+            acct_id = cl["account_id"]
+        else:
+            acct_id = await _key_to_account_id(db, cl["system_key"])
         amt = Decimal(str(cl["amount"]))
         lines.append(gl.GLLine(account_id=acct_id, denomination="MONEY",
                                base_debit=amt, money_debit=amt, memo="opening cash"))
