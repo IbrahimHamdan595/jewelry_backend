@@ -97,7 +97,12 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     entry_date = order.created_at.date() if order.created_at else date.today()
     await ensure_period(db, entry_date)
 
-    cash_key = "BANK" if order.payment_method == PaymentMethod.CARD else "CASH"
+    if order.payment_method == PaymentMethod.CREDIT:
+        cash_key = "AR"  # Module 3 — sale on account; AR control debited
+    elif order.payment_method == PaymentMethod.CARD:
+        cash_key = "BANK"
+    else:
+        cash_key = "CASH"
     making_revenue = sum(
         (it.making_charge * it.quantity for it in order.items), ZERO
     ).quantize(_Q_MONEY)
