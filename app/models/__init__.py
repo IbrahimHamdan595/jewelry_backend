@@ -61,6 +61,24 @@ class PeriodStatus(str, enum.Enum):
     CLOSED = "CLOSED"
 
 
+# ── Cash & Bank (Module 2) ────────────────────────────────────────────────────
+
+class BankAccountType(str, enum.Enum):
+    CASH = "CASH"
+    BANK = "BANK"
+    PETTY_CASH = "PETTY_CASH"
+
+
+class StatementLineStatus(str, enum.Enum):
+    UNMATCHED = "UNMATCHED"
+    MATCHED = "MATCHED"
+
+
+class ReconciliationStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    COMPLETED = "COMPLETED"
+
+
 class OrderStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     REFUNDED = "REFUNDED"
@@ -1038,3 +1056,66 @@ class GLEntrySequence(Base):
 
     day_key: Mapped[str] = mapped_column(String, primary_key=True)  # "YYYYMMDD"
     last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+# ── Cash & Bank (Module 2) ────────────────────────────────────────────────────
+
+class BankAccount(Base):
+    """A cash drawer / bank account / petty cash, backed by its own MONEY
+    gl_account so it reconciles independently (Module 2)."""
+    __tablename__ = "bank_accounts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    gl_account_id: Mapped[str] = mapped_column(String, ForeignKey("gl_accounts.id"), unique=True, nullable=False)
+    account_type: Mapped[BankAccountType] = mapped_column(
+        Enum(BankAccountType, name="bank_account_type_enum"), nullable=False
+    )
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    bank_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    account_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    opening_balance: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BankStatementLine(Base):
+    __tablename__ = "bank_statement_lines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    bank_account_id: Mapped[str] = mapped_column(String, ForeignKey("bank_accounts.id"), nullable=False)
+    stmt_date: Mapped[date] = mapped_column(Date, nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=False, default="")
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)  # signed, account currency
+    reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    matched_gl_line_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_lines.id"), nullable=True)
+    reconciliation_id: Mapped[str | None] = mapped_column(String, ForeignKey("reconciliations.id"), nullable=True)
+    status: Mapped[StatementLineStatus] = mapped_column(
+        Enum(StatementLineStatus, name="bank_stmt_line_status_enum"),
+        nullable=False, default=StatementLineStatus.UNMATCHED,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_bank_stmt_lines_acct_status", "bank_account_id", "status"),
+    )
+
+
+class Reconciliation(Base):
+    __tablename__ = "reconciliations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    bank_account_id: Mapped[str] = mapped_column(String, ForeignKey("bank_accounts.id"), nullable=False)
+    statement_date: Mapped[date] = mapped_column(Date, nullable=False)
+    statement_balance: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    gl_balance: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    cleared_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    difference: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    status: Mapped[ReconciliationStatus] = mapped_column(
+        Enum(ReconciliationStatus, name="reconciliation_status_enum"),
+        nullable=False, default=ReconciliationStatus.OPEN,
+    )
+    started_by_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
