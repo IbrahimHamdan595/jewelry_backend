@@ -62,3 +62,31 @@ async def test_vendor_bill_no_tax_code_unchanged(db):
         lines=[{"description": "x", "expense_system_key": "OFFICE_EXPENSE", "amount": D("40")}],
         payment_system_key="CASH", memo="", settings=_settings(True), actor_user_id="u1")
     assert bill.vat_amount == D("0.00") and bill.total == D("40.00") and bill.subtotal == D("40.00")
+
+
+async def _resolve_id(db, key):
+    from app.models import GLAccount
+    return (await db.execute(select(GLAccount).where(GLAccount.system_key == key))).scalar_one().id
+
+
+@pytest.mark.asyncio
+async def test_vat_return_nets_output_minus_input(db):
+    await _seed(db)
+    std = (await db.execute(select(TaxCode).where(TaxCode.code == "STANDARD"))).scalar_one()
+    # Input VAT 110 via a vendor bill in June (Q2).
+    await expenses.post_vendor_bill(db, vendor_name="L", supplier_id=None, bill_date=date(2026, 6, 3),
+        due_date=None, lines=[{"description": "r", "expense_system_key": "RENT_EXPENSE", "amount": D("1000")}],
+        payment_system_key=None, memo="", settings=_settings(True), actor_user_id="u1", tax_code_id=std.id)
+    # Output VAT 200 via a manual journal CR VAT_PAYABLE / DR Cash (stand-in for a sale).
+    cash = await _resolve_id(db, "CASH"); vatp = await _resolve_id(db, "VAT_PAYABLE")
+    await gl.post_entry(db, entry_date=date(2026, 6, 10), memo="sale vat", source_type="MANUAL", source_id=None,
+        lines=[gl.GLLine(account_id=cash, denomination="MONEY", base_debit=D("200"), money_debit=D("200")),
+               gl.GLLine(account_id=vatp, denomination="MONEY", base_credit=D("200"), money_credit=D("200"))],
+        actor_user_id="u1")
+    ret = await tax.compute_vat_return(db, year=2026, quarter=2)
+    assert ret["output_vat"] == D("200.00")
+    assert ret["input_vat"] == D("110.00")
+    assert ret["net_payable"] == D("90.00") and ret["direction"] == "PAYABLE"
+    assert ret["cash_split"]["cash_75"] == D("67.50") and ret["cash_split"]["transfer_25"] == D("22.50")
+    q1 = await tax.compute_vat_return(db, year=2026, quarter=1)
+    assert q1["output_vat"] == D("0.00") and q1["net_payable"] == D("0.00")
