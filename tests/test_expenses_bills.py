@@ -63,3 +63,28 @@ async def test_bill_paid_now_credits_cash(db):
     accts = {a["system_key"]: a for a in tb["accounts"] if a["system_key"]}
     assert accts["OFFICE_EXPENSE"]["base_debit"] == D("40.00")
     assert accts["CASH"]["base_credit"] == D("40.00")
+
+
+from sqlalchemy import select as _sel
+from app.models import VendorBill as _VB
+
+
+@pytest.mark.asyncio
+async def test_vendor_payment_fifo_and_tieout(db):
+    await _seed(db)
+    b1 = await expenses.post_vendor_bill(db, vendor_name="Landlord", supplier_id=None,
+        bill_date=date(2026, 6, 1), due_date=None,
+        lines=[{"description": "a", "expense_system_key": "RENT_EXPENSE", "amount": D("100")}],
+        payment_system_key=None, memo="", settings=_settings(True), actor_user_id="u1")
+    b2 = await expenses.post_vendor_bill(db, vendor_name="Landlord", supplier_id=None,
+        bill_date=date(2026, 6, 2), due_date=None,
+        lines=[{"description": "b", "expense_system_key": "RENT_EXPENSE", "amount": D("50")}],
+        payment_system_key=None, memo="", settings=_settings(True), actor_user_id="u1")
+    pay = await expenses.post_vendor_payment(db, vendor_name="Landlord", payment_date=date(2026, 6, 5),
+        amount=D("120"), payment_system_key="CASH", memo="", settings=_settings(True), actor_user_id="u1")
+    b1r = (await db.execute(_sel(_VB).where(_VB.id == b1.id))).scalar_one()
+    b2r = (await db.execute(_sel(_VB).where(_VB.id == b2.id))).scalar_one()
+    assert b1r.status == VendorBillStatus.PAID and b2r.amount_paid == D("20.00")
+    assert pay.unapplied_amount == D("0.00")
+    v = await expenses.verify_vendor_ap(db)
+    assert v["gl"] == D("30.00") and v["subledger"] == D("30.00") and v["matches"]
