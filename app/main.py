@@ -11,8 +11,8 @@ from app.core.rate_limit import limiter
 from app.jobs.gold_rate_poller import scheduler, start_gold_rate_poller
 from app.api import (
     accounting, adjustments, ap, ar, auth, auth_audit, bank, buybacks, categories, coins,
-    gold_price, inventory, ledger, lots, melts, orders, ounces, polish, products, reports,
-    stock_takes, suppliers, zakat,
+    expenses, gold_price, inventory, ledger, lots, melts, orders, ounces, polish, products,
+    reports, stock_takes, suppliers, zakat,
 )
 from app.api import settings as settings_router
 from app.api import staff
@@ -75,5 +75,6 @@ for r in (
     bank.router,
     ar.router,
     ap.router,
+    expenses.router,
 ):
     app.include_router(r, prefix="/api")
