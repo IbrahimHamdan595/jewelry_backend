@@ -22,3 +22,31 @@ async def test_settings_auto_post_flag_defaults_false(db):
     db.add(s)
     await db.flush()
     assert s.accounting_auto_post_enabled is False
+
+
+from datetime import date
+
+from app.core import gl_postings as glp
+from app.models import GLPeriod, PeriodStatus
+
+
+@pytest.mark.asyncio
+async def test_ensure_period_creates_open_then_reuses(db):
+    p1 = await glp.ensure_period(db, date(2026, 6, 10))
+    assert p1.status == PeriodStatus.OPEN and p1.year == 2026 and p1.period_no == 6
+    p2 = await glp.ensure_period(db, date(2026, 6, 20))
+    assert p2.id == p1.id  # same month reused
+
+
+@pytest.mark.asyncio
+async def test_resolve_account_id(db):
+    await seed_chart_of_accounts(db)
+    aid = await glp.resolve_account_id(db, "CASH")
+    assert aid
+    with pytest.raises(Exception):
+        await glp.resolve_account_id(db, "NOPE")
+
+
+def test_auto_post_enabled_reads_flag():
+    assert glp.auto_post_enabled(Settings(id="singleton")) is False
+    assert glp.auto_post_enabled(Settings(id="singleton", accounting_auto_post_enabled=True)) is True
