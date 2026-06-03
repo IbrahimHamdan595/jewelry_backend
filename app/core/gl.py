@@ -164,6 +164,28 @@ async def _resolve_denominations(db: AsyncSession, lines: list[GLLine]) -> None:
         ln.denomination = acct.denomination.value
 
 
+_Q_MONEY = Decimal("0.01")
+_Q_FX = Decimal("0.000001")
+_Q_GRAMS = Decimal("0.001")
+
+
+def _normalize_line_decimals(ln: GLLine) -> None:
+    """Quantize a line's Decimals to the persisted column scale IN PLACE.
+
+    Critical for the hash chain: the entry hash is computed from these values
+    and must match what the DB stores and returns on verify. Numeric(18,2)
+    money, Numeric(18,6) fx, Numeric(14,3) grams round-trip to exactly these
+    scales on both Postgres and the SQLite test fixture, so hashing the
+    pre-quantized values keeps verify() stable."""
+    ln.money_debit = Decimal(ln.money_debit).quantize(_Q_MONEY)
+    ln.money_credit = Decimal(ln.money_credit).quantize(_Q_MONEY)
+    ln.base_debit = Decimal(ln.base_debit).quantize(_Q_MONEY)
+    ln.base_credit = Decimal(ln.base_credit).quantize(_Q_MONEY)
+    ln.fx_rate = Decimal(ln.fx_rate).quantize(_Q_FX)
+    ln.metal_debit_grams = Decimal(ln.metal_debit_grams).quantize(_Q_GRAMS)
+    ln.metal_credit_grams = Decimal(ln.metal_credit_grams).quantize(_Q_GRAMS)
+
+
 def _line_to_hash_dict(ln: GLLine) -> dict:
     return {
         "account_id": ln.account_id,
@@ -199,6 +221,11 @@ async def post_entry(
     """
     period = await _resolve_open_period(db, entry_date)
     await _resolve_denominations(db, lines)
+
+    # Quantize to persisted column scale BEFORE validate + hash, so the chain
+    # hash matches what the DB returns on verify (see _normalize_line_decimals).
+    for ln in lines:
+        _normalize_line_decimals(ln)
 
     errors = validate_balanced(lines)
     if errors:
