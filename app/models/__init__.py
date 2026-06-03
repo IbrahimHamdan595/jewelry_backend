@@ -79,6 +79,15 @@ class ReconciliationStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
 
 
+# ── Accounts Receivable (Module 3) ────────────────────────────────────────────
+
+class ARInvoiceStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    PAID = "PAID"
+    VOID = "VOID"
+
+
 class OrderStatus(str, enum.Enum):
     COMPLETED = "COMPLETED"
     REFUNDED = "REFUNDED"
@@ -91,6 +100,7 @@ class PaymentMethod(str, enum.Enum):
     CASH = "CASH"
     CARD = "CARD"
     MIXED = "MIXED"
+    CREDIT = "CREDIT"  # Module 3 — sale on account (DR AR)
 
 
 class LotSource(str, enum.Enum):
@@ -275,6 +285,8 @@ class Order(Base):
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus, name="orderstatus_enum"), default=OrderStatus.COMPLETED)
     payment_method: Mapped[PaymentMethod] = mapped_column(Enum(PaymentMethod, name="paymentmethod_enum"), nullable=False)
     customer_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Module 3 — links a credit sale to a customer subledger (nullable for cash sales).
+    customer_id: Mapped[str | None] = mapped_column(String, ForeignKey("customers.id"), nullable=True)
     cashier_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     vat_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
@@ -1119,3 +1131,79 @@ class Reconciliation(Base):
     started_by_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ── Accounts Receivable (Module 3) ────────────────────────────────────────────
+
+class Customer(Base):
+    __tablename__ = "customers"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    phone: Mapped[str | None] = mapped_column(String, nullable=True)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    credit_limit: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)  # NULL = unlimited
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ARInvoice(Base):
+    __tablename__ = "ar_invoices"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    invoice_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    customer_id: Mapped[str] = mapped_column(String, ForeignKey("customers.id"), nullable=False)
+    order_id: Mapped[str | None] = mapped_column(String, ForeignKey("orders.id"), nullable=True)
+    invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    subtotal: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    vat_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    amount_paid: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    status: Mapped[ARInvoiceStatus] = mapped_column(
+        Enum(ARInvoiceStatus, name="ar_invoice_status_enum"), nullable=False, default=ARInvoiceStatus.OPEN
+    )
+    gl_entry_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_entries.id"), nullable=True)
+    memo: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_ar_invoices_customer_status", "customer_id", "status"),)
+
+
+class ARInvoiceLine(Base):
+    __tablename__ = "ar_invoice_lines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    invoice_id: Mapped[str] = mapped_column(String, ForeignKey("ar_invoices.id", ondelete="CASCADE"), nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=False, default="")
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    line_total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+
+
+class ARReceipt(Base):
+    __tablename__ = "ar_receipts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    receipt_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    customer_id: Mapped[str] = mapped_column(String, ForeignKey("customers.id"), nullable=False)
+    receipt_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    payment_system_key: Mapped[str] = mapped_column(String, nullable=False, default="CASH")
+    unapplied_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    gl_entry_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_entries.id"), nullable=True)
+    memo: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ARReceiptAllocation(Base):
+    __tablename__ = "ar_receipt_allocations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    receipt_id: Mapped[str] = mapped_column(String, ForeignKey("ar_receipts.id", ondelete="CASCADE"), nullable=False)
+    invoice_id: Mapped[str] = mapped_column(String, ForeignKey("ar_invoices.id"), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
