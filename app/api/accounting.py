@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core import gl, ledger
+from app.core import gl, ledger, period_close
 from app.core.audit_chain import verify_gl_chain
 from app.core.coa_seed import seed_chart_of_accounts, post_opening_balances
 from app.core.permissions import require_accounting, require_admin
@@ -125,6 +125,10 @@ async def close_period(
     p = (await db.execute(select(GLPeriod).where(GLPeriod.id == period_id))).scalar_one_or_none()
     if p is None:
         raise HTTPException(404, "Period not found")
+    readiness = await period_close.close_readiness(db, year=p.year, period_no=p.period_no)
+    if not readiness["can_close"]:
+        failed = [h for h in readiness["hard"] if not h["ok"]]
+        raise HTTPException(422, "Cannot close: " + "; ".join(h["detail"] for h in failed))
     p.status = PeriodStatus.CLOSED
     p.closed_by_user_id = user.id
     p.closed_at = datetime.now(timezone.utc)
@@ -147,6 +151,45 @@ async def reopen_period(
                         ref_type="gl_period", ref_id=p.id, payload={"year": p.year, "period_no": p.period_no})
     await db.commit()
     return PeriodOut.model_validate(p)
+
+
+# ── Period close & controls (Module 8) ────────────────────────────────────────
+
+def _S_close(v):
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, dict):
+        return {k: _S_close(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_S_close(x) for x in v]
+    return v
+
+
+@router.get("/periods/close-readiness")
+async def close_readiness_endpoint(
+    year: int, period_no: int, db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting),
+):
+    return _S_close(await period_close.close_readiness(db, year=year, period_no=period_no))
+
+
+@router.get("/periods/year-close-preview")
+async def year_close_preview_endpoint(
+    year: int, db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting),
+):
+    return _S_close(await period_close.year_close_preview(db, year=year))
+
+
+@router.post("/periods/close-year")
+async def close_year_endpoint(
+    body: dict, db: AsyncSession = Depends(get_db), user: User = Depends(require_admin),
+):
+    year = int(body["year"])
+    entry = await period_close.close_year(db, year=year, actor_user_id=user.id)
+    await db.commit()
+    opened = (await db.execute(
+        select(GLPeriod).where(GLPeriod.year == year + 1).order_by(GLPeriod.period_no))).scalars().all()
+    return {"entry_id": entry.id, "entry_no": entry.entry_no,
+            "opened_periods": [f"{p.year}-{p.period_no:02d}" for p in opened]}
 
 
 # ── Journal entries ───────────────────────────────────────────────────────────

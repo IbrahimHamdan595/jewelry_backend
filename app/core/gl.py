@@ -102,8 +102,9 @@ def validate_balanced(lines: list[GLLine]) -> list[str]:
     return errors
 
 
-async def _resolve_open_period(db: AsyncSession, entry_date: date) -> GLPeriod:
-    """Find the monthly period for `entry_date` and require it OPEN."""
+async def _resolve_open_period(db: AsyncSession, entry_date: date, *, allow_closed: bool = False) -> GLPeriod:
+    """Find the monthly period for `entry_date`. Require it OPEN unless
+    allow_closed (year-close posts into the closed December)."""
     period = (
         await db.execute(
             select(GLPeriod).where(
@@ -118,7 +119,7 @@ async def _resolve_open_period(db: AsyncSession, entry_date: date) -> GLPeriod:
             detail=f"No accounting period for {entry_date.year}-{entry_date.month:02d}. "
                    f"Open it first.",
         )
-    if period.status != PeriodStatus.OPEN:
+    if period.status != PeriodStatus.OPEN and not allow_closed:
         raise HTTPException(
             status_code=422,
             detail=f"Accounting period {entry_date.year}-{entry_date.month:02d} is CLOSED.",
@@ -208,6 +209,7 @@ async def post_entry(
     actor_user_id: str,
     reverses_entry_id: str | None = None,
     occurred_at: datetime | None = None,
+    allow_closed_period: bool = False,
 ) -> GLJournalEntry:
     """Post a balanced journal entry inside the caller's transaction (no commit).
 
@@ -219,7 +221,7 @@ async def post_entry(
     head (inside ledger.record). Always acquire GL-head-then-inventory-head to
     avoid deadlocks.
     """
-    period = await _resolve_open_period(db, entry_date)
+    period = await _resolve_open_period(db, entry_date, allow_closed=allow_closed_period)
     await _resolve_denominations(db, lines)
 
     # Quantize to persisted column scale BEFORE validate + hash, so the chain

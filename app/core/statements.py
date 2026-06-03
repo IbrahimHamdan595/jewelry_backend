@@ -42,6 +42,7 @@ async def income_statement(db: AsyncSession, *, start: date, end: date) -> dict:
         .join(GLJournalEntry, GLJournalLine.entry_id == GLJournalEntry.id)
         .join(GLAccount, GLJournalLine.account_id == GLAccount.id)
         .where(GLJournalEntry.entry_date >= start, GLJournalEntry.entry_date <= end)
+        .where(GLJournalEntry.source_type != "YEAR_CLOSE")
         .where(GLAccount.type.in_((AccountType.INCOME, AccountType.EXPENSE)))
     )).all()
 
