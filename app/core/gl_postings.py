@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import gl
 from app.core.pricing import KARAT_PURITY
 from app.models import (
-    GLAccount, GLJournalEntry, GLPeriod, PeriodStatus, Settings,
+    GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
+    PeriodStatus, Product, Settings,
 )
 
 ZERO = Decimal("0")
@@ -76,3 +77,68 @@ async def find_live_entry(db: AsyncSession, source_type: str, source_id: str) ->
             )
         )
     ).scalars().first()
+
+
+async def _cogs_cost_for_item(db: AsyncSession, item) -> Decimal:
+    """Tracked product cost when present, else gold_rate_at_sale × pure-grams proxy."""
+    if item.item_kind == OrderItemKind.PRODUCT and item.product_id:
+        prod = (await db.execute(select(Product).where(Product.id == item.product_id))).scalar_one_or_none()
+        if prod is not None and prod.cost_basis_usd is not None:
+            return (prod.cost_basis_usd * item.quantity).quantize(_Q_MONEY)
+    purity = KARAT_PURITY[item.karat]
+    return (item.gold_rate_at_sale * item.weight_grams * purity * item.quantity).quantize(_Q_MONEY)
+
+
+async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: str):
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_ORDER, order.id):
+        return None
+    entry_date = order.created_at.date() if order.created_at else date.today()
+    await ensure_period(db, entry_date)
+
+    cash_key = "BANK" if order.payment_method == PaymentMethod.CARD else "CASH"
+    making_revenue = sum(
+        (it.making_charge * it.quantity for it in order.items), ZERO
+    ).quantize(_Q_MONEY)
+    sales_revenue = (order.subtotal - making_revenue - order.discount_amount).quantize(_Q_MONEY)
+
+    cash_id = await resolve_account_id(db, cash_key)
+    rev_id = await resolve_account_id(db, "SALES_REVENUE")
+    making_id = await resolve_account_id(db, "MAKING_CHARGE_REVENUE")
+    vat_id = await resolve_account_id(db, "VAT_PAYABLE")
+    cogs_id = await resolve_account_id(db, "METAL_COGS")
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+
+    lines = [
+        gl.GLLine(account_id=cash_id, denomination="MONEY",
+                  base_debit=order.total_usd, money_debit=order.total_usd, memo="sale cash"),
+        gl.GLLine(account_id=rev_id, denomination="MONEY",
+                  base_credit=sales_revenue, money_credit=sales_revenue, memo="sale revenue"),
+    ]
+    if making_revenue > 0:
+        lines.append(gl.GLLine(account_id=making_id, denomination="MONEY",
+                               base_credit=making_revenue, money_credit=making_revenue, memo="making charge"))
+    if order.vat_amount > 0:
+        lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY",
+                               base_credit=order.vat_amount, money_credit=order.vat_amount, memo="output VAT"))
+
+    # COGS aggregated per karat
+    cogs: dict[str, dict] = {}
+    for it in order.items:
+        k = it.karat.value
+        grams = (it.weight_grams * it.quantity)
+        cost = await _cogs_cost_for_item(db, it)
+        agg = cogs.setdefault(k, {"grams": ZERO, "cost": ZERO})
+        agg["grams"] += grams
+        agg["cost"] += cost
+    for k, v in cogs.items():
+        lines.append(gl.GLLine(account_id=cogs_id, denomination="DUAL",
+                               base_debit=v["cost"], metal_debit_grams=v["grams"], karat=k, memo="metal COGS"))
+        lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
+                               base_credit=v["cost"], metal_credit_grams=v["grams"], karat=k, memo="metal out"))
+
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo=f"Sale {order.order_number}",
+        source_type=SOURCE_ORDER, source_id=order.id, lines=lines, actor_user_id=actor_user_id,
+    )
