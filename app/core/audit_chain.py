@@ -198,6 +198,67 @@ def verify_auth_chain(rows: Iterable[dict]) -> dict:
     }
 
 
+# GL journal-entry chain (Module 0). Header + ordered lines hashed together.
+# Order of these field tuples is part of the protocol — do NOT reorder without
+# a re-hash migration.
+_GL_HEADER_FIELDS: tuple[str, ...] = (
+    "entry_no", "entry_date", "memo", "source_type", "source_id",
+    "reverses_entry_id", "actor_user_id", "occurred_at",
+)
+_GL_LINE_FIELDS: tuple[str, ...] = (
+    "account_id", "money_debit", "money_credit", "currency", "fx_rate",
+    "base_debit", "base_credit", "metal_debit_grams", "metal_credit_grams",
+    "karat", "memo",
+)
+
+
+def compute_gl_entry_hash(*, prev_hash: str, header: dict[str, Any], lines: list[dict]) -> str:
+    """SHA-256 over canonical(header + ordered lines + prev_hash). Pure.
+
+    Line ORDER is significant (lines is a list); within each line and the
+    header, dict key order is normalized via sort_keys. Decimals/dates/datetimes
+    canonicalize exactly as elsewhere in this module.
+    """
+    if not isinstance(prev_hash, str) or not prev_hash:
+        raise ValueError(
+            f"prev_hash must be a non-empty string (use GENESIS_HASH for the "
+            f"first row); got {prev_hash!r}"
+        )
+    payload = {f: _canonical(header[f]) for f in _GL_HEADER_FIELDS}
+    payload["lines"] = [{f: _canonical(line[f]) for f in _GL_LINE_FIELDS} for line in lines]
+    payload["__prev"] = prev_hash
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def verify_gl_chain(rows: Iterable[dict]) -> dict:
+    """Walk GL entry rows (each with header fields + a `lines` list) in chain
+    order; report the first break. Same return shape as `verify_chain`."""
+    expected_prev = GENESIS_HASH
+    total = 0
+    for row in rows:
+        total += 1
+        recomputed = compute_gl_entry_hash(
+            prev_hash=row["prev_hash"],
+            header={f: row[f] for f in _GL_HEADER_FIELDS},
+            lines=row["lines"],
+        )
+        if row["prev_hash"] != expected_prev or row["entry_hash"] != recomputed:
+            return {
+                "status": "broken",
+                "total_rows": total,
+                "first_break": {
+                    "id": row["id"],
+                    "expected_prev_hash": expected_prev,
+                    "actual_prev_hash": row["prev_hash"],
+                    "expected_entry_hash": recomputed,
+                    "actual_entry_hash": row["entry_hash"],
+                },
+            }
+        expected_prev = row["entry_hash"]
+    return {"status": "intact" if total > 0 else "empty", "total_rows": total, "first_break": None}
+
+
 def verify_chain(rows: Iterable[dict]) -> dict:
     """Walk a sequence of ledger rows and report the first chain break.
 
