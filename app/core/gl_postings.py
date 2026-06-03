@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import gl
 from app.core.pricing import KARAT_PURITY
 from app.models import (
-    GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
-    PeriodStatus, Product, Settings,
+    DebtUnit, GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
+    PeriodStatus, Product, Settings, SupplierItemKind,
 )
 
 ZERO = Decimal("0")
@@ -206,4 +206,84 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     return await gl.post_entry(
         db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
         source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
+    )
+
+
+async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings, actor_user_id: str):
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_SUPPLIER_PURCHASE, purchase.id):
+        return None
+    entry_date = purchase.occurred_at.date() if purchase.occurred_at else date.today()
+    await ensure_period(db, entry_date)
+
+    inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+    metal_ap_id = await resolve_account_id(db, "METAL_AP")
+    prod_inv_id = await resolve_account_id(db, "PRODUCT_INVENTORY")
+    ap_id = await resolve_account_id(db, "AP")
+
+    lines: list[gl.GLLine] = []
+
+    # Gold rows: per karat grams + cost from gold items.
+    gold_cost_by_karat: dict[str, Decimal] = {}
+    gold_grams_by_karat: dict[str, Decimal] = {}
+    for it in purchase.items:
+        if it.item_kind == SupplierItemKind.PURE_GOLD and it.karat is not None:
+            k = it.karat.value
+            gold_grams_by_karat[k] = gold_grams_by_karat.get(k, ZERO) + (it.weight_grams or ZERO)
+            gold_cost_by_karat[k] = gold_cost_by_karat.get(k, ZERO) + (it.unit_cost_usd or ZERO)
+    for k, grams in gold_grams_by_karat.items():
+        cost = gold_cost_by_karat.get(k, ZERO).quantize(_Q_MONEY)
+        lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
+                               base_debit=cost, metal_debit_grams=grams, karat=k, memo="gold purchase"))
+        lines.append(gl.GLLine(account_id=metal_ap_id, denomination="DUAL",
+                               base_credit=cost, metal_credit_grams=grams, karat=k, memo="metal AP"))
+
+    # Non-gold (product/coin/ounce) rows: money cost → Product Inventory vs AP.
+    cash_cost = sum(
+        ((it.unit_cost_usd or ZERO) for it in purchase.items
+         if it.item_kind != SupplierItemKind.PURE_GOLD), ZERO
+    ).quantize(_Q_MONEY)
+    if cash_cost > 0:
+        lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
+                               base_debit=cash_cost, money_debit=cash_cost, memo="product purchase"))
+        lines.append(gl.GLLine(account_id=ap_id, denomination="MONEY",
+                               base_credit=cash_cost, money_credit=cash_cost, memo="AP"))
+
+    if not lines:
+        return None
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="Supplier purchase",
+        source_type=SOURCE_SUPPLIER_PURCHASE, source_id=purchase.id, lines=lines, actor_user_id=actor_user_id,
+    )
+
+
+async def post_supplier_payment(db: AsyncSession, payment, settings: Settings, actor_user_id: str):
+    if not auto_post_enabled(settings):
+        return None
+    if await find_live_entry(db, SOURCE_SUPPLIER_PAYMENT, payment.id):
+        return None
+    entry_date = payment.paid_at.date() if payment.paid_at else date.today()
+    await ensure_period(db, entry_date)
+
+    if payment.unit == DebtUnit.CASH:
+        ap_id = await resolve_account_id(db, "AP")
+        cash_id = await resolve_account_id(db, "CASH")
+        amt = payment.amount.quantize(_Q_MONEY)
+        lines = [
+            gl.GLLine(account_id=ap_id, denomination="MONEY", base_debit=amt, money_debit=amt, memo="pay AP"),
+            gl.GLLine(account_id=cash_id, denomination="MONEY", base_credit=amt, money_credit=amt, memo="cash out"),
+        ]
+    else:  # GOLD: pay down metal AP grams with inventory grams (cost-neutral metal move)
+        metal_ap_id = await resolve_account_id(db, "METAL_AP")
+        inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+        k = payment.karat.value
+        grams = payment.amount
+        lines = [
+            gl.GLLine(account_id=metal_ap_id, denomination="DUAL", metal_debit_grams=grams, karat=k, memo="pay metal AP"),
+            gl.GLLine(account_id=inv_id, denomination="DUAL", metal_credit_grams=grams, karat=k, memo="metal out"),
+        ]
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="Supplier payment",
+        source_type=SOURCE_SUPPLIER_PAYMENT, source_id=payment.id, lines=lines, actor_user_id=actor_user_id,
     )
