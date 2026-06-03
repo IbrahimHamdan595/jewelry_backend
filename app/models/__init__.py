@@ -898,3 +898,137 @@ class StockTakeLine(Base):
             unique=True,
         ),
     )
+
+
+# ── Accounting (GL Core, Module 0) ────────────────────────────────────────────
+
+# Journal entry source types are documentation-style STRINGS (like
+# InventoryLedger.event_type) so new operations add a source without a schema
+# migration. Constants live in app/core/gl.py.
+
+class GLAccount(Base):
+    """Chart-of-accounts node. Metal/DUAL accounts are karat-agnostic
+    containers; per-karat balance is enforced by the posting engine and
+    reported as a breakdown (design §3.3)."""
+    __tablename__ = "gl_accounts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    type: Mapped[AccountType] = mapped_column(Enum(AccountType, name="gl_account_type_enum"), nullable=False)
+    parent_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_accounts.id"), nullable=True)
+    denomination: Mapped[Denomination] = mapped_column(
+        Enum(Denomination, name="gl_denomination_enum"), nullable=False, default=Denomination.MONEY
+    )
+    currency: Mapped[str | None] = mapped_column(String, nullable=True)  # money accounts; NULL for pure METAL
+    # Reserved (design §3.3): karat lives on the line in M0, NULL on the account.
+    karat: Mapped[str | None] = mapped_column(String, nullable=True)
+    system_key: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
+    normal_balance: Mapped[NormalBalance] = mapped_column(
+        Enum(NormalBalance, name="gl_normal_balance_enum"), nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_gl_accounts_type", "type"),
+        Index("ix_gl_accounts_parent", "parent_id"),
+    )
+
+
+class GLPeriod(Base):
+    """Monthly accounting period. period_no is the month 1..12 (design §16: monthly)."""
+    __tablename__ = "gl_periods"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    period_no: Mapped[int] = mapped_column(Integer, nullable=False)  # 1..12
+    status: Mapped[PeriodStatus] = mapped_column(
+        Enum(PeriodStatus, name="gl_period_status_enum"), nullable=False, default=PeriodStatus.OPEN
+    )
+    closed_by_user_id: Mapped[str | None] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("uq_gl_periods_year_period", "year", "period_no", unique=True),
+    )
+
+
+class GLJournalEntry(Base):
+    """Append-only, hash-chained journal-entry header (design §3.3)."""
+    __tablename__ = "gl_journal_entries"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    entry_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)  # JE-YYYYMMDD-NNN
+    entry_date: Mapped[date] = mapped_column(Date, nullable=False)
+    period_id: Mapped[str] = mapped_column(String, ForeignKey("gl_periods.id"), nullable=False)
+    memo: Mapped[str] = mapped_column(String, nullable=False, default="")
+    source_type: Mapped[str] = mapped_column(String, nullable=False)   # MANUAL/ORDER/... (string)
+    source_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reverses_entry_id: Mapped[str | None] = mapped_column(String, ForeignKey("gl_journal_entries.id"), nullable=True)
+    actor_user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    prev_hash: Mapped[str] = mapped_column(String, nullable=False)
+    entry_hash: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    lines: Mapped[list["GLJournalLine"]] = relationship(
+        back_populates="entry", cascade="all, delete-orphan", order_by="GLJournalLine.line_no"
+    )
+
+    __table_args__ = (
+        Index("ix_gl_entries_entry_date", "entry_date"),
+        Index("ix_gl_entries_period", "period_id"),
+        Index("ix_gl_entries_source", "source_type", "source_id"),
+    )
+
+
+class GLJournalLine(Base):
+    """One debit/credit line. A line populates the money fields, the metal
+    fields, or both (DUAL accounts) — design §3.2/§3.3."""
+    __tablename__ = "gl_journal_lines"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    entry_id: Mapped[str] = mapped_column(String, ForeignKey("gl_journal_entries.id", ondelete="CASCADE"), nullable=False)
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    account_id: Mapped[str] = mapped_column(String, ForeignKey("gl_accounts.id"), nullable=False)
+    # Money component (txn currency + FX + USD base). USD lines: money == base, fx_rate = 1.
+    money_debit: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    money_credit: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("1"))
+    base_debit: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    base_credit: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
+    # Metal component (grams per karat).
+    metal_debit_grams: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=Decimal("0"))
+    metal_credit_grams: Mapped[Decimal] = mapped_column(Numeric(14, 3), nullable=False, default=Decimal("0"))
+    karat: Mapped[str | None] = mapped_column(String, nullable=True)
+    memo: Mapped[str] = mapped_column(String, nullable=False, default="")
+
+    entry: Mapped["GLJournalEntry"] = relationship(back_populates="lines")
+
+    __table_args__ = (
+        Index("ix_gl_lines_entry", "entry_id"),
+        Index("ix_gl_lines_account", "account_id"),
+    )
+
+
+class GLJournalChainHead(Base):
+    """Single-row table; locked FOR UPDATE during posting to serialize the GL
+    hash chain — sibling of InventoryLedgerChainHead."""
+    __tablename__ = "gl_journal_chain_head"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    latest_entry_hash: Mapped[str] = mapped_column(String, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class GLEntrySequence(Base):
+    """Per-day entry-number counter (JE-YYYYMMDD-NNN). Locked FOR UPDATE so
+    numbering is gap-tracked and never count()+1 (design §3.3)."""
+    __tablename__ = "gl_entry_sequence"
+
+    day_key: Mapped[str] = mapped_column(String, primary_key=True)  # "YYYYMMDD"
+    last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

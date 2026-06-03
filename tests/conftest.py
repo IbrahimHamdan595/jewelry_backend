@@ -23,7 +23,7 @@ from app.core.audit_chain import GENESIS_HASH
 from app.db.base import Base
 # Importing app.models triggers all model class registration on Base.metadata.
 import app.models  # noqa: F401
-from app.models import AuthAuditChainHead, InventoryLedgerChainHead
+from app.models import AuthAuditChainHead, InventoryLedgerChainHead, GLJournalChainHead
 
 
 @pytest_asyncio.fixture
@@ -48,6 +48,9 @@ async def db():
         )
         session.add(
             AuthAuditChainHead(id=1, latest_entry_hash=GENESIS_HASH, row_count=0)
+        )
+        session.add(
+            GLJournalChainHead(id=1, latest_entry_hash=GENESIS_HASH, row_count=0)
         )
         await session.commit()
         yield session
