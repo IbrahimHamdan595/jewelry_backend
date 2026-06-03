@@ -15,9 +15,11 @@ from app.core.permissions import require_admin
 from app.deps import get_db
 from app.models import (
     AdjustmentReason, AdjustmentTarget, CoinType, GoldLot, ManualAdjustment,
-    OunceType, Product, ProductStatus, User,
+    OunceType, Product, ProductStatus, Settings, User,
 )
 from app.schemas.adjustment import AdjustmentCreate, AdjustmentOut
+from app.core import gl_postings
+from types import SimpleNamespace
 
 router = APIRouter(prefix="/adjustments", tags=["adjustments"])
 
@@ -109,6 +111,23 @@ async def create_adjustment(
                 "is_depleted_after": lot.is_depleted,
             },
         )
+
+        # Module 1 auto-posting: a gold-lot LOSS (negative delta) writes off metal
+        # inventory to Adjustment Expense (no-op if flag OFF). Gains (positive
+        # delta) and product/coin/ounce stock adjustments are deferred to a
+        # follow-up.
+        if body.delta < 0:
+            _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+            if _settings:
+                lost = -body.delta
+                cost = (
+                    (lot.cost_basis_usd * lost / lot.weight_grams)
+                    if lot.weight_grams and lot.weight_grams > 0 else Decimal("0")
+                )
+                await gl_postings.post_adjustment(db, SimpleNamespace(
+                    id=adj.id, occurred_at=None, karat=lot.karat, grams=lost, cost_usd=cost,
+                ), _settings, user.id)
+
         await db.commit()
         await db.refresh(adj)
         return AdjustmentOut.model_validate(adj)

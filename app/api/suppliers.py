@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import gl_postings
 from app.core.inventory import consume_from_lot
 from app.core.ledger import (
     EVENT_LOT_CREATED,
@@ -552,6 +553,11 @@ async def create_purchase(
         },
     )
 
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_supplier_purchase(db, purchase, _settings, user.id)
+
     await db.commit()
 
     # Re-fetch with items loaded.
@@ -814,6 +820,11 @@ async def create_payment(
                 "reason": "payment", "payment_id": payment.id,
             },
         )
+
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_supplier_payment(db, payment, _settings, user.id)
 
     await db.commit()
     await db.refresh(payment)

@@ -18,7 +18,7 @@ from app.core import gl
 from app.core.pricing import KARAT_PURITY
 from app.models import (
     DebtUnit, GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
-    PeriodStatus, Product, Settings, SupplierItemKind,
+    PeriodStatus, Product, Settings, SupplierItemKind, SupplierPurchaseItem,
 )
 
 ZERO = Decimal("0")
@@ -226,12 +226,20 @@ async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings,
     prod_inv_id = await resolve_account_id(db, "PRODUCT_INVENTORY")
     ap_id = await resolve_account_id(db, "AP")
 
+    # Query items explicitly — the relationship isn't loaded at the hook site
+    # (items are created separately), and an async lazy-load would fail.
+    items = (
+        await db.execute(
+            select(SupplierPurchaseItem).where(SupplierPurchaseItem.purchase_id == purchase.id)
+        )
+    ).scalars().all()
+
     lines: list[gl.GLLine] = []
 
     # Gold rows: per karat grams + cost from gold items.
     gold_cost_by_karat: dict[str, Decimal] = {}
     gold_grams_by_karat: dict[str, Decimal] = {}
-    for it in purchase.items:
+    for it in items:
         if it.item_kind == SupplierItemKind.PURE_GOLD and it.karat is not None:
             k = it.karat.value
             gold_grams_by_karat[k] = gold_grams_by_karat.get(k, ZERO) + (it.weight_grams or ZERO)
@@ -245,7 +253,7 @@ async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings,
 
     # Non-gold (product/coin/ounce) rows: money cost → Product Inventory vs AP.
     cash_cost = sum(
-        ((it.unit_cost_usd or ZERO) for it in purchase.items
+        ((it.unit_cost_usd or ZERO) for it in items
          if it.item_kind != SupplierItemKind.PURE_GOLD), ZERO
     ).quantize(_Q_MONEY)
     if cash_cost > 0:
@@ -309,7 +317,9 @@ async def post_buyback(db: AsyncSession, buyback, settings: Settings, actor_user
     cash_id = await resolve_account_id(db, "CASH")
     clearing_id = await resolve_account_id(db, "METAL_CLEARING")
     k = buyback.karat.value
-    grams = buyback.weight_grams * (buyback.quantity or 1)
+    # weight_grams + buy_price_usd are already TOTALS on the buyback row (coin/ounce
+    # creators store coin.weight_grams × quantity), so do not multiply by quantity.
+    grams = buyback.weight_grams
     cost = buyback.buy_price_usd.quantize(_Q_MONEY)
     lines = [
         gl.GLLine(account_id=inv_id, denomination="DUAL", base_debit=cost,
@@ -333,12 +343,16 @@ async def post_melt(db: AsyncSession, melt, settings: Settings, actor_user_id: s
     if await find_live_entry(db, SOURCE_MELT, melt.id):
         return None
     entry_date = melt.occurred_at.date() if melt.occurred_at else date.today()
+    fk, fg = melt.from_karat.value, melt.from_grams
+    tk, tg = melt.to_karat.value, melt.to_grams
+    # Same karat AND same weight = metal unchanged in METAL_INVENTORY
+    # (finished→raw is the same account/karat) → nothing to post.
+    if fk == tk and fg == tg:
+        return None
     await ensure_period(db, entry_date)
     inv_id = await resolve_account_id(db, "METAL_INVENTORY")
     clearing_id = await resolve_account_id(db, "METAL_CLEARING")
     cost = melt.cost_usd.quantize(_Q_MONEY)
-    fk, fg = melt.from_karat.value, melt.from_grams
-    tk, tg = melt.to_karat.value, melt.to_grams
     lines = [
         gl.GLLine(account_id=inv_id, denomination="DUAL", base_credit=cost,
                   metal_credit_grams=fg, karat=fk, memo="melt consume"),

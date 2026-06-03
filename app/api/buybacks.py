@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import gl_postings
 from app.core.gold_api import get_current_gold_rate
 from app.core.ledger import (
     EVENT_BUYBACK_COIN,
@@ -252,6 +253,9 @@ async def _create_pure_gold_buyback(
         },
     )
 
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    await gl_postings.post_buyback(db, buyback, cfg, user.id)
+
     await db.commit()
     await db.refresh(buyback)
     return BuybackReceiptOut.model_validate(buyback)
@@ -327,6 +331,9 @@ async def _create_coin_buyback(
             "qty_after": coin.on_hand_qty,
         },
     )
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    await gl_postings.post_buyback(db, buyback, cfg, user.id)
+
     await db.commit()
     await db.refresh(buyback)
     return BuybackReceiptOut.model_validate(buyback)
@@ -402,6 +409,9 @@ async def _create_ounce_buyback(
             "qty_after": bar.on_hand_qty,
         },
     )
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    await gl_postings.post_buyback(db, buyback, cfg, user.id)
+
     await db.commit()
     await db.refresh(buyback)
     return BuybackReceiptOut.model_validate(buyback)
@@ -458,6 +468,9 @@ async def _create_used_product_buyback(
             "pending_polish": True,
         },
     )
+    # Module 1 auto-posting (no-op unless the flag is ON).
+    await gl_postings.post_buyback(db, buyback, cfg, user.id)
+
     await db.commit()
     await db.refresh(buyback)
     return BuybackReceiptOut.model_validate(buyback)

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import gl_postings
 from app.core.ledger import EVENT_LOT_CREATED, EVENT_MELT, record
 from app.core.permissions import require_admin
 from app.deps import get_db
@@ -17,9 +18,11 @@ from app.models import (
     LotSource,
     Product,
     ProductStatus,
+    Settings,
     User,
     WalkinBuyback,
 )
+from types import SimpleNamespace
 from app.schemas.lot import LotOut
 from app.schemas.transitions import MeltCreate, MeltOut
 
@@ -123,6 +126,15 @@ async def _melt_product(
         },
     )
 
+    # Module 1 auto-posting: only a karat/weight change moves metal (no-op otherwise).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_melt(db, SimpleNamespace(
+            id=lot.id, occurred_at=None,
+            from_karat=product.karat, from_grams=product.weight_grams,
+            to_karat=karat, to_grams=weight, cost_usd=cost_basis,
+        ), _settings, user.id)
+
     await db.commit()
     await db.refresh(lot)
     return MeltOut(
@@ -225,6 +237,15 @@ async def _melt_used_buyback(
             "karat_override": body.override_karat is not None,
         },
     )
+
+    # Module 1 auto-posting: only a karat/weight change moves metal (no-op otherwise).
+    _settings = (await db.execute(select(Settings).where(Settings.id == "singleton"))).scalar_one_or_none()
+    if _settings:
+        await gl_postings.post_melt(db, SimpleNamespace(
+            id=lot.id, occurred_at=None,
+            from_karat=buyback.karat, from_grams=buyback.weight_grams,
+            to_karat=karat, to_grams=weight, cost_usd=cost_basis,
+        ), _settings, user.id)
 
     await db.commit()
     await db.refresh(lot)
