@@ -347,6 +347,9 @@ class OrderItem(Base):
     margin_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     making_charge: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     final_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    # Sale-time COGS snapshot (metal cost of the line). Captured at checkout so
+    # gross profit is queryable without the GL. NULL on pre-feature orders.
+    cost_basis_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     # Phase 1 (per-item refunds). refunded_qty counts units returned to stock
     # (0 or 1 for atomic PRODUCT lines; 0..quantity for COIN/OUNCE lines).
     # refunded_amount is the cumulative pre-VAT value refunded for this line.

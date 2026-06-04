@@ -216,6 +216,15 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
     cash_bank_balance = float(await dash.cash_bank_balance(db)) if gl_live else None
     vat_position = (await dash.vat_position(db, today)) if gl_live else None
 
+    # Phase C — profitability (None until cost-captured orders exist; go-forward)
+    _prof = await dash.profitability(db, week_start, week_end)
+    profitability = None if _prof is None else {
+        "gross_profit": float(_prof["gross_profit"]),
+        "gross_margin_pct": float(_prof["gross_margin_pct"]) if _prof["gross_margin_pct"] is not None else None,
+        "profit_per_gram": float(_prof["profit_per_gram"]) if _prof["profit_per_gram"] is not None else None,
+        "since": _prof["since"],
+    }
+
     return {
         "today_orders": today_orders,
         "today_revenue": float(today_revenue),
@@ -278,4 +287,6 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
         "vat_position": vat_position,
         # Phase E — loss-prevention (last 7 Beirut days)
         "loss_prevention": await dash.loss_prevention(db, week_start, week_end),
+        # Phase C — profitability (null until cost-captured sales exist)
+        "profitability": profitability,
     }

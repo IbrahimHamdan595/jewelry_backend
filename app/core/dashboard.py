@@ -208,3 +208,31 @@ async def loss_prevention(db: AsyncSession, start: datetime, end: datetime) -> d
         Order.discount_percent > threshold))).scalar_one()
     return {"order_voids": int(voids), "rate_overrides": int(overrides),
             "excess_discount_orders": int(excess)}
+
+
+# ── Phase C — profitability (from the sale-time cost snapshot) ────────────────
+
+async def profitability(db: AsyncSession, start: datetime, end: datetime) -> dict | None:
+    """Gross profit / margin / profit-per-gram over COMPLETED orders in the
+    window that have a captured cost basis. Returns None when no cost-captured
+    orders exist (go-forward: pre-feature orders are excluded)."""
+    rows = (await db.execute(
+        select(OrderItem.final_price, OrderItem.cost_basis_usd,
+               OrderItem.weight_grams, OrderItem.quantity, Order.created_at)
+        .join(Order, OrderItem.order_id == Order.id)
+        .where(Order.status == OrderStatus.COMPLETED, Order.created_at >= start, Order.created_at < end,
+               OrderItem.cost_basis_usd.is_not(None))
+    )).all()
+    if not rows:
+        return None
+    revenue = sum((r.final_price for r in rows), ZERO)
+    cost = sum((r.cost_basis_usd for r in rows), ZERO)
+    grams = sum((r.weight_grams * r.quantity for r in rows), ZERO)
+    gross = revenue - cost
+    since = min(r.created_at for r in rows)
+    return {
+        "gross_profit": gross.quantize(_Q_MONEY),
+        "gross_margin_pct": (gross / revenue * 100).quantize(_Q_MONEY) if revenue else None,
+        "profit_per_gram": (gross / grams).quantize(_Q_MONEY) if grams else None,
+        "since": since.date().isoformat(),
+    }

@@ -201,6 +201,9 @@ async def _checkout_product_line(
             "status_after": product.status.value,
         },
     })
+    # Snapshot the metal COGS at sale time (independent of the GL auto-post flag)
+    # so gross profit is queryable on the dashboard.
+    item.cost_basis_usd = await gl_postings._cogs_cost_for_item(db, item)
     return [item], line_total
 
 
@@ -287,6 +290,7 @@ async def _checkout_unit_line(
             "qty_after": row.on_hand_qty,
         },
     }
+    item.cost_basis_usd = await gl_postings._cogs_cost_for_item(db, item)
     return [item], priced["final_price"] * line.quantity, ledger_payload
 
 

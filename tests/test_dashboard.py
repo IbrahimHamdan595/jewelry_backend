@@ -161,3 +161,29 @@ async def test_loss_prevention_counts(db):
     assert lp["order_voids"] == 1
     assert lp["rate_overrides"] == 1
     assert lp["excess_discount_orders"] == 1
+
+
+# ── Phase C ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_profitability_excludes_null_cost(db):
+    now = day_range(date(2026, 6, 5))[0] + timedelta(hours=12)
+    o1 = await _order(db, total=D("250"), when=now, items=[
+        {"qty": 1, "karat": Karat.K21, "grams": D("5"), "making": D("25"), "final": D("250")}])
+    it = (await db.execute(select(OrderItem).where(OrderItem.order_id == o1.id))).scalar_one()
+    it.cost_basis_usd = D("180")                 # cost captured
+    await _order(db, total=D("300"), when=now, items=[
+        {"qty": 1, "karat": Karat.K21, "grams": D("4"), "making": D("25"), "final": D("300")}])
+    await db.flush()                              # o2 item leaves cost NULL → excluded
+    p = await dashboard.profitability(db, *day_range(date(2026, 6, 5)))
+    assert p["gross_profit"] == D("70.00")        # 250 − 180
+    assert p["gross_margin_pct"] == D("28.00")    # 70 / 250
+    assert p["profit_per_gram"] == D("14.00")     # 70 / 5
+
+
+@pytest.mark.asyncio
+async def test_profitability_none_when_no_cost_captured(db):
+    now = day_range(date(2026, 6, 5))[0] + timedelta(hours=12)
+    await _order(db, total=D("300"), when=now, items=[
+        {"qty": 1, "karat": Karat.K21, "grams": D("4"), "making": D("25"), "final": D("300")}])
+    assert await dashboard.profitability(db, *day_range(date(2026, 6, 5))) is None
