@@ -208,19 +208,13 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
         ).scalars():
             supplier_names[s.id] = s.name
 
-    # Accounts payable rollup
-    ap_rows = (await db.execute(
-        select(SupplierBalance).where(SupplierBalance.balance != 0)
-    )).scalars().all()
-    ap_cash = Decimal("0")
-    ap_gold_by_karat: dict[str, Decimal] = {}
-    ap_supplier_ids: set[str] = set()
-    for b in ap_rows:
-        ap_supplier_ids.add(b.supplier_id)
-        if b.unit == DebtUnit.CASH:
-            ap_cash += b.balance
-        else:
-            ap_gold_by_karat[b.karat] = ap_gold_by_karat.get(b.karat, Decimal("0")) + b.balance
+    # Phase B — money pulse. AR/AP aging come from the subledgers (dormant-safe);
+    # cash & VAT read GL balances, so they appear only once the GL is active.
+    receivables = await dash.receivables(db, as_of=today)
+    payables_aging = await dash.payables_aging(db, as_of=today)
+    gl_live = await dash.gl_has_entries(db)
+    cash_bank_balance = float(await dash.cash_bank_balance(db)) if gl_live else None
+    vat_position = (await dash.vat_position(db, today)) if gl_live else None
 
     return {
         "today_orders": today_orders,
@@ -277,9 +271,9 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
             }
             for p in recent_purchases
         ],
-        "accounts_payable": {
-            "total_cash_owed": float(ap_cash),
-            "total_grams_owed_by_karat": {k: float(v) for k, v in ap_gold_by_karat.items()},
-            "supplier_count": len(ap_supplier_ids),
-        },
+        # Phase B — money pulse (AP aging replaces the old accounts_payable block)
+        "receivables": receivables,
+        "payables_aging": payables_aging,
+        "cash_bank_balance": cash_bank_balance,
+        "vat_position": vat_position,
     }

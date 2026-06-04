@@ -136,3 +136,52 @@ async def dead_stock_count(db: AsyncSession, *, asof: datetime) -> int:
         Product.is_active.is_(True), Product.status.notin_(_DEAD_STATUSES),
         Product.on_hand_qty > 0, Product.created_at < cutoff))).scalar_one()
     return int(n)
+
+
+# ── Phase B — money pulse ─────────────────────────────────────────────────────
+
+from app.core import ap as ap_core  # noqa: E402
+from app.core import ar as ar_core  # noqa: E402
+from app.models import GLJournalEntry  # noqa: E402
+
+
+async def gl_has_entries(db: AsyncSession) -> bool:
+    """True once the GL is active (auto-post on + opening balances posted).
+    Gates the cash/VAT tiles, which read GL balances (zero while dormant)."""
+    return (await db.execute(select(func.count(GLJournalEntry.id)))).scalar_one() > 0
+
+
+async def receivables(db: AsyncSession, *, as_of: date) -> dict:
+    a = await ar_core.compute_aging(db, as_of=as_of)
+    t = a["totals"]
+    return {"total": float(a["grand_total"]), "b0_30": float(t["0_30"]), "b31_60": float(t["31_60"]),
+            "b61_90": float(t["61_90"]), "b90_plus": float(t["90_plus"])}
+
+
+async def payables_aging(db: AsyncSession, *, as_of: date) -> dict:
+    a = await ap_core.compute_ap_aging(db, as_of=as_of)
+    c = a["cash_buckets"]
+    return {"cash_total": float(a["cash_total"]), "b0_30": float(c["0_30"]), "b31_60": float(c["31_60"]),
+            "b61_90": float(c["61_90"]), "b90_plus": float(c["90_plus"]),
+            "metal_owed_by_karat": {k: float(v) for k, v in a["metal_owed_by_karat"].items()}}
+
+
+async def cash_bank_balance(db: AsyncSession) -> Decimal:
+    """USD-base balance across active bank accounts (GL-derived → 0 while dormant)."""
+    from app.models import BankAccount, GLJournalLine
+    accts = (await db.execute(select(BankAccount).where(BankAccount.is_active.is_(True)))).scalars().all()
+    total = ZERO
+    for ba in accts:
+        rows = (await db.execute(
+            select(GLJournalLine).where(GLJournalLine.account_id == ba.gl_account_id))).scalars().all()
+        total += sum((l.base_debit - l.base_credit for l in rows), ZERO)
+    return total.quantize(_Q_MONEY)
+
+
+async def vat_position(db: AsyncSession, today: date) -> dict:
+    """Current-quarter VAT (GL-derived). Quarter computed from the Beirut date."""
+    from app.core import tax as tax_core
+    q = (today.month - 1) // 3 + 1
+    vr = await tax_core.compute_vat_return(db, year=today.year, quarter=q)
+    return {"net_payable": float(vr["net_payable"]), "direction": vr["direction"],
+            "period_label": f"Q{q} {today.year}"}

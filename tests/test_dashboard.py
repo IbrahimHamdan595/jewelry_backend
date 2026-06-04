@@ -116,3 +116,20 @@ async def test_inventory_aging_dead_stock_low_stock(db):
     assert aging["d365_plus"] >= 1 and aging["d0_90"] >= 1
     assert (await dashboard.low_stock_count(db)) >= 1            # product below min_stock
     assert (await dashboard.dead_stock_count(db, asof=asof)) >= 1  # 400-day-old in-stock product
+
+
+# ── Phase B ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gl_has_entries_false_when_dormant(db):
+    assert (await dashboard.gl_has_entries(db)) is False
+
+
+@pytest.mark.asyncio
+async def test_receivables_payables_shape(db):
+    r = await dashboard.receivables(db, as_of=date(2026, 6, 5))
+    assert set(r) == {"total", "b0_30", "b31_60", "b61_90", "b90_plus"}
+    assert r["total"] == 0.0
+    p = await dashboard.payables_aging(db, as_of=date(2026, 6, 5))
+    assert set(p) == {"cash_total", "b0_30", "b31_60", "b61_90", "b90_plus", "metal_owed_by_karat"}
+    assert p["cash_total"] == 0.0
