@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core import dashboard as dash
 from app.core.daterange import BEIRUT_TZ, day_range
+from app.core.gold_api import get_current_gold_rate
 from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db
 from app.models import (
@@ -70,10 +71,11 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
         )
     )).scalar_one()
 
-    # Gold rate
+    # Gold rate (+ staleness from the same source the live-rate endpoint uses)
     latest_rate = (await db.execute(
         select(GoldRateHistory.rate_24k).order_by(GoldRateHistory.fetched_at.desc()).limit(1)
     )).scalar_one_or_none()
+    rate_info = await get_current_gold_rate(db)
 
     # 7-day chart (daily revenue, Beirut-local calendar days)
     chart_data = []
@@ -213,8 +215,22 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
         "week_revenue": float(week_revenue),
         "prev_week_revenue": float(prev_week_revenue),
         "gold_rate_24k": float(latest_rate) if latest_rate else None,
+        "gold_rate_is_stale": bool(rate_info["is_stale"]),
+        "gold_rate_fetched_at": rate_info["fetched_at"].isoformat() if rate_info.get("fetched_at") else None,
         "chart_data": chart_data,
         "top_sellers": top_sellers,
+        # Phase A — jeweler headline KPIs
+        "gold_weight_sold_today_by_karat": [
+            {"karat": r["karat"], "grams": float(r["grams"])}
+            for r in await dash.gold_weight_sold_by_karat(db, today_start, today_end)
+        ],
+        "gold_weight_sold_week_by_karat": [
+            {"karat": r["karat"], "grams": float(r["grams"])}
+            for r in await dash.gold_weight_sold_by_karat(db, week_start, week_end)
+        ],
+        "avg_invoice_value_today": float(dash.avg_invoice(today_revenue, today_orders)),
+        "making_charges_today": float(await dash.making_charges(db, today_start, today_end)),
+        "making_charges_week": float(await dash.making_charges(db, week_start, week_end)),
         "recent_orders": [
             {
                 "id": o.id,
