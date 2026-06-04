@@ -76,3 +76,43 @@ async def test_making_charges_and_avg_invoice(db):
     assert making == D("50.00")
     assert dashboard.avg_invoice(D("300"), 1) == D("300.00")
     assert dashboard.avg_invoice(D("0"), 0) == D("0.00")
+
+
+# ── Phase D ───────────────────────────────────────────────────────────────────
+from app.models import (
+    CoinType, GoldLot, LotSource, MarginMode, OunceType, Product, ProductStatus,
+)
+
+
+@pytest.mark.asyncio
+async def test_inventory_value_market(db):
+    db.add(GoldLot(karat=Karat.K24, weight_grams=D("10"), weight_remaining_grams=D("10"),
+                   source=LotSource.SEED, cost_basis_usd=D("700"), is_depleted=False))
+    db.add(Product(code="R1", name_en="R", category="rings", karat=Karat.K21, weight_grams=D("4"),
+                   margin_percent=D("15"), making_charge=D("25"), on_hand_qty=2,
+                   status=ProductStatus.AVAILABLE, cost_basis_usd=D("250")))
+    await db.flush()
+    val = await dashboard.inventory_valuation(db, rate_24k=D("80"))
+    assert val["pure_gold_usd"] == D("799.20")   # 10g K24 × 0.999 × 80
+    assert val["products_usd"] == D("500.00")     # 2 × 250
+    assert val["total_usd"] == val["pure_gold_usd"] + val["coins_usd"] + val["ounces_usd"] + val["products_usd"]
+    assert val["method"] == "market"
+
+
+@pytest.mark.asyncio
+async def test_inventory_aging_dead_stock_low_stock(db):
+    asof = datetime.now(BEIRUT_TZ)
+    old = asof - timedelta(days=400)
+    recent = asof - timedelta(days=10)
+    db.add(GoldLot(karat=Karat.K24, weight_grams=D("1"), weight_remaining_grams=D("1"),
+                   source=LotSource.SEED, cost_basis_usd=D("70"), is_depleted=False, acquired_at=old))
+    db.add(GoldLot(karat=Karat.K24, weight_grams=D("1"), weight_remaining_grams=D("1"),
+                   source=LotSource.SEED, cost_basis_usd=D("70"), is_depleted=False, acquired_at=recent))
+    db.add(Product(code="L", name_en="L", category="rings", karat=Karat.K21, weight_grams=D("4"),
+                   margin_percent=D("15"), making_charge=D("25"), on_hand_qty=1, min_stock_qty=5,
+                   status=ProductStatus.AVAILABLE, created_at=old))
+    await db.flush()
+    aging = await dashboard.inventory_aging(db, asof=asof)
+    assert aging["d365_plus"] >= 1 and aging["d0_90"] >= 1
+    assert (await dashboard.low_stock_count(db)) >= 1            # product below min_stock
+    assert (await dashboard.dead_stock_count(db, asof=asof)) >= 1  # 400-day-old in-stock product

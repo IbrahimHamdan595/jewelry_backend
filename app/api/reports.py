@@ -31,6 +31,19 @@ from app.models import (
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
+def _inv_value_floats(v: dict) -> dict:
+    """Convert the inventory_valuation Decimal fields to floats for the payload."""
+    return {
+        "total_usd": float(v["total_usd"]),
+        "pure_gold_usd": float(v["pure_gold_usd"]),
+        "coins_usd": float(v["coins_usd"]),
+        "ounces_usd": float(v["ounces_usd"]),
+        "products_usd": float(v["products_usd"]),
+        "rate_24k": float(v["rate_24k"]) if v["rate_24k"] is not None else None,
+        "method": v["method"],
+    }
+
+
 @router.get("/dashboard")
 async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
     now = datetime.now(timezone.utc)
@@ -247,8 +260,13 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
             "pure_gold_by_karat": pure_gold_totals,
             "coins": {"on_hand_total": int(coin_total), "distinct_types": int(coin_distinct)},
             "ounces": {"on_hand_total": int(ounce_total), "distinct_types": int(ounce_distinct)},
-            "low_stock_alerts": int(low_coin + low_ounce + low_product),
+            "low_stock_alerts": await dash.low_stock_count(db),
         },
+        # Phase D — inventory health (market valuation, aging, dead-stock)
+        "inventory_value": _inv_value_floats(
+            await dash.inventory_valuation(db, rate_24k=rate_info.get("rate"))),
+        "inventory_aging": await dash.inventory_aging(db, asof=now),
+        "dead_stock_count": await dash.dead_stock_count(db, asof=now),
         "recent_purchases": [
             {
                 "id": p.id,
