@@ -6,6 +6,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core import dashboard as dash
+from app.core.daterange import BEIRUT_TZ, day_range
+from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db
 from app.models import (
     CoinType,
@@ -28,36 +31,41 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 
 
 @router.get("/dashboard")
-async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
+async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(require_admin)):
     now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start = now - timedelta(days=7)
-    prev_week_start = week_start - timedelta(days=7)
+    today = datetime.now(BEIRUT_TZ).date()
+    today_start, today_end = day_range(today)
+    week_start, week_end = dash.week_window(today)
+    prev_week_start = day_range(today - timedelta(days=13))[0]
+    prev_week_end = week_start
 
-    # Today stats
+    # Today stats (Beirut-local calendar day, half-open window)
     today_orders = (await db.execute(
         select(func.count(Order.id)).where(
-            Order.created_at >= today_start, Order.status == OrderStatus.COMPLETED
+            Order.created_at >= today_start, Order.created_at < today_end,
+            Order.status == OrderStatus.COMPLETED
         )
     )).scalar_one()
 
     today_revenue = (await db.execute(
         select(func.coalesce(func.sum(Order.total_usd), 0)).where(
-            Order.created_at >= today_start, Order.status == OrderStatus.COMPLETED
+            Order.created_at >= today_start, Order.created_at < today_end,
+            Order.status == OrderStatus.COMPLETED
         )
     )).scalar_one()
 
-    # This week revenue
+    # This week revenue (7 Beirut days)
     week_revenue = (await db.execute(
         select(func.coalesce(func.sum(Order.total_usd), 0)).where(
-            Order.created_at >= week_start, Order.status == OrderStatus.COMPLETED
+            Order.created_at >= week_start, Order.created_at < week_end,
+            Order.status == OrderStatus.COMPLETED
         )
     )).scalar_one()
 
     # Previous week revenue for delta
     prev_week_revenue = (await db.execute(
         select(func.coalesce(func.sum(Order.total_usd), 0)).where(
-            Order.created_at.between(prev_week_start, week_start),
+            Order.created_at >= prev_week_start, Order.created_at < prev_week_end,
             Order.status == OrderStatus.COMPLETED,
         )
     )).scalar_one()
@@ -67,18 +75,18 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(get_cu
         select(GoldRateHistory.rate_24k).order_by(GoldRateHistory.fetched_at.desc()).limit(1)
     )).scalar_one_or_none()
 
-    # 7-day chart (daily revenue)
+    # 7-day chart (daily revenue, Beirut-local calendar days)
     chart_data = []
     for i in range(6, -1, -1):
-        day_start = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start.replace(hour=23, minute=59, second=59)
+        d = today - timedelta(days=i)
+        day_start, day_end = day_range(d)
         rev = (await db.execute(
             select(func.coalesce(func.sum(Order.total_usd), 0)).where(
-                Order.created_at.between(day_start, day_end),
+                Order.created_at >= day_start, Order.created_at < day_end,
                 Order.status == OrderStatus.COMPLETED,
             )
         )).scalar_one()
-        chart_data.append({"date": day_start.date().isoformat(), "revenue": float(rev), "is_today": i == 0})
+        chart_data.append({"date": d.isoformat(), "revenue": float(rev), "is_today": i == 0})
 
     # Top sellers this week
     top_sellers_rows = (await db.execute(
