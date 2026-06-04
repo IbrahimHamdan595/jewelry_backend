@@ -185,3 +185,26 @@ async def vat_position(db: AsyncSession, today: date) -> dict:
     vr = await tax_core.compute_vat_return(db, year=today.year, quarter=q)
     return {"net_payable": float(vr["net_payable"]), "direction": vr["direction"],
             "period_label": f"Q{q} {today.year}"}
+
+
+# ── Phase E — loss-prevention (read-only over the ledger + orders) ────────────
+
+from app.core import ledger as _ledger  # noqa: E402
+from app.models import InventoryLedger, Settings  # noqa: E402
+
+
+async def loss_prevention(db: AsyncSession, start: datetime, end: datetime) -> dict:
+    def _count_event(ev):
+        return select(func.count(InventoryLedger.id)).where(
+            InventoryLedger.event_type == ev,
+            InventoryLedger.occurred_at >= start, InventoryLedger.occurred_at < end)
+    voids = (await db.execute(_count_event(_ledger.EVENT_ORDER_VOID))).scalar_one()
+    overrides = (await db.execute(_count_event(_ledger.EVENT_GOLD_RATE_OVERRIDE_SET))).scalar_one()
+    s = (await db.execute(select(Settings).limit(1))).scalar_one_or_none()
+    threshold = s.max_discount_percent if s else ZERO
+    excess = (await db.execute(select(func.count(Order.id)).where(
+        Order.status == OrderStatus.COMPLETED,
+        Order.created_at >= start, Order.created_at < end,
+        Order.discount_percent > threshold))).scalar_one()
+    return {"order_voids": int(voids), "rate_overrides": int(overrides),
+            "excess_discount_orders": int(excess)}

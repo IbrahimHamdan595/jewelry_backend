@@ -133,3 +133,31 @@ async def test_receivables_payables_shape(db):
     p = await dashboard.payables_aging(db, as_of=date(2026, 6, 5))
     assert set(p) == {"cash_total", "b0_30", "b31_60", "b61_90", "b90_plus", "metal_owed_by_karat"}
     assert p["cash_total"] == 0.0
+
+
+# ── Phase E ───────────────────────────────────────────────────────────────────
+from app.core import ledger
+from app.models import InventoryLedger, Settings
+
+
+@pytest.mark.asyncio
+async def test_loss_prevention_counts(db):
+    await _ensure_user(db)
+    start, end = day_range(date(2026, 6, 5))
+    mid = start + timedelta(hours=6)
+    db.add(InventoryLedger(event_type=ledger.EVENT_ORDER_VOID, actor_user_id="u1",
+                           ref_type="order", ref_id="o1", payload={}, occurred_at=mid,
+                           prev_hash="x", entry_hash="hash-void"))
+    db.add(InventoryLedger(event_type=ledger.EVENT_GOLD_RATE_OVERRIDE_SET, actor_user_id="u1",
+                           ref_type="rate", ref_id="r1", payload={}, occurred_at=mid,
+                           prev_hash="hash-void", entry_hash="hash-override"))
+    db.add(Settings(id="singleton", max_discount_percent=D("10")))
+    await db.flush()
+    await _order(db, total=D("100"), when=mid)                 # no discount
+    o = await _order(db, total=D("100"), when=mid)             # 15% > 10% threshold
+    o.discount_percent = D("15")
+    await db.flush()
+    lp = await dashboard.loss_prevention(db, start, end)
+    assert lp["order_voids"] == 1
+    assert lp["rate_overrides"] == 1
+    assert lp["excess_discount_orders"] == 1

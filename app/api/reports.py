@@ -276,4 +276,6 @@ async def dashboard(db: AsyncSession = Depends(get_db), _: User = Depends(requir
         "payables_aging": payables_aging,
         "cash_bank_balance": cash_bank_balance,
         "vat_position": vat_position,
+        # Phase E — loss-prevention (last 7 Beirut days)
+        "loss_prevention": await dash.loss_prevention(db, week_start, week_end),
     }
