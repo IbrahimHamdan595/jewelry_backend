@@ -270,11 +270,27 @@ def _stringify(v):
     return v
 
 
+def _tb_sheets(d: dict):
+    from app.core.xlsx import Sheet
+    rows = []
+    for a in d["accounts"]:
+        metal = ", ".join(f"{k}: {v['net_grams']}" for k, v in a["metal_by_karat"].items())
+        rows.append([a["code"], a["name"], a["base_debit"], a["base_credit"], metal])
+    rows.append(["", "Total", d["total_base_debit"], d["total_base_credit"], ""])
+    return [Sheet(name="Trial Balance",
+                  headers=["Code", "Account", "Debit (USD)", "Credit (USD)", "Metal (g/karat)"],
+                  rows=rows, title=f"Trial Balance as of {d['as_of']}")]
+
+
 @router.get("/trial-balance")
 async def trial_balance(
-    as_of: date, db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting),
+    as_of: date, format: str = Query(None),
+    db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting),
 ):
     tb = await gl.compute_trial_balance(db, as_of=as_of)
+    if format == "xlsx":
+        from app.core.xlsx import build_xlsx_response
+        return build_xlsx_response(_tb_sheets(tb), filename=f"trial-balance-{as_of}")
     return _stringify(tb)
 
 

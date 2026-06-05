@@ -1,17 +1,44 @@
 from datetime import date
 from decimal import Decimal
+from html import escape
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import expenses
+from app.core import expenses, pdf
 from app.core.permissions import require_accounting
 from app.deps import get_db
-from app.models import AccountType, GLAccount, Settings, User, VendorBill
+from app.models import AccountType, GLAccount, Settings, User, VendorBill, VendorBillLine
 from app.schemas.expenses import VendorBillCreate, VendorPaymentCreate
 
 router = APIRouter(prefix="/accounting/expenses", tags=["accounting-expenses"])
+
+_BILL_L = {
+    "en": {"title": "Vendor Bill", "vendor": "Vendor", "date": "Date", "no": "Bill No.",
+           "desc": "Description", "amount": "Amount", "subtotal": "Subtotal", "vat": "VAT",
+           "total": "Total", "paid": "Paid", "due": "Balance due"},
+    "ar": {"title": "فاتورة مورّد", "vendor": "المورّد", "date": "التاريخ", "no": "رقم الفاتورة",
+           "desc": "الوصف", "amount": "المبلغ", "subtotal": "المجموع الفرعي",
+           "vat": "ضريبة القيمة المضافة", "total": "الإجمالي", "paid": "المدفوع", "due": "الرصيد المستحق"},
+}
+
+
+def _bill_html(bill: VendorBill, lines: list[VendorBillLine], lang: str) -> str:
+    L = _BILL_L.get(lang, _BILL_L["en"])
+    tbl = pdf.table([(L["desc"], False), (L["amount"], True)],
+                    [[ln.description, ln.amount] for ln in lines])
+    meta = (f'<div class="meta"><div><strong>{escape(L["no"])}:</strong> {escape(bill.bill_no)}</div>'
+            f'<div><strong>{escape(L["vendor"])}:</strong> {escape(bill.vendor_name)}</div>'
+            f'<div class="muted">{escape(L["date"])}: {bill.bill_date}</div></div>')
+    due = (bill.total - bill.amount_paid).quantize(Decimal("0.01"))
+    summary_rows = "".join(
+        f'<div class="row"><span>{escape(lbl)}</span><span class="amt">{val}</span></div>'
+        for lbl, val in [(L["subtotal"], bill.subtotal), (L["vat"], bill.vat_amount),
+                         (L["total"], bill.total), (L["paid"], bill.amount_paid)])
+    summary = (f'<div class="summary">{summary_rows}'
+               f'<div class="row grand"><span>{escape(L["due"])}</span><span class="amt">{due}</span></div></div>')
+    return pdf.document(title=L["title"], lang=lang, body=meta + tbl + summary)
 
 
 def _S(v):
@@ -54,6 +81,17 @@ async def list_bills(vendor_name: str = "", db: AsyncSession = Depends(get_db), 
     rows = (await db.execute(q)).scalars().all()
     return {"items": [{"id": b.id, "bill_no": b.bill_no, "vendor_name": b.vendor_name, "bill_date": b.bill_date,
                        "total": str(b.total), "amount_paid": str(b.amount_paid), "status": b.status.value} for b in rows]}
+
+
+@router.get("/bills/{bill_id}/pdf")
+async def bill_pdf(bill_id: str, lang: str = Query("en"),
+                   db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting)):
+    bill = (await db.execute(select(VendorBill).where(VendorBill.id == bill_id))).scalar_one_or_none()
+    if bill is None:
+        raise HTTPException(404, "Bill not found")
+    lines = (await db.execute(
+        select(VendorBillLine).where(VendorBillLine.bill_id == bill_id))).scalars().all()
+    return pdf.pdf_response(_bill_html(bill, lines, lang), filename=f"bill-{bill.bill_no}")
 
 
 @router.post("/payments")

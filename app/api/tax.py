@@ -58,7 +58,28 @@ async def update_code(code_id: str, body: dict, db: AsyncSession = Depends(get_d
     return {"id": c.id, "code": c.code, "rate": str(c.rate), "is_active": c.is_active}
 
 
+def _vat_sheets(d: dict):
+    from app.core.xlsx import Sheet
+    summary = Sheet(
+        name="VAT Return",
+        headers=["Item", "Amount"],
+        rows=[["Output VAT", d["output_vat"]], ["Input VAT", d["input_vat"]],
+              ["Net payable", d["net_payable"]], ["Direction", d["direction"]]],
+        title=f"VAT Return {d['year']} Q{d['quarter']} ({d['from']} → {d['until']})")
+    txns = Sheet(
+        name="Transactions",
+        headers=["Entry", "Date", "Source", "Kind", "VAT"],
+        rows=[[t["entry_no"], str(t["date"]), t["source_type"], t["kind"], t["vat"]]
+              for t in d["transactions"]],
+        title="VAT transactions")
+    return [summary, txns]
+
+
 @router.get("/vat-return")
-async def vat_return(year: int, quarter: int = Query(ge=1, le=4),
+async def vat_return(year: int, quarter: int = Query(ge=1, le=4), format: str = Query(None),
                      db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting)):
-    return _S(await tax.compute_vat_return(db, year=year, quarter=quarter))
+    data = await tax.compute_vat_return(db, year=year, quarter=quarter)
+    if format == "xlsx":
+        from app.core.xlsx import build_xlsx_response
+        return build_xlsx_response(_vat_sheets(data), filename=f"vat-return-{year}-Q{quarter}")
+    return _S(data)

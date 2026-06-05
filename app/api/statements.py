@@ -1,17 +1,94 @@
 from datetime import date
 from decimal import Decimal
+from html import escape
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import kpis as kpis_core
-from app.core import statements
+from app.core import pdf, statements
 from app.core.permissions import require_accounting
 from app.core.xlsx import Sheet, build_xlsx_response
 from app.deps import get_db
 from app.models import User
 
 router = APIRouter(prefix="/accounting/statements", tags=["accounting-statements"])
+
+# ── PDF label packs + builders (bilingual, RTL-aware) ─────────────────────────
+
+_PNL_L = {
+    "en": {"title": "Income Statement", "revenue": "Revenue", "cogs": "COGS",
+           "gross": "Gross profit", "opex": "Operating expenses", "operating": "Operating profit",
+           "other": "Other income/(expense)", "net": "Net profit"},
+    "ar": {"title": "قائمة الدخل", "revenue": "الإيرادات", "cogs": "تكلفة المبيعات",
+           "gross": "الربح الإجمالي", "opex": "المصاريف التشغيلية", "operating": "الربح التشغيلي",
+           "other": "إيرادات/(مصاريف) أخرى", "net": "صافي الربح"},
+}
+_BS_L = {
+    "en": {"title": "Balance Sheet", "assets": "Assets", "liabilities": "Liabilities",
+           "equity": "Equity", "tassets": "Total assets", "tliab": "Total liabilities",
+           "tequity": "Total equity"},
+    "ar": {"title": "الميزانية العمومية", "assets": "الأصول", "liabilities": "الالتزامات",
+           "equity": "حقوق الملكية", "tassets": "إجمالي الأصول", "tliab": "إجمالي الالتزامات",
+           "tequity": "إجمالي حقوق الملكية"},
+}
+_CF_L = {
+    "en": {"title": "Cash Flow", "opening": "Opening cash", "net": "Net change", "closing": "Closing cash"},
+    "ar": {"title": "قائمة التدفقات النقدية", "opening": "النقد الافتتاحي", "net": "صافي التغير",
+           "closing": "النقد الختامي"},
+}
+
+
+def _two_col(rows: list[tuple]) -> str:
+    """rows: (label, amount|None, css_class). None amount ⇒ section header."""
+    body = ""
+    for label, amount, cls in rows:
+        amt = "" if amount is None else escape(str(amount))
+        body += f'<tr class="{cls}"><td>{escape(str(label))}</td><td class="num">{amt}</td></tr>'
+    return f"<table><tbody>{body}</tbody></table>"
+
+
+def _pnl_pdf(d: dict, lang: str) -> str:
+    L = _PNL_L.get(lang, _PNL_L["en"])
+    rows = [(L["revenue"], None, "section")]
+    rows += [(l["name"], l["amount"], "") for l in d["revenue_lines"]]
+    rows.append((L["revenue"], d["revenue"], "total"))
+    rows.append((L["cogs"], None, "section"))
+    rows += [(l["name"], l["amount"], "") for l in d["cogs_lines"]]
+    rows.append((L["gross"], d["gross_profit"], "total"))
+    rows.append((L["opex"], None, "section"))
+    rows += [(l["name"], l["amount"], "") for l in d["opex_lines"]]
+    rows.append((L["operating"], d.get("operating_profit", d["gross_profit"]), "total"))
+    if d.get("other_lines"):
+        rows.append((L["other"], None, "section"))
+        rows += [(l["name"], l["amount"], "") for l in d["other_lines"]]
+    rows.append((L["net"], d["net_profit"], "total"))
+    return pdf.document(title=L["title"], lang=lang, subtitle=f'{d["start"]} → {d["end"]}',
+                        body=_two_col(rows))
+
+
+def _bs_pdf(d: dict, lang: str) -> str:
+    L = _BS_L.get(lang, _BS_L["en"])
+    rows = [(L["assets"], None, "section")]
+    rows += [(l["name"], l["amount"], "") for l in d["asset_lines"]]
+    rows.append((L["tassets"], d["total_assets"], "total"))
+    rows.append((L["liabilities"], None, "section"))
+    rows += [(l["name"], l["amount"], "") for l in d["liability_lines"]]
+    rows.append((L["tliab"], d["total_liabilities"], "total"))
+    rows.append((L["equity"], None, "section"))
+    rows += [(l["name"], l["amount"], "") for l in d["equity_lines"]]
+    rows.append((L["tequity"], d["total_equity"], "total"))
+    return pdf.document(title=L["title"], lang=lang, subtitle=f'{d["as_of"]}', body=_two_col(rows))
+
+
+def _cf_pdf(d: dict, lang: str) -> str:
+    L = _CF_L.get(lang, _CF_L["en"])
+    rows = [(L["opening"], d["opening_cash"], "")]
+    rows += [(c["label"], c["amount"], "") for c in d["categories"]]
+    rows.append((L["net"], d["net_change"], "total"))
+    rows.append((L["closing"], d["closing_cash"], "total"))
+    return pdf.document(title=L["title"], lang=lang, subtitle=f'{d["start"]} → {d["end"]}',
+                        body=_two_col(rows))
 
 
 def _S(v):
@@ -105,32 +182,38 @@ def _kpis_sheets(d: dict) -> list[Sheet]:
 
 
 @router.get("/income-statement")
-async def income_statement(start: date, end: date, format: str = Query(None),
+async def income_statement(start: date, end: date, format: str = Query(None), lang: str = Query("en"),
                            db: AsyncSession = Depends(get_db),
                            _: User = Depends(require_accounting)):
     data = await statements.income_statement(db, start=start, end=end)
     if format == "xlsx":
         return build_xlsx_response(_pnl_sheets(data), filename=f"income-statement-{start}-{end}")
+    if format == "pdf":
+        return pdf.pdf_response(_pnl_pdf(data, lang), filename=f"income-statement-{start}-{end}")
     return _S(data)
 
 
 @router.get("/balance-sheet")
-async def balance_sheet(as_of: date, format: str = Query(None),
+async def balance_sheet(as_of: date, format: str = Query(None), lang: str = Query("en"),
                         db: AsyncSession = Depends(get_db),
                         _: User = Depends(require_accounting)):
     data = await statements.balance_sheet(db, as_of=as_of)
     if format == "xlsx":
         return build_xlsx_response(_bs_sheets(data), filename=f"balance-sheet-{as_of}")
+    if format == "pdf":
+        return pdf.pdf_response(_bs_pdf(data, lang), filename=f"balance-sheet-{as_of}")
     return _S(data)
 
 
 @router.get("/cash-flow")
-async def cash_flow(start: date, end: date, format: str = Query(None),
+async def cash_flow(start: date, end: date, format: str = Query(None), lang: str = Query("en"),
                     db: AsyncSession = Depends(get_db),
                     _: User = Depends(require_accounting)):
     data = await statements.cash_flow(db, start=start, end=end)
     if format == "xlsx":
         return build_xlsx_response(_cf_sheets(data), filename=f"cash-flow-{start}-{end}")
+    if format == "pdf":
+        return pdf.pdf_response(_cf_pdf(data, lang), filename=f"cash-flow-{start}-{end}")
     return _S(data)
 
 
