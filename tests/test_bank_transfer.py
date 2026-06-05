@@ -49,7 +49,7 @@ async def test_transfer_cross_currency_posts_fx(db):
     tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
     assert tb["balanced"] is True
     accts = {a["system_key"]: a for a in tb["accounts"] if a["system_key"]}
-    assert "FX_GAIN_LOSS" in accts  # residual posted
+    assert ("FX_LOSS" in accts) or ("FX_GAIN" in accts)  # residual posted to the split FX accounts
 
 
 @pytest.mark.asyncio

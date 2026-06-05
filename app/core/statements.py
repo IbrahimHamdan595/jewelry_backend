@@ -22,6 +22,7 @@ from app.models import (
 ZERO = Decimal("0")
 
 COGS_KEYS = {"METAL_COGS", "MAKING_COGS"}
+OTHER_KEYS = {"FX_GAIN", "FX_LOSS"}  # reported as "Other income/(expense)" below operating
 INVENTORY_KEYS = {"METAL_INVENTORY", "PRODUCT_INVENTORY"}
 MONEY_AP_KEYS = {"AP", "VENDOR_AP"}
 
@@ -56,10 +57,18 @@ async def income_statement(db: AsyncSession, *, start: date, end: date) -> dict:
         a["debit"] += line.base_debit
         a["credit"] += line.base_credit
 
-    revenue_lines, cogs_lines, opex_lines = [], [], []
-    revenue = cogs = opex = ZERO
+    revenue_lines, cogs_lines, opex_lines, other_lines = [], [], [], []
+    revenue = cogs = opex = other = ZERO
     for a in sorted(acc.values(), key=lambda x: x["code"]):
-        if a["type"] == AccountType.INCOME:
+        # Realized FX (FX_GAIN income / FX_LOSS expense) is reported together as
+        # "Other income/(expense)" below operating profit (Odoo parity), signed
+        # so a gain is positive and a loss negative.
+        if a["system_key"] in OTHER_KEYS:
+            signed = _q_money((a["credit"] - a["debit"]) if a["type"] == AccountType.INCOME
+                              else -(a["debit"] - a["credit"]))
+            other += signed
+            other_lines.append(_line(a, signed))
+        elif a["type"] == AccountType.INCOME:
             amt = _q_money(a["credit"] - a["debit"])
             revenue += amt
             revenue_lines.append(_line(a, amt))
@@ -72,13 +81,16 @@ async def income_statement(db: AsyncSession, *, start: date, end: date) -> dict:
             opex += amt
             opex_lines.append(_line(a, amt))
 
-    revenue, cogs, opex = _q_money(revenue), _q_money(cogs), _q_money(opex)
+    revenue, cogs, opex, other = _q_money(revenue), _q_money(cogs), _q_money(opex), _q_money(other)
     gross = _q_money(revenue - cogs)
+    operating = _q_money(gross - opex)
     return {
         "start": start, "end": end,
         "revenue_lines": revenue_lines, "cogs_lines": cogs_lines, "opex_lines": opex_lines,
+        "other_lines": other_lines,
         "revenue": revenue, "cogs": cogs, "gross_profit": gross,
-        "operating_expenses": opex, "net_profit": _q_money(gross - opex),
+        "operating_expenses": opex, "operating_profit": operating,
+        "other_income_expense": other, "net_profit": _q_money(operating + other),
     }
 
 

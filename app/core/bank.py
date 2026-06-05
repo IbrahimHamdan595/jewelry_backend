@@ -100,7 +100,9 @@ async def post_transfer(db: AsyncSession, *, from_account: BankAccount, to_accou
     ]
     residual = (src_base - dest_base).quantize(_Q_MONEY)
     if residual != ZERO:
-        fx = (await db.execute(select(GLAccount).where(GLAccount.system_key == "FX_GAIN_LOSS"))).scalar_one()
+        # Split FX (Odoo parity): a debit residual is a loss, a credit a gain.
+        fx_key = "FX_LOSS" if residual > 0 else "FX_GAIN"
+        fx = (await db.execute(select(GLAccount).where(GLAccount.system_key == fx_key))).scalar_one()
         if residual > 0:
             lines.append(gl.GLLine(account_id=fx.id, denomination="MONEY",
                                    base_debit=residual, money_debit=residual, memo="transfer FX"))

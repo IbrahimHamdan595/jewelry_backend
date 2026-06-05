@@ -45,9 +45,12 @@ SYSTEM_ACCOUNTS: list[tuple] = [
     ("3100", "Retained Earnings",     EQ, M,  CR, "USD", "RETAINED_EARNINGS"),
     ("4000", "Sales Revenue",         INC, M, CR, "USD", "SALES_REVENUE"),
     ("4100", "Making-Charge Revenue", INC, M, CR, "USD", "MAKING_CHARGE_REVENUE"),
+    # Realized FX split (Odoo parity): gain → INCOME (credit), loss → EXPENSE
+    # (debit). Reported together as "Other income/(expense)" below operating.
+    ("4900", "FX Gain",               INC, M, CR, "USD", "FX_GAIN"),
     ("5000", "Metal COGS",            EXP, DU, DR, "USD", "METAL_COGS"),
     ("5100", "Making COGS",           EXP, M,  DR, "USD", "MAKING_COGS"),
-    ("6900", "FX Gain/Loss",          EXP, M,  DR, "USD", "FX_GAIN_LOSS"),
+    ("6900", "FX Loss",               EXP, M,  DR, "USD", "FX_LOSS"),
     # Module 1 (auto-posting) additions:
     ("1250", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),
     ("5200", "Inventory Adjustment Expense", EXP, M, DR, "USD", "ADJUSTMENT_EXPENSE"),

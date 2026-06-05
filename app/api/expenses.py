@@ -41,7 +41,7 @@ async def create_bill(body: VendorBillCreate, db: AsyncSession = Depends(get_db)
         db, vendor_name=body.vendor_name, supplier_id=body.supplier_id, bill_date=body.bill_date,
         due_date=body.due_date, lines=[l.model_dump() for l in body.lines],
         payment_system_key=body.payment_system_key, memo=body.memo, settings=await _settings(db),
-        actor_user_id=user.id, tax_code_id=body.tax_code_id)
+        actor_user_id=user.id, tax_code_id=body.tax_code_id, currency=body.currency, fx_rate=body.fx_rate)
     await db.commit()
     return {"id": bill.id, "bill_no": bill.bill_no, "total": str(bill.total), "status": bill.status.value}
 
@@ -60,7 +60,8 @@ async def list_bills(vendor_name: str = "", db: AsyncSession = Depends(get_db), 
 async def create_payment(body: VendorPaymentCreate, db: AsyncSession = Depends(get_db), user: User = Depends(require_accounting)):
     p = await expenses.post_vendor_payment(db, vendor_name=body.vendor_name, payment_date=body.payment_date,
         amount=body.amount, payment_system_key=body.payment_system_key, memo=body.memo,
-        settings=await _settings(db), actor_user_id=user.id, allocations=body.allocations)
+        settings=await _settings(db), actor_user_id=user.id, allocations=body.allocations,
+        currency=body.currency, fx_rate=body.fx_rate)
     await db.commit()
     return {"id": p.id, "payment_no": p.payment_no, "unapplied_amount": str(p.unapplied_amount)}
 

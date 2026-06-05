@@ -64,7 +64,7 @@ async def create_invoice(body: StandaloneInvoiceCreate, db: AsyncSession = Depen
     inv = await ar.post_standalone_invoice(
         db, customer_id=body.customer_id, invoice_date=body.invoice_date, due_date=body.due_date,
         lines=[l.model_dump() for l in body.lines], memo=body.memo, vat_percent=body.vat_percent,
-        settings=await _settings(db), actor_user_id=user.id)
+        settings=await _settings(db), actor_user_id=user.id, fx_rate=body.fx_rate)
     await db.commit()
     return {"id": inv.id, "invoice_no": inv.invoice_no, "total": str(inv.total), "status": inv.status.value}
 
@@ -74,7 +74,8 @@ async def create_receipt(body: ReceiptCreate, db: AsyncSession = Depends(get_db)
                          user: User = Depends(require_accounting)):
     r = await ar.post_receipt(db, customer_id=body.customer_id, receipt_date=body.receipt_date,
                               amount=body.amount, payment_system_key=body.payment_system_key, memo=body.memo,
-                              settings=await _settings(db), actor_user_id=user.id, allocations=body.allocations)
+                              settings=await _settings(db), actor_user_id=user.id, allocations=body.allocations,
+                              currency=body.currency, fx_rate=body.fx_rate)
     await db.commit()
     return {"id": r.id, "receipt_no": r.receipt_no, "unapplied_amount": str(r.unapplied_amount)}
 

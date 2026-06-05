@@ -11,8 +11,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import gl
-from app.core.ar import _next_doc_no
+from app.core import gl, gl_fx
+from app.core.ar import _leg_to_glline, _next_doc_no
 from app.core.gl_postings import auto_post_enabled
 from app.models import (
     AccountType, GLAccount, GLJournalEntry, GLJournalLine, Settings, TaxCode,
@@ -21,6 +21,7 @@ from app.models import (
 
 ZERO = Decimal("0")
 _Q_MONEY = Decimal("0.01")
+ONE = Decimal("1")
 
 SOURCE_VENDOR_BILL = "VENDOR_BILL"
 SOURCE_VENDOR_PAYMENT = "VENDOR_PAYMENT"
@@ -48,9 +49,13 @@ async def _resolve_expense_account(db: AsyncSession, line: dict) -> str:
 async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: str | None,
                            bill_date: date, due_date, lines: list[dict], payment_system_key: str | None,
                            memo: str, settings: Settings, actor_user_id: str,
-                           tax_code_id: str | None = None) -> VendorBill:
+                           tax_code_id: str | None = None,
+                           currency: str = "USD", fx_rate: Decimal | None = None) -> VendorBill:
     if not lines:
         raise HTTPException(422, "A bill needs at least one line")
+    currency = currency or "USD"
+    rate = (Decimal(str(fx_rate)) if fx_rate is not None
+            else (Decimal(str(settings.lbp_exchange_rate)) if currency != "USD" else ONE))
     resolved = []  # (expense_account_id, amount, description)
     total = ZERO
     for ln in lines:
@@ -68,17 +73,20 @@ async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: s
             raise HTTPException(422, "Tax code not found")
         vat = (subtotal * tc.rate / Decimal(100)).quantize(_Q_MONEY)
     total = (subtotal + vat).quantize(_Q_MONEY)
+    base_total = (total / rate).quantize(_Q_MONEY)  # money is in the bill currency; base = money/rate
 
     entry = None
     if auto_post_enabled(settings):
         credit_id = (await _resolve(db, payment_system_key)) if payment_system_key else (await _resolve(db, "VENDOR_AP"))
-        gl_lines = [gl.GLLine(account_id=aid, denomination="MONEY", base_debit=amt, money_debit=amt, memo=desc or "expense")
+        gl_lines = [gl.GLLine(account_id=aid, denomination="MONEY", base_debit=(amt / rate).quantize(_Q_MONEY),
+                              money_debit=amt, currency=currency, fx_rate=rate, memo=desc or "expense")
                     for aid, amt, desc in resolved]
         if vat > 0:
             vat_id = await _resolve(db, "VAT_RECEIVABLE")
-            gl_lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY", base_debit=vat, money_debit=vat, memo="input VAT"))
+            gl_lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY", base_debit=(vat / rate).quantize(_Q_MONEY),
+                                      money_debit=vat, currency=currency, fx_rate=rate, memo="input VAT"))
         gl_lines.append(gl.GLLine(account_id=credit_id, denomination="MONEY",
-                                  base_credit=total, money_credit=total,
+                                  base_credit=base_total, money_credit=total, currency=currency, fx_rate=rate,
                                   memo=("paid" if payment_system_key else "vendor AP")))
         entry = await gl.post_entry(db, entry_date=bill_date, memo=f"Vendor bill {vendor_name} {memo}",
                                     source_type=SOURCE_VENDOR_BILL, source_id=None, lines=gl_lines, actor_user_id=actor_user_id)
@@ -86,6 +94,7 @@ async def post_vendor_bill(db: AsyncSession, *, vendor_name: str, supplier_id: s
     paid_now = payment_system_key is not None
     bill = VendorBill(bill_no=await _next_doc_no(db, "BILL", bill_date), vendor_name=vendor_name,
                       supplier_id=supplier_id, bill_date=bill_date, due_date=due_date,
+                      currency=currency, fx_rate=rate,
                       subtotal=subtotal, vat_amount=vat, total=total, tax_code_id=tax_code_id,
                       amount_paid=(total if paid_now else ZERO),
                       status=(VendorBillStatus.PAID if paid_now else VendorBillStatus.OPEN),
@@ -108,37 +117,40 @@ def _apply(bill: VendorBill, amount: Decimal) -> Decimal:
 
 async def post_vendor_payment(db: AsyncSession, *, vendor_name: str, payment_date: date, amount: Decimal,
                               payment_system_key: str, memo: str, settings: Settings, actor_user_id: str,
-                              allocations: list[dict] | None = None) -> VendorPayment:
+                              allocations: list[dict] | None = None,
+                              currency: str = "USD", fx_rate: Decimal | None = None) -> VendorPayment:
     amount = Decimal(str(amount)).quantize(_Q_MONEY)
     if amount <= 0:
         raise HTTPException(422, "amount must be positive")
-
-    entry = None
-    if auto_post_enabled(settings):
-        ap_id = await _resolve(db, "VENDOR_AP")
-        pay_id = await _resolve(db, payment_system_key)
-        entry = await gl.post_entry(db, entry_date=payment_date, memo=f"Vendor payment {vendor_name} {memo}",
-            source_type=SOURCE_VENDOR_PAYMENT, source_id=None,
-            lines=[gl.GLLine(account_id=ap_id, denomination="MONEY", base_debit=amount, money_debit=amount, memo="pay vendor AP"),
-                   gl.GLLine(account_id=pay_id, denomination="MONEY", base_credit=amount, money_credit=amount, memo="cash out")],
-            actor_user_id=actor_user_id)
+    currency = currency or "USD"
+    cash_acct = (await db.execute(
+        select(GLAccount).where(GLAccount.system_key == payment_system_key))).scalar_one_or_none()
+    if cash_acct is None:
+        raise HTTPException(422, f"GL account {payment_system_key} not seeded")
+    tender_currency = cash_acct.currency or "USD"
+    rate = (Decimal(str(fx_rate)) if fx_rate is not None
+            else (Decimal(str(settings.lbp_exchange_rate)) if tender_currency != "USD" else ONE))
 
     payment = VendorPayment(payment_no=await _next_doc_no(db, "VP", payment_date), vendor_name=vendor_name,
-                            payment_date=payment_date, amount=amount, payment_system_key=payment_system_key,
-                            gl_entry_id=(entry.id if entry else None), memo=memo)
+                            payment_date=payment_date, currency=currency, fx_rate=rate, amount=amount,
+                            payment_system_key=payment_system_key, gl_entry_id=None, memo=memo)
     db.add(payment)
     await db.flush()
 
+    alloc_specs: list[gl_fx.Allocation] = []
     remaining = amount
     if allocations:
         for al in allocations:
             bill = (await db.execute(select(VendorBill).where(VendorBill.id == al["bill_id"]))).scalar_one()
             applied = _apply(bill, Decimal(str(al["amount"])).quantize(_Q_MONEY))
-            db.add(VendorPaymentAllocation(payment_id=payment.id, bill_id=bill.id, amount=applied))
-            remaining -= applied
+            if applied > 0:
+                db.add(VendorPaymentAllocation(payment_id=payment.id, bill_id=bill.id, amount=applied))
+                alloc_specs.append(gl_fx.Allocation(bill.currency or "USD", bill.fx_rate or ONE, applied))
+                remaining -= applied
     else:
         open_bills = (await db.execute(
             select(VendorBill).where(VendorBill.vendor_name == vendor_name,
+                                     VendorBill.currency == currency,
                                      VendorBill.status.in_((VendorBillStatus.OPEN, VendorBillStatus.PARTIAL)))
             .order_by(VendorBill.bill_date, VendorBill.bill_no)
         )).scalars().all()
@@ -148,9 +160,29 @@ async def post_vendor_payment(db: AsyncSession, *, vendor_name: str, payment_dat
             applied = _apply(bill, remaining)
             if applied > 0:
                 db.add(VendorPaymentAllocation(payment_id=payment.id, bill_id=bill.id, amount=applied))
+                alloc_specs.append(gl_fx.Allocation(bill.currency or "USD", bill.fx_rate or ONE, applied))
                 remaining -= applied
 
     payment.unapplied_amount = remaining.quantize(_Q_MONEY)
+
+    if auto_post_enabled(settings):
+        specs = list(alloc_specs)
+        if remaining > ZERO:   # overpayment debits AP at the recorded rate (no FX on it)
+            specs.append(gl_fx.Allocation(currency, ONE if currency == "USD" else rate, remaining.quantize(_Q_MONEY)))
+        if specs:
+            try:
+                legs = gl_fx.settlement_legs(
+                    kind="payment", recorded_currency=currency, allocations=specs,
+                    control_system_key="VENDOR_AP", cash_system_key=payment_system_key,
+                    tender_currency=tender_currency, tender_fx_rate=rate)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
+            gl_lines = [await _leg_to_glline(db, l) for l in legs]
+            entry = await gl.post_entry(db, entry_date=payment_date, memo=f"Vendor payment {vendor_name} {memo}",
+                                        source_type=SOURCE_VENDOR_PAYMENT, source_id=None,
+                                        lines=gl_lines, actor_user_id=actor_user_id)
+            payment.gl_entry_id = entry.id
+
     await db.flush()
     return payment
 
@@ -162,9 +194,10 @@ async def verify_vendor_ap(db: AsyncSession) -> dict:
     bills = (await db.execute(
         select(VendorBill).where(VendorBill.status.in_((VendorBillStatus.OPEN, VendorBillStatus.PARTIAL)))
     )).scalars().all()
-    owed = sum(((b.total - b.amount_paid) for b in bills), ZERO)
+    # Subledger in base (USD) — each doc at its captured rate — to tie like-for-like.
+    owed = sum((((b.total - b.amount_paid) / (b.fx_rate or ONE)) for b in bills), ZERO)
     payments = (await db.execute(select(VendorPayment))).scalars().all()
-    unapplied = sum((p.unapplied_amount for p in payments), ZERO)
+    unapplied = sum(((p.unapplied_amount / (p.fx_rate or ONE)) for p in payments), ZERO)
     sub = (owed - unapplied).quantize(_Q_MONEY)
     return {"gl": gl_ap, "subledger": sub, "matches": gl_ap == sub}
 

@@ -36,6 +36,7 @@ class StandaloneInvoiceCreate(BaseModel):
     due_date: date | None = None
     vat_percent: Decimal = Decimal("0")
     memo: str = ""
+    fx_rate: Decimal | None = None  # LBP per USD; default 1 (USD) or settings rate for an LBP customer
     lines: list[InvoiceLineIn] = Field(min_length=1)
 
 
@@ -46,3 +47,5 @@ class ReceiptCreate(BaseModel):
     payment_system_key: str = "CASH"
     memo: str = ""
     allocations: list[dict] | None = None
+    currency: str = "USD"            # currency the receipt is recorded in (the invoice currency)
+    fx_rate: Decimal | None = None   # cash-leg rate (LBP per USD); default 1 / settings rate

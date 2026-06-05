@@ -22,7 +22,7 @@ async def test_seed_creates_all_system_accounts_idempotently(db):
     keys = {a.system_key for a in (await db.execute(select(GLAccount))).scalars().all()}
     for required in ("CASH", "BANK", "METAL_INVENTORY", "AP", "METAL_AP",
                      "VAT_PAYABLE", "OPENING_BALANCE_EQUITY", "RETAINED_EARNINGS",
-                     "SALES_REVENUE", "METAL_COGS", "FX_GAIN_LOSS"):
+                     "SALES_REVENUE", "METAL_COGS", "FX_LOSS", "FX_GAIN"):
         assert required in keys
 
     # DUAL accounts carry grams + money.

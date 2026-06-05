@@ -29,13 +29,16 @@ def _S(v):
 def _pnl_sheets(d: dict) -> list[Sheet]:
     rows = []
     for label, lines in (("Revenue", d["revenue_lines"]), ("COGS", d["cogs_lines"]),
-                         ("Operating expenses", d["opex_lines"])):
+                         ("Operating expenses", d["opex_lines"]),
+                         ("Other income/(expense)", d.get("other_lines", []))):
         rows.append([label, "", ""])
         for l in lines:
             rows.append([l["name"], l["code"], l["amount"]])
     rows += [["Revenue", "", d["revenue"]], ["COGS", "", d["cogs"]],
              ["Gross profit", "", d["gross_profit"]],
              ["Operating expenses", "", d["operating_expenses"]],
+             ["Operating profit", "", d.get("operating_profit", d["gross_profit"])],
+             ["Other income/(expense)", "", d.get("other_income_expense", 0)],
              ["Net profit", "", d["net_profit"]]]
     return [Sheet(name="P&L", headers=["Account", "Code", "Amount"], rows=rows,
                   title=f"Income Statement {d['start']} → {d['end']}")]

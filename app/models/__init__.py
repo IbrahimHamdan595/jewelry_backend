@@ -1171,6 +1171,7 @@ class ARInvoice(Base):
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("1"))  # LBP per USD captured at booking
     subtotal: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     vat_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
@@ -1204,6 +1205,7 @@ class ARReceipt(Base):
     customer_id: Mapped[str] = mapped_column(String, ForeignKey("customers.id"), nullable=False)
     receipt_date: Mapped[date] = mapped_column(Date, nullable=False)
     currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("1"))  # LBP per USD of the cash leg
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     payment_system_key: Mapped[str] = mapped_column(String, nullable=False, default="CASH")
     unapplied_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
@@ -1233,6 +1235,7 @@ class VendorBill(Base):
     bill_date: Mapped[date] = mapped_column(Date, nullable=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("1"))  # LBP per USD captured at booking
     total: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))
     # Module 6 (Tax/VAT): lines are net; subtotal = Σ lines, vat_amount = subtotal × rate,
     # total = subtotal + vat. tax_code_id NULL ⇒ no VAT (M5 behaviour unchanged).
@@ -1268,6 +1271,8 @@ class VendorPayment(Base):
     payment_no: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     vendor_name: Mapped[str] = mapped_column(String, nullable=False)
     payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String, nullable=False, default="USD")
+    fx_rate: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, default=Decimal("1"))  # LBP per USD of the cash leg
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     payment_system_key: Mapped[str] = mapped_column(String, nullable=False, default="CASH")
     unapplied_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, default=Decimal("0"))

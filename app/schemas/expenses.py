@@ -19,6 +19,8 @@ class VendorBillCreate(BaseModel):
     memo: str = ""
     payment_system_key: str | None = None  # CASH/BANK ⇒ paid now; None ⇒ on credit
     tax_code_id: str | None = None  # Module 6 — input VAT
+    currency: str = "USD"
+    fx_rate: Decimal | None = None  # LBP per USD; default 1 (USD) or settings rate
     lines: list[BillLineIn] = Field(min_length=1)
 
 
@@ -29,3 +31,5 @@ class VendorPaymentCreate(BaseModel):
     payment_system_key: str = "CASH"
     memo: str = ""
     allocations: list[dict] | None = None
+    currency: str = "USD"            # currency the payment is recorded in (the bill currency)
+    fx_rate: Decimal | None = None   # cash-leg rate (LBP per USD); default 1 / settings rate

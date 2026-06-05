@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core import gl
+from app.core import gl, gl_fx
 from app.core.gl_postings import auto_post_enabled
 from app.models import (
     ARInvoice, ARInvoiceLine, ARInvoiceStatus, ARReceipt, ARReceiptAllocation,
@@ -22,6 +22,17 @@ from app.models import (
 
 ZERO = Decimal("0")
 _Q_MONEY = Decimal("0.01")
+ONE = Decimal("1")
+
+
+async def _leg_to_glline(db: AsyncSession, leg: gl_fx.Leg) -> gl.GLLine:
+    """Resolve a settlement Leg (system_key) into a posting GLLine."""
+    acct_id = await _resolve(db, leg.system_key)
+    if leg.debit:
+        return gl.GLLine(account_id=acct_id, denomination="MONEY", base_debit=leg.base,
+                         money_debit=leg.money, currency=leg.currency, fx_rate=leg.fx_rate, memo=leg.memo)
+    return gl.GLLine(account_id=acct_id, denomination="MONEY", base_credit=leg.base,
+                     money_credit=leg.money, currency=leg.currency, fx_rate=leg.fx_rate, memo=leg.memo)
 
 SOURCE_AR_INVOICE = "AR_INVOICE"
 SOURCE_AR_RECEIPT = "AR_RECEIPT"
@@ -42,17 +53,19 @@ async def _next_doc_no(db: AsyncSession, prefix: str, entry_date: date) -> str:
 
 
 async def customer_open_balance(db: AsyncSession, customer_id: str) -> Decimal:
+    """Open balance in **base (USD)** — each document converted at its captured
+    rate — so it ties out like-for-like against the GL AR control (USD base)."""
     invoices = (await db.execute(
         select(ARInvoice).where(
             ARInvoice.customer_id == customer_id,
             ARInvoice.status.in_((ARInvoiceStatus.OPEN, ARInvoiceStatus.PARTIAL)),
         )
     )).scalars().all()
-    owed = sum(((inv.total - inv.amount_paid) for inv in invoices), ZERO)
+    owed = sum((((inv.total - inv.amount_paid) / (inv.fx_rate or ONE)) for inv in invoices), ZERO)
     receipts = (await db.execute(
         select(ARReceipt).where(ARReceipt.customer_id == customer_id)
     )).scalars().all()
-    unapplied = sum(((r.unapplied_amount) for r in receipts), ZERO)
+    unapplied = sum(((r.unapplied_amount / (r.fx_rate or ONE)) for r in receipts), ZERO)
     return (owed - unapplied).quantize(_Q_MONEY)
 
 
@@ -109,29 +122,40 @@ async def verify_ar_control(db: AsyncSession) -> dict:
 
 async def post_standalone_invoice(db: AsyncSession, *, customer_id: str, invoice_date: date,
                                   due_date, lines: list[dict], memo: str, vat_percent: Decimal,
-                                  settings: Settings, actor_user_id: str) -> ARInvoice:
+                                  settings: Settings, actor_user_id: str,
+                                  fx_rate: Decimal | None = None) -> ARInvoice:
     customer = (await db.execute(select(Customer).where(Customer.id == customer_id))).scalar_one_or_none()
     if customer is None:
         raise HTTPException(404, "Customer not found")
+    currency = customer.currency or "USD"
+    rate = (Decimal(str(fx_rate)) if fx_rate is not None
+            else (Decimal(str(settings.lbp_exchange_rate)) if currency != "USD" else ONE))
     subtotal = sum((Decimal(str(l["unit_price"])) * int(l.get("quantity", 1)) for l in lines), ZERO).quantize(_Q_MONEY)
     vat = (subtotal * Decimal(str(vat_percent)) / Decimal(100)).quantize(_Q_MONEY)
     total = (subtotal + vat).quantize(_Q_MONEY)
-    await check_credit_limit(db, customer, total)
+    # amounts above are in the invoice currency; base (USD) = money / rate.
+    base_subtotal = (subtotal / rate).quantize(_Q_MONEY)
+    base_vat = (vat / rate).quantize(_Q_MONEY)
+    base_total = (base_subtotal + base_vat).quantize(_Q_MONEY)
+    await check_credit_limit(db, customer, base_total)
 
     entry = None
     if auto_post_enabled(settings):
         ar_id = await _resolve(db, "AR")
         rev_id = await _resolve(db, "SALES_REVENUE")
         vat_id = await _resolve(db, "VAT_PAYABLE")
-        gl_lines = [gl.GLLine(account_id=ar_id, denomination="MONEY", base_debit=total, money_debit=total, memo="AR invoice"),
-                    gl.GLLine(account_id=rev_id, denomination="MONEY", base_credit=subtotal, money_credit=subtotal, memo="revenue")]
+        gl_lines = [gl.GLLine(account_id=ar_id, denomination="MONEY", base_debit=base_total, money_debit=total,
+                              currency=currency, fx_rate=rate, memo="AR invoice"),
+                    gl.GLLine(account_id=rev_id, denomination="MONEY", base_credit=base_subtotal, money_credit=subtotal,
+                              currency=currency, fx_rate=rate, memo="revenue")]
         if vat > 0:
-            gl_lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY", base_credit=vat, money_credit=vat, memo="VAT"))
+            gl_lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY", base_credit=base_vat, money_credit=vat,
+                                      currency=currency, fx_rate=rate, memo="VAT"))
         entry = await gl.post_entry(db, entry_date=invoice_date, memo=f"AR invoice {memo}",
                                     source_type=SOURCE_AR_INVOICE, source_id=None, lines=gl_lines, actor_user_id=actor_user_id)
 
     inv = ARInvoice(invoice_no=await _next_doc_no(db, "AR", invoice_date), customer_id=customer_id,
-                    invoice_date=invoice_date, due_date=due_date, currency=customer.currency,
+                    invoice_date=invoice_date, due_date=due_date, currency=currency, fx_rate=rate,
                     subtotal=subtotal, vat_amount=vat, total=total, status=ARInvoiceStatus.OPEN,
                     gl_entry_id=(entry.id if entry else None), memo=memo)
     db.add(inv)
@@ -156,37 +180,44 @@ def _apply_to_invoice(inv: ARInvoice, amount: Decimal) -> Decimal:
 
 async def post_receipt(db: AsyncSession, *, customer_id: str, receipt_date: date, amount: Decimal,
                        payment_system_key: str, memo: str, settings: Settings, actor_user_id: str,
-                       allocations: list[dict] | None = None) -> ARReceipt:
+                       allocations: list[dict] | None = None,
+                       currency: str = "USD", fx_rate: Decimal | None = None) -> ARReceipt:
+    """Record a customer receipt. `currency` is the currency the receipt is
+    *recorded in* (the invoice currency); the cash leg lands in the tender
+    account (`payment_system_key`) at `fx_rate` (LBP/USD; default = settings rate
+    for an LBP tender). Realized FX is posted on settlement (see gl_fx)."""
     amount = Decimal(str(amount)).quantize(_Q_MONEY)
     if amount <= 0:
         raise HTTPException(422, "amount must be positive")
-
-    entry = None
-    if auto_post_enabled(settings):
-        pay_id = await _resolve(db, payment_system_key)
-        ar_id = await _resolve(db, "AR")
-        entry = await gl.post_entry(db, entry_date=receipt_date, memo=f"AR receipt {memo}",
-            source_type=SOURCE_AR_RECEIPT, source_id=None,
-            lines=[gl.GLLine(account_id=pay_id, denomination="MONEY", base_debit=amount, money_debit=amount, memo="receipt"),
-                   gl.GLLine(account_id=ar_id, denomination="MONEY", base_credit=amount, money_credit=amount, memo="apply AR")],
-            actor_user_id=actor_user_id)
+    currency = currency or "USD"
+    cash_acct = (await db.execute(
+        select(GLAccount).where(GLAccount.system_key == payment_system_key))).scalar_one_or_none()
+    if cash_acct is None:
+        raise HTTPException(422, f"GL account {payment_system_key} not seeded")
+    tender_currency = cash_acct.currency or "USD"
+    rate = (Decimal(str(fx_rate)) if fx_rate is not None
+            else (Decimal(str(settings.lbp_exchange_rate)) if tender_currency != "USD" else ONE))
 
     receipt = ARReceipt(receipt_no=await _next_doc_no(db, "RC", receipt_date), customer_id=customer_id,
-                        receipt_date=receipt_date, amount=amount, payment_system_key=payment_system_key,
-                        gl_entry_id=(entry.id if entry else None), memo=memo)
+                        receipt_date=receipt_date, currency=currency, fx_rate=rate, amount=amount,
+                        payment_system_key=payment_system_key, memo=memo)
     db.add(receipt)
     await db.flush()
 
+    alloc_specs: list[gl_fx.Allocation] = []
     remaining = amount
     if allocations:
         for al in allocations:
             inv = (await db.execute(select(ARInvoice).where(ARInvoice.id == al["invoice_id"]))).scalar_one()
             applied = _apply_to_invoice(inv, Decimal(str(al["amount"])).quantize(_Q_MONEY))
-            db.add(ARReceiptAllocation(receipt_id=receipt.id, invoice_id=inv.id, amount=applied))
-            remaining -= applied
+            if applied > 0:
+                db.add(ARReceiptAllocation(receipt_id=receipt.id, invoice_id=inv.id, amount=applied))
+                alloc_specs.append(gl_fx.Allocation(inv.currency or "USD", inv.fx_rate or ONE, applied))
+                remaining -= applied
     else:
         open_invoices = (await db.execute(
             select(ARInvoice).where(ARInvoice.customer_id == customer_id,
+                                    ARInvoice.currency == currency,
                                     ARInvoice.status.in_((ARInvoiceStatus.OPEN, ARInvoiceStatus.PARTIAL)))
             .order_by(ARInvoice.invoice_date, ARInvoice.invoice_no)
         )).scalars().all()
@@ -196,9 +227,29 @@ async def post_receipt(db: AsyncSession, *, customer_id: str, receipt_date: date
             applied = _apply_to_invoice(inv, remaining)
             if applied > 0:
                 db.add(ARReceiptAllocation(receipt_id=receipt.id, invoice_id=inv.id, amount=applied))
+                alloc_specs.append(gl_fx.Allocation(inv.currency or "USD", inv.fx_rate or ONE, applied))
                 remaining -= applied
 
     receipt.unapplied_amount = remaining.quantize(_Q_MONEY)
+
+    if auto_post_enabled(settings):
+        specs = list(alloc_specs)
+        if remaining > ZERO:   # overpayment relieves AR at the recorded rate (no FX on it)
+            specs.append(gl_fx.Allocation(currency, ONE if currency == "USD" else rate, remaining.quantize(_Q_MONEY)))
+        if specs:
+            try:
+                legs = gl_fx.settlement_legs(
+                    kind="receipt", recorded_currency=currency, allocations=specs,
+                    control_system_key="AR", cash_system_key=payment_system_key,
+                    tender_currency=tender_currency, tender_fx_rate=rate)
+            except ValueError as e:
+                raise HTTPException(422, str(e))
+            gl_lines = [await _leg_to_glline(db, l) for l in legs]
+            entry = await gl.post_entry(db, entry_date=receipt_date, memo=f"AR receipt {memo}",
+                                        source_type=SOURCE_AR_RECEIPT, source_id=None,
+                                        lines=gl_lines, actor_user_id=actor_user_id)
+            receipt.gl_entry_id = entry.id
+
     await db.flush()
     return receipt
 
