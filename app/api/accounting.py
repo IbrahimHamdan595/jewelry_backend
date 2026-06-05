@@ -278,6 +278,24 @@ async def trial_balance(
     return _stringify(tb)
 
 
+@router.get("/general-ledger")
+async def general_ledger(
+    account_id: str, start: date, end: date, format: str = Query(None),
+    db: AsyncSession = Depends(get_db), _: User = Depends(require_accounting),
+):
+    """GL drilldown for one account — a thin alias over the statements
+    account-ledger so there is a single source of truth for opening/closing +
+    per-line running balance (base and grams)."""
+    from app.api.statements import _acct_sheets
+    from app.core import statements as statements_core
+    from app.core.xlsx import build_xlsx_response
+
+    data = await statements_core.account_statement(db, account_id=account_id, start=start, end=end)
+    if format == "xlsx":
+        return build_xlsx_response(_acct_sheets(data), filename=f"general-ledger-{data['code']}-{start}-{end}")
+    return _stringify(data)
+
+
 @router.post("/opening-balances", response_model=JournalEntryOut)
 async def opening_balances(
     body: OpeningBalancesCreate, db: AsyncSession = Depends(get_db),

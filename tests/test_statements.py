@@ -151,6 +151,31 @@ async def test_account_statement_running_balance(db):
 
 
 @pytest.mark.asyncio
+async def test_general_ledger_drilldown_reconciles_to_trial_balance(db):
+    """Phase 2 GL drilldown invariant: opening + Σ(debit−credit) within the window
+    equals closing, and closing reconciles to the account's trial-balance net."""
+    await _seed(db)
+    cash = await _acct(db, "CASH")
+    rev = await _acct(db, "SALES_REVENUE")
+    rent = await _acct(db, "RENT_EXPENSE")
+    obe = await _acct(db, "OPENING_BALANCE_EQUITY")
+
+    await _post(db, date(2026, 5, 25), [_m(cash, debit=D("5000")), _m(obe, credit=D("5000"))])  # before window
+    await _post(db, date(2026, 6, 5), [_m(cash, debit=D("1000")), _m(rev, credit=D("1000"))])
+    await _post(db, date(2026, 6, 6), [_m(rent, debit=D("150")), _m(cash, credit=D("150"))])
+
+    st = await statements.account_statement(
+        db, account_id=cash, start=date(2026, 6, 1), end=date(2026, 6, 30))
+    movement = sum((r["debit"] - r["credit"] for r in st["rows"]), D("0"))
+    assert st["opening_balance"] + movement == st["closing_balance"]
+
+    # Closing balance must equal this account's net in the trial balance at window end.
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    cash_net = [a for a in tb["accounts"] if a["account_id"] == cash][0]["net_base"]
+    assert cash_net == st["closing_balance"] == D("5850.00")
+
+
+@pytest.mark.asyncio
 async def test_statements_exclude_entries_after_window(db):
     await _seed(db)
     cash = await _acct(db, "CASH")
