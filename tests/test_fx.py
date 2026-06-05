@@ -108,6 +108,14 @@ async def _acct_base(db, system_key):
     return (sum((l.base_debit for l in lines), D("0")), sum((l.base_credit for l in lines), D("0")))
 
 
+async def _acct_line_count(db, system_key):
+    """How many GL lines touch this account — 0 proves no leg was emitted at all
+    (a stray $0.00 leg would still count, so this is stricter than a net-zero check)."""
+    a = (await db.execute(select(GLAccount).where(GLAccount.system_key == system_key))).scalar_one()
+    from app.models import GLJournalLine
+    return len((await db.execute(select(GLJournalLine).where(GLJournalLine.account_id == a.id))).scalars().all())
+
+
 @pytest.mark.asyncio
 async def test_lbp_invoice_receipt_at_moved_rate_books_fx_loss(db):
     await _seed(db)
@@ -136,8 +144,8 @@ async def test_lbp_invoice_receipt_at_moved_rate_books_fx_loss(db):
     # (c) realized loss in FX_LOSS with the right sign/amount: $1000 − $972.83
     dr, cr = await _acct_base(db, "FX_LOSS")
     assert (dr - cr) == D("27.17")
-    gdr, gcr = await _acct_base(db, "FX_GAIN")
-    assert (gcr - gdr) == D("0")
+    # a loss must NOT also touch the gain account — assert absence, not net-zero
+    assert await _acct_line_count(db, "FX_GAIN") == 0
 
     # (d) AR control ties out in base (fully settled → 0)
     v = await ar.verify_ar_control(db)
@@ -169,5 +177,78 @@ async def test_ap_lbp_bill_payment_at_moved_rate_books_fx_gain(db):
 
     gdr, gcr = await _acct_base(db, "FX_GAIN")
     assert (gcr - gdr) == D("27.17")  # 1000 − 89.5M/92000(972.83)
+    assert await _acct_line_count(db, "FX_LOSS") == 0
     v = await expenses.verify_vendor_ap(db)
     assert v["matches"] is True and v["gl"] == D("0.00")
+
+
+@pytest.mark.asyncio
+async def test_usd_invoice_lbp_cash_emits_no_fx_line(db):
+    """USD invoice settled with LBP cash, recorded in USD: there is no invoice-level
+    FX exposure, so NO FX leg may be posted — not a $0.00 one. Asserting the line
+    count is 0 (not the net) is what catches a stray zero-value FX leg."""
+    await _seed(db)
+    cust = Customer(name="USD Buyer", currency="USD")
+    db.add(cust)
+    await db.flush()
+    s = _settings()
+    inv = await ar.post_standalone_invoice(
+        db, customer_id=cust.id, invoice_date=date(2026, 6, 5), due_date=None,
+        lines=[{"description": "goods", "unit_price": "1000", "quantity": 1}],
+        memo="usd", vat_percent=D("0"), settings=s, actor_user_id="u1", fx_rate=D("1"))
+    assert inv.fx_rate == D("1") and inv.total == D("1000.00")
+
+    # Pay the USD invoice with LBP cash at today's rate 92000 (tender = CASH_LBP).
+    rc = await ar.post_receipt(
+        db, customer_id=cust.id, receipt_date=date(2026, 6, 6), amount=D("1000"),
+        payment_system_key="CASH_LBP", memo="lbp cash", settings=s, actor_user_id="u1",
+        currency="USD", fx_rate=D("92000"))
+    assert rc.gl_entry_id is not None
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] is True and tb["metal_balanced"] is True
+
+    # No FX leg at all — neither account is touched.
+    assert await _acct_line_count(db, "FX_GAIN") == 0
+    assert await _acct_line_count(db, "FX_LOSS") == 0
+    # Cash recorded in LBP at the tender rate; base is the USD face value.
+    cdr, _ = await _acct_base(db, "CASH_LBP")
+    assert cdr == D("1000.00")
+    v = await ar.verify_ar_control(db)
+    assert v["matches"] is True and v["gl_ar_balance"] == D("0.00")
+
+
+@pytest.mark.asyncio
+async def test_lbp_invoice_awkward_rate_residual_balances_to_cent(db):
+    """Non-round rates (89537 → 91123): the quantized residual must land entirely in
+    the FX line and the trial balance must still net to zero to the cent."""
+    await _seed(db)
+    cust = Customer(name="Awkward LBP", currency="LBP")
+    db.add(cust)
+    await db.flush()
+    s = _settings()
+    # 89,500,000 LBP @ 89537 → base $999.59
+    inv = await ar.post_standalone_invoice(
+        db, customer_id=cust.id, invoice_date=date(2026, 6, 5), due_date=None,
+        lines=[{"description": "goods", "unit_price": "89500000", "quantity": 1}],
+        memo="awkward", vat_percent=D("0"), settings=s, actor_user_id="u1", fx_rate=D("89537"))
+    assert inv.fx_rate == D("89537")
+
+    # Settle in full with LBP cash at 91123 → cash base $982.19, residual $17.40 loss.
+    rc = await ar.post_receipt(
+        db, customer_id=cust.id, receipt_date=date(2026, 6, 6), amount=D("89500000"),
+        payment_system_key="CASH_LBP", memo="pay", settings=s, actor_user_id="u1",
+        currency="LBP", fx_rate=D("91123"))
+    assert rc.gl_entry_id is not None
+
+    # Trial balance nets to zero to the cent despite the awkward rates.
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] is True and tb["metal_balanced"] is True
+
+    # The full quantized residual landed in exactly one FX_LOSS line.
+    assert await _acct_line_count(db, "FX_LOSS") == 1
+    dr, cr = await _acct_base(db, "FX_LOSS")
+    assert (dr - cr) == D("17.40")
+    assert await _acct_line_count(db, "FX_GAIN") == 0
+    v = await ar.verify_ar_control(db)
+    assert v["matches"] is True and v["gl_ar_balance"] == D("0.00")
