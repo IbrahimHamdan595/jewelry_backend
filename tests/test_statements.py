@@ -176,6 +176,44 @@ async def test_general_ledger_drilldown_reconciles_to_trial_balance(db):
 
 
 @pytest.mark.asyncio
+async def test_general_ledger_metal_dimension_reconciles_per_karat(db):
+    """The grams columns aren't decoration: opening grams + Σ(metal_debit−metal_credit)
+    within the window must equal closing grams, and closing grams must tie to the
+    account's per-karat net in the trial balance."""
+    await _seed(db)
+    metal_inv = await _acct(db, "METAL_INVENTORY")
+    obe = await _acct(db, "OPENING_BALANCE_EQUITY")
+
+    def _dual(account_id, *, dr_g=D("0"), cr_g=D("0"), base):
+        return gl.GLLine(account_id=account_id, denomination="DUAL",
+                         base_debit=base if dr_g else D("0"), base_credit=base if cr_g else D("0"),
+                         money_debit=base if dr_g else D("0"), money_credit=base if cr_g else D("0"),
+                         currency="USD", metal_debit_grams=dr_g, metal_credit_grams=cr_g, karat="K21")
+
+    # Before window: 100g K21 opening into metal inventory.
+    await _post(db, date(2026, 5, 25), [_dual(metal_inv, dr_g=D("100"), base=D("4000")),
+                                        _dual(obe, cr_g=D("100"), base=D("4000"))])
+    # In window: +50g, then −30g (both K21).
+    await _post(db, date(2026, 6, 5), [_dual(metal_inv, dr_g=D("50"), base=D("2000")),
+                                       _dual(obe, cr_g=D("50"), base=D("2000"))])
+    await _post(db, date(2026, 6, 10), [_dual(metal_inv, cr_g=D("30"), base=D("1200")),
+                                        _dual(obe, dr_g=D("30"), base=D("1200"))])
+
+    st = await statements.account_statement(
+        db, account_id=metal_inv, start=date(2026, 6, 1), end=date(2026, 6, 30))
+    assert st["opening_grams"] == D("100.000")
+    movement = sum((r["metal_debit_grams"] - r["metal_credit_grams"] for r in st["rows"]), D("0"))
+    assert movement == D("20.000")
+    assert st["opening_grams"] + movement == st["closing_grams"] == D("120.000")
+    assert st["rows"][-1]["running_grams"] == D("120.000")
+
+    # Ties to METAL_INVENTORY's K21 net in the trial balance.
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    row = [a for a in tb["accounts"] if a["account_id"] == metal_inv][0]
+    assert row["metal_by_karat"]["K21"]["net_grams"] == D("120.000")
+
+
+@pytest.mark.asyncio
 async def test_statements_exclude_entries_after_window(db):
     await _seed(db)
     cash = await _acct(db, "CASH")
