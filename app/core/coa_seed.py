@@ -26,43 +26,88 @@ M, MT, DU = Denomination.MONEY, Denomination.METAL, Denomination.DUAL
 DR, CR = NormalBalance.DEBIT, NormalBalance.CREDIT
 
 # (code, name, type, denomination, normal_balance, currency, system_key)
+# Codes are the Lebanese standard 6-digit posting codes (renumbered from the
+# original 1xxx/4xxx internal codes — design 2026-06-07 §5). Accounts are still
+# resolved by system_key everywhere; code is display/reporting only.
 SYSTEM_ACCOUNTS: list[tuple] = [
-    ("1000", "Cash (USD)",            A,  M,  DR, "USD", "CASH"),
-    ("1010", "Cash (LBP)",            A,  M,  DR, "LBP", "CASH_LBP"),
-    ("1020", "Bank",                  A,  M,  DR, "USD", "BANK"),
-    ("1100", "Accounts Receivable",   A,  M,  DR, "USD", "AR"),
-    ("1200", "Metal Inventory",       A,  DU, DR, "USD", "METAL_INVENTORY"),
-    ("1210", "Product Inventory",     A,  M,  DR, "USD", "PRODUCT_INVENTORY"),
-    ("1300", "VAT Receivable (input)",A,  M,  DR, "USD", "VAT_RECEIVABLE"),
-    ("2000", "Accounts Payable",      L,  M,  CR, "USD", "AP"),
-    ("2100", "Metal AP",              L,  DU, CR, "USD", "METAL_AP"),
-    ("2200", "VAT Payable (output)",  L,  M,  CR, "USD", "VAT_PAYABLE"),
-    ("2300", "Customer Deposits",     L,  M,  CR, "USD", "CUSTOMER_DEPOSITS"),
+    ("530001", "Cash (USD)",            A,  M,  DR, "USD", "CASH"),
+    ("530011", "Cash (LBP)",            A,  M,  DR, "LBP", "CASH_LBP"),
+    ("512201", "Bank",                  A,  M,  DR, "USD", "BANK"),
+    ("411111", "Accounts Receivable",   A,  M,  DR, "USD", "AR"),
+    ("370011", "Metal Inventory",       A,  DU, DR, "USD", "METAL_INVENTORY"),
+    ("370012", "Product Inventory",     A,  M,  DR, "USD", "PRODUCT_INVENTORY"),
+    ("442611", "VAT Receivable (input)",A,  M,  DR, "USD", "VAT_RECEIVABLE"),
+    ("401101", "Accounts Payable",      L,  M,  CR, "USD", "AP"),
+    ("401102", "Metal AP",              L,  DU, CR, "USD", "METAL_AP"),
+    ("442701", "VAT Payable (output)",  L,  M,  CR, "USD", "VAT_PAYABLE"),
+    ("419101", "Customer Deposits",     L,  M,  CR, "USD", "CUSTOMER_DEPOSITS"),
     # DUAL: opening equity carries the money plug AND the per-karat metal
     # counterpart for physical gold contributed as opening capital (the gold on
     # hand not financed by supplier metal debt). See post_opening_balances.
-    ("3000", "Opening Balance Equity",EQ, DU, CR, "USD", "OPENING_BALANCE_EQUITY"),
-    ("3100", "Retained Earnings",     EQ, M,  CR, "USD", "RETAINED_EARNINGS"),
-    ("4000", "Sales Revenue",         INC, M, CR, "USD", "SALES_REVENUE"),
-    ("4100", "Making-Charge Revenue", INC, M, CR, "USD", "MAKING_CHARGE_REVENUE"),
+    # 101901 is CUSTOM — no Lebanese-standard equivalent (technical plug).
+    ("101901", "Opening Balance Equity",EQ, DU, CR, "USD", "OPENING_BALANCE_EQUITY"),
+    ("101401", "Retained Earnings",     EQ, M,  CR, "USD", "RETAINED_EARNINGS"),
+    ("701000", "Sales Revenue",         INC, M, CR, "USD", "SALES_REVENUE"),
+    ("713000", "Making-Charge Revenue", INC, M, CR, "USD", "MAKING_CHARGE_REVENUE"),
     # Realized FX split (Odoo parity): gain → INCOME (credit), loss → EXPENSE
     # (debit). Reported together as "Other income/(expense)" below operating.
-    ("4900", "FX Gain",               INC, M, CR, "USD", "FX_GAIN"),
-    ("5000", "Metal COGS",            EXP, DU, DR, "USD", "METAL_COGS"),
-    ("5100", "Making COGS",           EXP, M,  DR, "USD", "MAKING_COGS"),
-    ("6900", "FX Loss",               EXP, M,  DR, "USD", "FX_LOSS"),
-    # Module 1 (auto-posting) additions:
-    ("1250", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),
-    ("5200", "Inventory Adjustment Expense", EXP, M, DR, "USD", "ADJUSTMENT_EXPENSE"),
+    ("775100", "FX Gain",               INC, M, CR, "USD", "FX_GAIN"),
+    ("611701", "Metal COGS",            EXP, DU, DR, "USD", "METAL_COGS"),
+    ("611702", "Making COGS",           EXP, M,  DR, "USD", "MAKING_COGS"),
+    ("675100", "FX Loss",               EXP, M,  DR, "USD", "FX_LOSS"),
+    # Module 1 (auto-posting) additions. 370019 is CUSTOM — no standard equivalent.
+    ("370019", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),
+    ("655300", "Inventory Adjustment Expense", EXP, M, DR, "USD", "ADJUSTMENT_EXPENSE"),
     # Module 5 (Expenses & Purchasing):
-    ("2400", "Vendor Payables",       L,  M,  CR, "USD", "VENDOR_AP"),
-    ("6000", "Rent Expense",          EXP, M, DR, "USD", "RENT_EXPENSE"),
-    ("6100", "Utilities Expense",     EXP, M, DR, "USD", "UTILITIES_EXPENSE"),
-    ("6200", "Salaries Expense",      EXP, M, DR, "USD", "SALARIES_EXPENSE"),
-    ("6300", "Marketing Expense",     EXP, M, DR, "USD", "MARKETING_EXPENSE"),
-    ("6400", "Bank Charges",          EXP, M, DR, "USD", "BANK_CHARGES_EXPENSE"),
-    ("6500", "Office Supplies",       EXP, M, DR, "USD", "OFFICE_EXPENSE"),
-    ("6800", "Miscellaneous Expense", EXP, M, DR, "USD", "MISC_EXPENSE"),
+    ("461901", "Vendor Payables",       L,  M,  CR, "USD", "VENDOR_AP"),
+    ("626310", "Rent Expense",          EXP, M, DR, "USD", "RENT_EXPENSE"),
+    ("626340", "Utilities Expense",     EXP, M, DR, "USD", "UTILITIES_EXPENSE"),
+    ("631100", "Salaries Expense",      EXP, M, DR, "USD", "SALARIES_EXPENSE"),
+    ("626930", "Marketing Expense",     EXP, M, DR, "USD", "MARKETING_EXPENSE"),
+    ("673900", "Bank Charges",          EXP, M, DR, "USD", "BANK_CHARGES_EXPENSE"),
+    ("626940", "Office Supplies",       EXP, M, DR, "USD", "OFFICE_EXPENSE"),
+    ("626991", "Miscellaneous Expense", EXP, M, DR, "USD", "MISC_EXPENSE"),
+    # --- Gap accounts (design 2026-06-07 v2 §6) ---
+    # Opex expenses (auto-wired: selectable on vendor bills + expense-by-category)
+    ("626151", "Telephone & Telecom",          EXP, M, DR, "USD", "TELECOM_EXPENSE"),
+    ("626800", "Insurance",                     EXP, M, DR, "USD", "INSURANCE_EXPENSE"),
+    ("626530", "Professional Fees",             EXP, M, DR, "USD", "PROFESSIONAL_FEES_EXPENSE"),
+    ("626330", "Water",                         EXP, M, DR, "USD", "WATER_EXPENSE"),
+    ("626111", "Delivery/Transport on Sales",   EXP, M, DR, "USD", "FREIGHT_OUT_EXPENSE"),
+    ("642000", "Municipality Taxes",            EXP, M, DR, "USD", "MUNICIPALITY_TAX_EXPENSE"),
+    ("644000", "Registration Fees",             EXP, M, DR, "USD", "REGISTRATION_FEES_EXPENSE"),
+    ("645801", "Tax Penalties & Interest",      EXP, M, DR, "USD", "TAX_PENALTIES_EXPENSE"),
+    ("643000", "VAT Non-Recoverable",           EXP, M, DR, "USD", "VAT_NONRECOVERABLE_EXPENSE"),
+    ("626910", "Medical Care",                  EXP, M, DR, "USD", "MEDICAL_EXPENSE"),
+    ("685110", "Donations",                     EXP, M, DR, "USD", "DONATIONS_EXPENSE"),
+    ("673100", "Interest on Loans",             EXP, M, DR, "USD", "INTEREST_EXPENSE"),
+    # Cash / contra / clearing
+    ("530002", "Petty Cash",                    A,   M, DR, "USD", "CASH_PETTY"),
+    ("709000", "Discounts Allowed",             INC, M, DR, "USD", "SALES_DISCOUNTS"),
+    ("540005", "Credit Cards (clearing)",       A,   M, DR, "USD", "CREDIT_CARD_CLEARING"),
+    # Equity / structural (dormant, manual JE)
+    ("101301", "Subscribed Capital",            EQ,  M, CR, "USD", "CAPITAL"),
+    ("111001", "Legal Reserve",                 EQ,  M, CR, "USD", "LEGAL_RESERVE"),
+    ("259001", "Deposits Paid",                 A,   M, DR, "USD", "DEPOSITS_PAID"),
+    ("121001", "Profit Brought Forward",        EQ,  M, CR, "USD", "PROFIT_BROUGHT_FORWARD"),
+    ("125001", "Losses Brought Forward",        EQ,  M, DR, "USD", "LOSS_BROUGHT_FORWARD"),
+    # Fixed assets (dormant; depreciation engine is module T2a)
+    ("226211", "Office & Computer Equipment",   A,   M, DR, "USD", "FA_OFFICE_EQUIPMENT"),
+    ("226221", "Computer Equipment & Programs", A,   M, DR, "USD", "FA_COMPUTER"),
+    ("226311", "Furniture & Fixtures",          A,   M, DR, "USD", "FA_FURNITURE"),
+    ("226101", "General Installations",         A,   M, DR, "USD", "FA_INSTALLATIONS"),
+    ("225101", "Transportation Equipment",      A,   M, DR, "USD", "FA_VEHICLES"),
+    ("282621", "Accum. Dep - Office Equipment", A,   M, CR, "USD", "FA_ACCUM_DEP_OFFICE"),
+    ("282622", "Accum. Dep - Computer",         A,   M, CR, "USD", "FA_ACCUM_DEP_COMPUTER"),
+    ("282631", "Accum. Dep - Furniture",        A,   M, CR, "USD", "FA_ACCUM_DEP_FURNITURE"),
+    ("282611", "Accum. Dep - Installations",    A,   M, CR, "USD", "FA_ACCUM_DEP_INSTALLATIONS"),
+    ("282521", "Accum. Dep - Vehicles",         A,   M, CR, "USD", "FA_ACCUM_DEP_VEHICLES"),
+    ("651262", "Depreciation - Office&Computer",EXP, M, DR, "USD", "DEP_EXPENSE_OFFICE"),
+    ("651263", "Depreciation - Furniture",      EXP, M, DR, "USD", "DEP_EXPENSE_FURNITURE"),
+    ("651261", "Depreciation - Installations",  EXP, M, DR, "USD", "DEP_EXPENSE_INSTALLATIONS"),
+    ("651251", "Depreciation - Vehicles",       EXP, M, DR, "USD", "DEP_EXPENSE_VEHICLES"),
+    ("781200", "Gain on Asset Disposal",        INC, M, CR, "USD", "FA_DISPOSAL_GAIN"),
+    ("681200", "Net Book Value of Disposed Assets", EXP, M, DR, "USD", "FA_DISPOSAL_NBV"),
 ]
 
 

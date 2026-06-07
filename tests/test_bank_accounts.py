@@ -39,18 +39,32 @@ async def test_create_bank_account_makes_gl_account(db):
     )
     acct = (await db.execute(select(GLAccount).where(GLAccount.id == ba.gl_account_id))).scalar_one()
     assert acct.denomination == Denomination.MONEY
-    assert 1100 <= int(acct.code) <= 1999
+    # Standard Lebanese liquidity band: CASH/PETTY → 5300xx (BANK → 5122xx).
+    assert 530000 <= int(acct.code) <= 530999
 
 
 @pytest.mark.asyncio
 async def test_adopt_seeded_accounts_idempotent(db):
     await seed_chart_of_accounts(db)
     created = await bank.adopt_seeded_accounts(db)
-    assert created == 3  # CASH, CASH_LBP, BANK
+    assert created == 5  # CASH, CASH_LBP, BANK, CASH_PETTY, CREDIT_CARD_CLEARING
     again = await bank.adopt_seeded_accounts(db)
     assert again == 0
     rows = (await db.execute(select(BankAccount))).scalars().all()
     assert {r.currency for r in rows} == {"USD", "LBP"}
+
+
+@pytest.mark.asyncio
+async def test_adopt_wraps_petty_and_card_clearing(db):
+    from app.models import GLAccount
+    await seed_chart_of_accounts(db)
+    await bank.adopt_seeded_accounts(db)
+    wrapped = {
+        (await db.execute(select(GLAccount).where(GLAccount.id == b.gl_account_id))).scalar_one().system_key
+        for b in (await db.execute(select(BankAccount))).scalars().all()
+    }
+    assert "CASH_PETTY" in wrapped
+    assert "CREDIT_CARD_CLEARING" in wrapped
 
 
 import pytest_asyncio
@@ -90,3 +104,27 @@ async def test_api_adopt_create_and_cash_position(client):
     assert r.status_code == 200, r.text
     cp = (await client.get("/api/accounting/bank/cash-position")).json()
     assert any(a["name"] == "Vault" for a in cp["accounts"])
+
+
+@pytest.mark.asyncio
+async def test_card_clearing_settles_to_bank_via_transfer(db):
+    from decimal import Decimal
+    from datetime import date
+    from app.models import GLAccount, GLPeriod, PeriodStatus, GLJournalEntry
+    await seed_chart_of_accounts(db)
+    await bank.adopt_seeded_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    await db.flush()
+
+    async def ba(system_key):
+        acct = (await db.execute(select(GLAccount).where(GLAccount.system_key == system_key))).scalar_one()
+        return (await db.execute(select(BankAccount).where(BankAccount.gl_account_id == acct.id))).scalar_one()
+
+    clearing = await ba("CREDIT_CARD_CLEARING")
+    bank_acct = await ba("BANK")
+    await bank.post_transfer(db, from_account=clearing, to_account=bank_acct,
+                             amount=Decimal("100"), dest_amount=None, memo="card settlement",
+                             entry_date=date(2026, 6, 15), actor_user_id="u1", lbp_rate=Decimal("89500"))
+    entries = (await db.execute(
+        select(GLJournalEntry).where(GLJournalEntry.source_type == bank.SOURCE_TRANSFER))).scalars().all()
+    assert len(entries) == 1

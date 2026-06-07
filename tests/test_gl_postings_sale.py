@@ -184,3 +184,75 @@ async def test_partial_refund_reverses_only_that_event(db):
     again = await post_order_refund(db, order, _settings(on=True), "u1",
                                     refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
     assert again is None
+
+
+async def _make_order_discounted(db):
+    # subtotal 100, discount 10 → gross sales 100, discounts 10, vat 11, total 101.
+    order = Order(
+        order_number="ORD-D", cashier_id="u1", payment_method=PaymentMethod.CASH,
+        subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
+        discount_percent=D("10"), discount_amount=D("10"),
+        total_usd=D("101"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+    )
+    order.items = [OrderItem(
+        item_kind=OrderItemKind.COIN, product_code="C1", product_name="Coin", karat=Karat.K21,
+        weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"), margin_percent=D("0"),
+        making_charge=D("0"), final_price=D("100"), quantity=1,
+    )]
+    db.add(order); await db.flush()
+    return order
+
+
+@pytest.mark.asyncio
+async def test_post_sale_splits_discount_to_contra_revenue(db):
+    await _seeded(db)
+    order = await _make_order_discounted(db)
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] is True and tb["metal_balanced"] is True
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["SALES_REVENUE"]["base_credit"] == D("100.00")   # GROSS, not net of discount
+    assert accts["SALES_DISCOUNTS"]["base_debit"] == D("10.00")   # contra-revenue
+    assert accts["CASH"]["base_debit"] == D("101.00")
+    assert accts["VAT_PAYABLE"]["base_credit"] == D("11.00")
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_reverses_discount_prorata(db):
+    await _seeded(db)
+    # 2-unit line @50 = subtotal 100, 10% discount = 10, vat 11, total 101.
+    order = Order(
+        order_number="ORD-DR", cashier_id="u1", payment_method=PaymentMethod.CASH,
+        subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
+        discount_percent=D("10"), discount_amount=D("10"),
+        total_usd=D("101"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+    )
+    item = OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="Coin",
+                     karat=Karat.K21, weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"),
+                     margin_percent=D("0"), making_charge=D("0"), final_price=D("100"), quantity=2)
+    order.items = [item]
+    db.add(order); await db.flush()
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+
+    # Refund 1 of 2 units: pre-VAT slice 50. discount_slice = 50/100*10 = 5.
+    rev = await post_order_refund(db, order, _settings(on=True), "u1",
+                                  refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
+    assert rev is not None
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] and tb["metal_balanced"]
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    # Discounts net: 10 (sale) − 5 (refund reversal) = 5 remaining debit.
+    assert accts["SALES_DISCOUNTS"]["net_base"] == D("5.00")
+    # Cash net: 101 in − (50 − 5 + 5.50) out = 101 − 50.50 = 50.50.
+    assert accts["CASH"]["net_base"] == D("50.50")
+
+
+@pytest.mark.asyncio
+async def test_card_sale_debits_clearing_not_bank(db):
+    await _seeded(db)
+    order = await _make_order(db, payment="CARD")
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CREDIT_CARD_CLEARING"]["base_debit"] == D("111.00")
+    assert accts.get("BANK", {}).get("base_debit", D("0")) == D("0.00")

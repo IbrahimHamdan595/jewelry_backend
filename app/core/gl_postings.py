@@ -100,18 +100,20 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     if order.payment_method == PaymentMethod.CREDIT:
         cash_key = "AR"  # Module 3 — sale on account; AR control debited
     elif order.payment_method == PaymentMethod.CARD:
-        cash_key = "BANK"
+        cash_key = "CREDIT_CARD_CLEARING"  # settled to BANK via bank transfer (design v2 §7.2)
     else:
         cash_key = "CASH"
     making_revenue = sum(
         (it.making_charge * it.quantity for it in order.items), ZERO
     ).quantize(_Q_MONEY)
-    sales_revenue = (order.subtotal - making_revenue - order.discount_amount).quantize(_Q_MONEY)
+    sales_revenue = (order.subtotal - making_revenue).quantize(_Q_MONEY)  # GROSS; discount split below
+    discount_amount = (order.discount_amount or ZERO).quantize(_Q_MONEY)
 
     cash_id = await resolve_account_id(db, cash_key)
     rev_id = await resolve_account_id(db, "SALES_REVENUE")
     making_id = await resolve_account_id(db, "MAKING_CHARGE_REVENUE")
     vat_id = await resolve_account_id(db, "VAT_PAYABLE")
+    discount_id = await resolve_account_id(db, "SALES_DISCOUNTS")
     cogs_id = await resolve_account_id(db, "METAL_COGS")
     inv_id = await resolve_account_id(db, "METAL_INVENTORY")
 
@@ -127,6 +129,9 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     if order.vat_amount > 0:
         lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY",
                                base_credit=order.vat_amount, money_credit=order.vat_amount, memo="output VAT"))
+    if discount_amount > 0:
+        lines.append(gl.GLLine(account_id=discount_id, denomination="MONEY",
+                               base_debit=discount_amount, money_debit=discount_amount, memo="discount allowed"))
 
     # COGS aggregated per karat
     cogs: dict[str, dict] = {}
@@ -191,7 +196,11 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     vat_share = (line_value * settings.vat_percent / Decimal(100)).quantize(_Q_MONEY)
     making_share = (refunded_item.making_charge * qty).quantize(_Q_MONEY)
     sales_share = (line_value - making_share).quantize(_Q_MONEY)
-    cash_back = (line_value + vat_share).quantize(_Q_MONEY)
+    # Reverse the discount pro-rata by this slice's share of the order subtotal.
+    subtotal = (order.subtotal or ZERO)
+    discount_slice = ((Decimal(str(order.discount_amount or ZERO)) * line_value / subtotal).quantize(_Q_MONEY)
+                      if subtotal > 0 else ZERO)
+    cash_back = (line_value - discount_slice + vat_share).quantize(_Q_MONEY)
     grams = refunded_item.weight_grams * qty
     cost = await _cogs_cost_for_item(db, _RefundItemView(refunded_item, qty))
 
@@ -201,6 +210,7 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     vat_id = await resolve_account_id(db, "VAT_PAYABLE")
     cogs_id = await resolve_account_id(db, "METAL_COGS")
     inv_id = await resolve_account_id(db, "METAL_INVENTORY")
+    discount_id = await resolve_account_id(db, "SALES_DISCOUNTS")
 
     lines = [
         gl.GLLine(account_id=rev_id, denomination="MONEY", base_debit=sales_share, money_debit=sales_share, memo="refund revenue"),
@@ -212,6 +222,9 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     if making_share > 0:
         lines.insert(2, gl.GLLine(account_id=making_id, denomination="MONEY",
                                   base_debit=making_share, money_debit=making_share, memo="refund making"))
+    if discount_slice > 0:
+        lines.append(gl.GLLine(account_id=discount_id, denomination="MONEY",
+                               base_credit=discount_slice, money_credit=discount_slice, memo="reverse discount"))
     return await gl.post_entry(
         db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
         source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
