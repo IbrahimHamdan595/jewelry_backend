@@ -26,22 +26,31 @@ SOURCE_TRANSFER = "TRANSFER"
 _SEEDED_MAP = {"CASH": BankAccountType.CASH, "CASH_LBP": BankAccountType.CASH, "BANK": BankAccountType.BANK}
 
 
-async def next_bank_account_code(db: AsyncSession) -> str:
-    """First free numeric code in the 1100–1999 band."""
+# Standard Lebanese liquidity bands (6-digit posting codes) per account type.
+_CODE_BANDS = {
+    BankAccountType.BANK: (512200, 512999),
+    BankAccountType.CASH: (530000, 530999),
+    BankAccountType.PETTY_CASH: (530000, 530999),
+}
+
+
+async def next_bank_account_code(db: AsyncSession, account_type: BankAccountType) -> str:
+    """First free numeric code in the standard liquidity band for this type."""
+    lo, hi = _CODE_BANDS[account_type]
     rows = (await db.execute(select(GLAccount.code))).scalars().all()
-    used = {int(c) for c in rows if c.isdigit() and 1100 <= int(c) <= 1999}
-    n = 1100
+    used = {int(c) for c in rows if c.isdigit() and lo <= int(c) <= hi}
+    n = lo + 1
     while n in used:
         n += 1
-    if n > 1999:
-        raise HTTPException(status_code=422, detail="No free bank account code in 1100–1999")
+    if n > hi:
+        raise HTTPException(status_code=422, detail=f"No free {account_type.value} code in {lo}-{hi}")
     return str(n)
 
 
 async def create_bank_account(db: AsyncSession, *, name: str, account_type: BankAccountType,
                               currency: str, bank_name: str | None, account_number: str | None,
                               actor_user_id: str) -> BankAccount:
-    code = await next_bank_account_code(db)
+    code = await next_bank_account_code(db, account_type)
     acct = GLAccount(code=code, name=name, type=AccountType.ASSET,
                      denomination=Denomination.MONEY, normal_balance=NormalBalance.DEBIT,
                      currency=currency, system_key=None)

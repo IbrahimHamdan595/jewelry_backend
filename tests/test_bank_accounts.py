@@ -39,7 +39,8 @@ async def test_create_bank_account_makes_gl_account(db):
     )
     acct = (await db.execute(select(GLAccount).where(GLAccount.id == ba.gl_account_id))).scalar_one()
     assert acct.denomination == Denomination.MONEY
-    assert 1100 <= int(acct.code) <= 1999
+    # Standard Lebanese liquidity band: CASH/PETTY → 5300xx (BANK → 5122xx).
+    assert 530000 <= int(acct.code) <= 530999
 
 
 @pytest.mark.asyncio
