@@ -47,11 +47,24 @@ async def test_create_bank_account_makes_gl_account(db):
 async def test_adopt_seeded_accounts_idempotent(db):
     await seed_chart_of_accounts(db)
     created = await bank.adopt_seeded_accounts(db)
-    assert created == 3  # CASH, CASH_LBP, BANK
+    assert created == 5  # CASH, CASH_LBP, BANK, CASH_PETTY, CREDIT_CARD_CLEARING
     again = await bank.adopt_seeded_accounts(db)
     assert again == 0
     rows = (await db.execute(select(BankAccount))).scalars().all()
     assert {r.currency for r in rows} == {"USD", "LBP"}
+
+
+@pytest.mark.asyncio
+async def test_adopt_wraps_petty_and_card_clearing(db):
+    from app.models import GLAccount
+    await seed_chart_of_accounts(db)
+    await bank.adopt_seeded_accounts(db)
+    wrapped = {
+        (await db.execute(select(GLAccount).where(GLAccount.id == b.gl_account_id))).scalar_one().system_key
+        for b in (await db.execute(select(BankAccount))).scalars().all()
+    }
+    assert "CASH_PETTY" in wrapped
+    assert "CREDIT_CARD_CLEARING" in wrapped
 
 
 import pytest_asyncio

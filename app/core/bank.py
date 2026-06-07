@@ -23,7 +23,13 @@ _Q_MONEY = Decimal("0.01")
 
 SOURCE_TRANSFER = "TRANSFER"
 
-_SEEDED_MAP = {"CASH": BankAccountType.CASH, "CASH_LBP": BankAccountType.CASH, "BANK": BankAccountType.BANK}
+_SEEDED_MAP = {
+    "CASH": BankAccountType.CASH, "CASH_LBP": BankAccountType.CASH,
+    "BANK": BankAccountType.BANK, "CASH_PETTY": BankAccountType.PETTY_CASH,
+    # Card clearing is wrapped as a BANK-type account so it appears in transfer
+    # dropdowns; settlement is a transfer clearing → real bank (design v2 §7.2).
+    "CREDIT_CARD_CLEARING": BankAccountType.BANK,
+}
 
 
 # Standard Lebanese liquidity bands (6-digit posting codes) per account type.
