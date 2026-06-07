@@ -245,3 +245,14 @@ async def test_partial_refund_reverses_discount_prorata(db):
     assert accts["SALES_DISCOUNTS"]["net_base"] == D("5.00")
     # Cash net: 101 in − (50 − 5 + 5.50) out = 101 − 50.50 = 50.50.
     assert accts["CASH"]["net_base"] == D("50.50")
+
+
+@pytest.mark.asyncio
+async def test_card_sale_debits_clearing_not_bank(db):
+    await _seeded(db)
+    order = await _make_order(db, payment="CARD")
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CREDIT_CARD_CLEARING"]["base_debit"] == D("111.00")
+    assert accts.get("BANK", {}).get("base_debit", D("0")) == D("0.00")

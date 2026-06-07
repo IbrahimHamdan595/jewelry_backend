@@ -100,7 +100,7 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     if order.payment_method == PaymentMethod.CREDIT:
         cash_key = "AR"  # Module 3 — sale on account; AR control debited
     elif order.payment_method == PaymentMethod.CARD:
-        cash_key = "BANK"
+        cash_key = "CREDIT_CARD_CLEARING"  # settled to BANK via bank transfer (design v2 §7.2)
     else:
         cash_key = "CASH"
     making_revenue = sum(
