@@ -106,12 +106,14 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     making_revenue = sum(
         (it.making_charge * it.quantity for it in order.items), ZERO
     ).quantize(_Q_MONEY)
-    sales_revenue = (order.subtotal - making_revenue - order.discount_amount).quantize(_Q_MONEY)
+    sales_revenue = (order.subtotal - making_revenue).quantize(_Q_MONEY)  # GROSS; discount split below
+    discount_amount = (order.discount_amount or ZERO).quantize(_Q_MONEY)
 
     cash_id = await resolve_account_id(db, cash_key)
     rev_id = await resolve_account_id(db, "SALES_REVENUE")
     making_id = await resolve_account_id(db, "MAKING_CHARGE_REVENUE")
     vat_id = await resolve_account_id(db, "VAT_PAYABLE")
+    discount_id = await resolve_account_id(db, "SALES_DISCOUNTS")
     cogs_id = await resolve_account_id(db, "METAL_COGS")
     inv_id = await resolve_account_id(db, "METAL_INVENTORY")
 
@@ -127,6 +129,9 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
     if order.vat_amount > 0:
         lines.append(gl.GLLine(account_id=vat_id, denomination="MONEY",
                                base_credit=order.vat_amount, money_credit=order.vat_amount, memo="output VAT"))
+    if discount_amount > 0:
+        lines.append(gl.GLLine(account_id=discount_id, denomination="MONEY",
+                               base_debit=discount_amount, money_debit=discount_amount, memo="discount allowed"))
 
     # COGS aggregated per karat
     cogs: dict[str, dict] = {}
