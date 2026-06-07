@@ -67,6 +67,47 @@ SYSTEM_ACCOUNTS: list[tuple] = [
     ("673900", "Bank Charges",          EXP, M, DR, "USD", "BANK_CHARGES_EXPENSE"),
     ("626940", "Office Supplies",       EXP, M, DR, "USD", "OFFICE_EXPENSE"),
     ("626991", "Miscellaneous Expense", EXP, M, DR, "USD", "MISC_EXPENSE"),
+    # --- Gap accounts (design 2026-06-07 v2 §6) ---
+    # Opex expenses (auto-wired: selectable on vendor bills + expense-by-category)
+    ("626151", "Telephone & Telecom",          EXP, M, DR, "USD", "TELECOM_EXPENSE"),
+    ("626800", "Insurance",                     EXP, M, DR, "USD", "INSURANCE_EXPENSE"),
+    ("626530", "Professional Fees",             EXP, M, DR, "USD", "PROFESSIONAL_FEES_EXPENSE"),
+    ("626330", "Water",                         EXP, M, DR, "USD", "WATER_EXPENSE"),
+    ("626111", "Delivery/Transport on Sales",   EXP, M, DR, "USD", "FREIGHT_OUT_EXPENSE"),
+    ("642000", "Municipality Taxes",            EXP, M, DR, "USD", "MUNICIPALITY_TAX_EXPENSE"),
+    ("644000", "Registration Fees",             EXP, M, DR, "USD", "REGISTRATION_FEES_EXPENSE"),
+    ("645801", "Tax Penalties & Interest",      EXP, M, DR, "USD", "TAX_PENALTIES_EXPENSE"),
+    ("643000", "VAT Non-Recoverable",           EXP, M, DR, "USD", "VAT_NONRECOVERABLE_EXPENSE"),
+    ("626910", "Medical Care",                  EXP, M, DR, "USD", "MEDICAL_EXPENSE"),
+    ("685110", "Donations",                     EXP, M, DR, "USD", "DONATIONS_EXPENSE"),
+    ("673100", "Interest on Loans",             EXP, M, DR, "USD", "INTEREST_EXPENSE"),
+    # Cash / contra / clearing
+    ("530002", "Petty Cash",                    A,   M, DR, "USD", "CASH_PETTY"),
+    ("709000", "Discounts Allowed",             INC, M, DR, "USD", "SALES_DISCOUNTS"),
+    ("540005", "Credit Cards (clearing)",       A,   M, DR, "USD", "CREDIT_CARD_CLEARING"),
+    # Equity / structural (dormant, manual JE)
+    ("101301", "Subscribed Capital",            EQ,  M, CR, "USD", "CAPITAL"),
+    ("111001", "Legal Reserve",                 EQ,  M, CR, "USD", "LEGAL_RESERVE"),
+    ("259001", "Deposits Paid",                 A,   M, DR, "USD", "DEPOSITS_PAID"),
+    ("121001", "Profit Brought Forward",        EQ,  M, CR, "USD", "PROFIT_BROUGHT_FORWARD"),
+    ("125001", "Losses Brought Forward",        EQ,  M, DR, "USD", "LOSS_BROUGHT_FORWARD"),
+    # Fixed assets (dormant; depreciation engine is module T2a)
+    ("226211", "Office & Computer Equipment",   A,   M, DR, "USD", "FA_OFFICE_EQUIPMENT"),
+    ("226221", "Computer Equipment & Programs", A,   M, DR, "USD", "FA_COMPUTER"),
+    ("226311", "Furniture & Fixtures",          A,   M, DR, "USD", "FA_FURNITURE"),
+    ("226101", "General Installations",         A,   M, DR, "USD", "FA_INSTALLATIONS"),
+    ("225101", "Transportation Equipment",      A,   M, DR, "USD", "FA_VEHICLES"),
+    ("282621", "Accum. Dep - Office Equipment", A,   M, CR, "USD", "FA_ACCUM_DEP_OFFICE"),
+    ("282622", "Accum. Dep - Computer",         A,   M, CR, "USD", "FA_ACCUM_DEP_COMPUTER"),
+    ("282631", "Accum. Dep - Furniture",        A,   M, CR, "USD", "FA_ACCUM_DEP_FURNITURE"),
+    ("282611", "Accum. Dep - Installations",    A,   M, CR, "USD", "FA_ACCUM_DEP_INSTALLATIONS"),
+    ("282521", "Accum. Dep - Vehicles",         A,   M, CR, "USD", "FA_ACCUM_DEP_VEHICLES"),
+    ("651262", "Depreciation - Office&Computer",EXP, M, DR, "USD", "DEP_EXPENSE_OFFICE"),
+    ("651263", "Depreciation - Furniture",      EXP, M, DR, "USD", "DEP_EXPENSE_FURNITURE"),
+    ("651261", "Depreciation - Installations",  EXP, M, DR, "USD", "DEP_EXPENSE_INSTALLATIONS"),
+    ("651251", "Depreciation - Vehicles",       EXP, M, DR, "USD", "DEP_EXPENSE_VEHICLES"),
+    ("781200", "Gain on Asset Disposal",        INC, M, CR, "USD", "FA_DISPOSAL_GAIN"),
+    ("681200", "Net Book Value of Disposed Assets", EXP, M, DR, "USD", "FA_DISPOSAL_NBV"),
 ]
 
 

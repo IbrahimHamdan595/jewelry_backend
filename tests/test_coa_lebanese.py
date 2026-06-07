@@ -44,6 +44,65 @@ def _load_renumber_migration():
     return mod
 
 
+from app.models import AccountType, NormalBalance
+
+NEW_ACCOUNTS = {
+    # system_key: (code, AccountType, NormalBalance)
+    "TELECOM_EXPENSE": ("626151", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "INSURANCE_EXPENSE": ("626800", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "PROFESSIONAL_FEES_EXPENSE": ("626530", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "WATER_EXPENSE": ("626330", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "FREIGHT_OUT_EXPENSE": ("626111", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "MUNICIPALITY_TAX_EXPENSE": ("642000", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "REGISTRATION_FEES_EXPENSE": ("644000", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "TAX_PENALTIES_EXPENSE": ("645801", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "VAT_NONRECOVERABLE_EXPENSE": ("643000", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "MEDICAL_EXPENSE": ("626910", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "DONATIONS_EXPENSE": ("685110", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "INTEREST_EXPENSE": ("673100", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "CASH_PETTY": ("530002", AccountType.ASSET, NormalBalance.DEBIT),
+    "SALES_DISCOUNTS": ("709000", AccountType.INCOME, NormalBalance.DEBIT),
+    "CREDIT_CARD_CLEARING": ("540005", AccountType.ASSET, NormalBalance.DEBIT),
+    "CAPITAL": ("101301", AccountType.EQUITY, NormalBalance.CREDIT),
+    "LEGAL_RESERVE": ("111001", AccountType.EQUITY, NormalBalance.CREDIT),
+    "DEPOSITS_PAID": ("259001", AccountType.ASSET, NormalBalance.DEBIT),
+    "PROFIT_BROUGHT_FORWARD": ("121001", AccountType.EQUITY, NormalBalance.CREDIT),
+    "LOSS_BROUGHT_FORWARD": ("125001", AccountType.EQUITY, NormalBalance.DEBIT),
+    "FA_OFFICE_EQUIPMENT": ("226211", AccountType.ASSET, NormalBalance.DEBIT),
+    "FA_COMPUTER": ("226221", AccountType.ASSET, NormalBalance.DEBIT),
+    "FA_FURNITURE": ("226311", AccountType.ASSET, NormalBalance.DEBIT),
+    "FA_INSTALLATIONS": ("226101", AccountType.ASSET, NormalBalance.DEBIT),
+    "FA_VEHICLES": ("225101", AccountType.ASSET, NormalBalance.DEBIT),
+    "FA_ACCUM_DEP_OFFICE": ("282621", AccountType.ASSET, NormalBalance.CREDIT),
+    "FA_ACCUM_DEP_COMPUTER": ("282622", AccountType.ASSET, NormalBalance.CREDIT),
+    "FA_ACCUM_DEP_FURNITURE": ("282631", AccountType.ASSET, NormalBalance.CREDIT),
+    "FA_ACCUM_DEP_INSTALLATIONS": ("282611", AccountType.ASSET, NormalBalance.CREDIT),
+    "FA_ACCUM_DEP_VEHICLES": ("282521", AccountType.ASSET, NormalBalance.CREDIT),
+    "DEP_EXPENSE_OFFICE": ("651262", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "DEP_EXPENSE_FURNITURE": ("651263", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "DEP_EXPENSE_INSTALLATIONS": ("651261", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "DEP_EXPENSE_VEHICLES": ("651251", AccountType.EXPENSE, NormalBalance.DEBIT),
+    "FA_DISPOSAL_GAIN": ("781200", AccountType.INCOME, NormalBalance.CREDIT),
+    "FA_DISPOSAL_NBV": ("681200", AccountType.EXPENSE, NormalBalance.DEBIT),
+}
+
+
+@pytest.mark.asyncio
+async def test_new_accounts_seeded(db):
+    await seed_chart_of_accounts(db)
+    rows = (await db.execute(select(GLAccount))).scalars().all()
+    by_key = {a.system_key: a for a in rows}
+    for key, (code, atype, nb) in NEW_ACCOUNTS.items():
+        a = by_key.get(key)
+        assert a is not None, f"{key} not seeded"
+        assert a.code == code and a.type == atype and a.normal_balance == nb, f"{key} mismatch"
+
+
+def test_result_of_period_not_seeded():
+    keys = {t[6] for t in SYSTEM_ACCOUNTS}
+    assert "RESULT_PERIOD_PROFIT" not in keys and "RESULT_PERIOD_LOSS" not in keys
+
+
 def test_migration_map_matches_seed():
     # The migration's RENUMBER must cover every renumbered account and be 1:1.
     mod = _load_renumber_migration()
