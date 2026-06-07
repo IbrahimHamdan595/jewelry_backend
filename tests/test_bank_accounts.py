@@ -104,3 +104,27 @@ async def test_api_adopt_create_and_cash_position(client):
     assert r.status_code == 200, r.text
     cp = (await client.get("/api/accounting/bank/cash-position")).json()
     assert any(a["name"] == "Vault" for a in cp["accounts"])
+
+
+@pytest.mark.asyncio
+async def test_card_clearing_settles_to_bank_via_transfer(db):
+    from decimal import Decimal
+    from datetime import date
+    from app.models import GLAccount, GLPeriod, PeriodStatus, GLJournalEntry
+    await seed_chart_of_accounts(db)
+    await bank.adopt_seeded_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    await db.flush()
+
+    async def ba(system_key):
+        acct = (await db.execute(select(GLAccount).where(GLAccount.system_key == system_key))).scalar_one()
+        return (await db.execute(select(BankAccount).where(BankAccount.gl_account_id == acct.id))).scalar_one()
+
+    clearing = await ba("CREDIT_CARD_CLEARING")
+    bank_acct = await ba("BANK")
+    await bank.post_transfer(db, from_account=clearing, to_account=bank_acct,
+                             amount=Decimal("100"), dest_amount=None, memo="card settlement",
+                             entry_date=date(2026, 6, 15), actor_user_id="u1", lbp_rate=Decimal("89500"))
+    entries = (await db.execute(
+        select(GLJournalEntry).where(GLJournalEntry.source_type == bank.SOURCE_TRANSFER))).scalars().all()
+    assert len(entries) == 1
