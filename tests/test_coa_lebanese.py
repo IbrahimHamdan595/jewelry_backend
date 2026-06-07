@@ -31,3 +31,25 @@ async def test_existing_accounts_use_standard_codes(db):
 def test_codes_unique_in_seed():
     codes = [t[0] for t in SYSTEM_ACCOUNTS]
     assert len(codes) == len(set(codes)), "duplicate codes in SYSTEM_ACCOUNTS"
+
+
+def _load_renumber_migration():
+    import importlib.util
+    import pathlib
+    path = (pathlib.Path(__file__).resolve().parent.parent
+            / "alembic" / "versions" / "c4e5f6a7b8d0_lebanese_coa_renumber.py")
+    spec = importlib.util.spec_from_file_location("coa_renumber_mig", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_migration_map_matches_seed():
+    # The migration's RENUMBER must cover every renumbered account and be 1:1.
+    mod = _load_renumber_migration()
+    MIG, OLD = mod.RENUMBER, mod.OLD
+    assert set(MIG) == set(RENUMBER), "migration RENUMBER must cover the renumber map"
+    assert set(OLD) == set(RENUMBER), "migration OLD (downgrade) must cover the renumber map"
+    assert MIG == RENUMBER, "migration RENUMBER must match the test/seed renumber map"
+    assert len(set(MIG.values())) == len(MIG), "new codes must be unique"
+    assert len(set(OLD.values())) == len(OLD), "old codes must be unique"
