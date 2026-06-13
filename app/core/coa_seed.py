@@ -54,6 +54,8 @@ SYSTEM_ACCOUNTS: list[tuple] = [
     ("775100", "FX Gain",               INC, M, CR, "USD", "FX_GAIN"),
     ("611701", "Metal COGS",            EXP, DU, DR, "USD", "METAL_COGS"),
     ("611702", "Making COGS",           EXP, M,  DR, "USD", "MAKING_COGS"),
+    ("611703", "Stone COGS",            EXP, M,  DR, "USD", "STONE_COGS"),
+    ("370013", "Stone Inventory",       A,   M,  DR, "USD", "STONE_INVENTORY"),
     ("675100", "FX Loss",               EXP, M,  DR, "USD", "FX_LOSS"),
     # Module 1 (auto-posting) additions. 370019 is CUSTOM — no standard equivalent.
     ("370019", "Metal Clearing",        A,  DU, DR, "USD", "METAL_CLEARING"),

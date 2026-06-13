@@ -148,6 +148,18 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
         lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
                                base_credit=v["cost"], metal_credit_grams=v["grams"], karat=k, memo="metal out"))
 
+    # Stone COGS (money-only): one aggregated pair when any line carries stone cost.
+    stone_cogs_total = sum(
+        ((it.stone_cost_at_sale or ZERO) * it.quantity for it in order.items), ZERO
+    ).quantize(_Q_MONEY)
+    if stone_cogs_total > 0:
+        stone_cogs_id = await resolve_account_id(db, "STONE_COGS")
+        stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+        lines.append(gl.GLLine(account_id=stone_cogs_id, denomination="MONEY",
+                               base_debit=stone_cogs_total, money_debit=stone_cogs_total, memo="stone COGS"))
+        lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                               base_credit=stone_cogs_total, money_credit=stone_cogs_total, memo="stone out"))
+
     return await gl.post_entry(
         db, entry_date=entry_date, memo=f"Sale {order.order_number}",
         source_type=SOURCE_ORDER, source_id=order.id, lines=lines, actor_user_id=actor_user_id,
