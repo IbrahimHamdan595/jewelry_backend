@@ -7,6 +7,7 @@ caller's transaction (no commit). All mappers are gated by the
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -20,6 +21,8 @@ from app.models import (
     DebtUnit, GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
     PeriodStatus, Product, Settings, SupplierItemKind, SupplierPurchaseItem,
 )
+
+logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 _Q_MONEY = Decimal("0.01")
@@ -284,16 +287,37 @@ async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings,
             k = it.karat.value
             gold_cost_by_karat[k] = gold_cost_by_karat.get(k, ZERO) + (it.unit_cost_usd or ZERO)
 
-    # Cash side (NET owed): DR Product Inventory full; CR AP net owed; CR Cash paid.
+    # Cash side (NET owed): DR Product Inventory + Stone Inventory; CR AP net owed; CR Cash paid.
     # M1 over-credited AP by the pay-at-creation portion; this nets it so GL AP
     # ties to SupplierBalance (Module 4).
+
+    # Of the product cash cost, the stone portion (for diamond products) is held
+    # in STONE_INVENTORY so it ties out against stone COGS relieved at sale.
+    stone_slice = ZERO
+    for it in items:
+        if it.item_kind == SupplierItemKind.PRODUCT and it.product_id:
+            prod = (await db.execute(select(Product).where(Product.id == it.product_id))).scalar_one_or_none()
+            if prod is not None and prod.stone_cost_usd:
+                stone_slice += prod.stone_cost_usd * (it.quantity or 1)
+    stone_slice = stone_slice.quantize(_Q_MONEY)
+
     total_cash_due = (purchase.total_cash_due or ZERO)
     cash_paid = (purchase.cash_paid_at_creation or ZERO)
     cash_owed = (total_cash_due - cash_paid).quantize(_Q_MONEY)
     if total_cash_due > 0:
-        lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
-                               base_debit=total_cash_due.quantize(_Q_MONEY),
-                               money_debit=total_cash_due.quantize(_Q_MONEY), memo="product purchase"))
+        # Guard against a stone slice exceeding the cash cost (data error): clamp + log.
+        if stone_slice > total_cash_due:
+            logger.warning("stone slice %s exceeds product cash cost %s on purchase %s; clamping",
+                           stone_slice, total_cash_due, purchase.id)
+            stone_slice = ZERO
+        product_slice = (total_cash_due - stone_slice).quantize(_Q_MONEY)
+        if product_slice > 0:
+            lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
+                                   base_debit=product_slice, money_debit=product_slice, memo="product purchase"))
+        if stone_slice > 0:
+            stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+            lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                                   base_debit=stone_slice, money_debit=stone_slice, memo="stone inventory in"))
         if cash_owed > 0:
             lines.append(gl.GLLine(account_id=ap_id, denomination="MONEY",
                                    base_credit=cash_owed, money_credit=cash_owed, memo="AP (net owed)"))
