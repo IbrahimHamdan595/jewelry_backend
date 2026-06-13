@@ -267,6 +267,16 @@ class Product(Base):
     # Phase 4
     is_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     cost_basis_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Diamond/stone layer (2026-06-13). A product "has stones" ⇔ stone_value_usd > 0.
+    # stone_value_usd adds to the SELLING price; stone_cost_usd is the stone COGS,
+    # kept separate from cost_basis_usd (which stays gold-only). Carats/count/cert/
+    # note are display-only (labels, receipts).
+    stone_value_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stone_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stone_carats: Mapped[Decimal | None] = mapped_column(Numeric(8, 3), nullable=True)
+    stone_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stone_cert: Mapped[str | None] = mapped_column(String, nullable=True)
+    stone_note: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[ProductStatus] = mapped_column(
         Enum(ProductStatus, name="productstatus_enum"),
         nullable=False,
@@ -350,6 +360,11 @@ class OrderItem(Base):
     # Sale-time COGS snapshot (metal cost of the line). Captured at checkout so
     # gross profit is queryable without the GL. NULL on pre-feature orders.
     cost_basis_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Stone value/cost baked into this line at checkout (NULL for non-stone lines
+    # and pre-feature orders). Snapshotted so later edits to the product's stone
+    # value don't rewrite historical receipts or refund math.
+    stone_value_at_sale: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stone_cost_at_sale: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     # Phase 1 (per-item refunds). refunded_qty counts units returned to stock
     # (0 or 1 for atomic PRODUCT lines; 0..quantity for COIN/OUNCE lines).
     # refunded_amount is the cumulative pre-VAT value refunded for this line.
