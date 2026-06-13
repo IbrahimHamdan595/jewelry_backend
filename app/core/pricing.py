@@ -33,6 +33,7 @@ def calculate_price(
     margin_percent: Decimal,
     making_charge: Decimal,
     karat_markup: Decimal = Decimal("0"),
+    stone_value: Decimal = Decimal("0"),
 ) -> dict[str, Decimal]:
     purity = KARAT_PURITY[karat]
     purity_rate = rate_24k * purity
@@ -40,13 +41,14 @@ def calculate_price(
     metal_value = effective_rate * weight_grams
     margin_amount = metal_value * (margin_percent / Decimal(100))
     with_margin = metal_value + margin_amount
-    final_price = with_margin + making_charge
+    final_price = with_margin + making_charge + stone_value
 
     return {
         "purity_rate": _round(purity_rate),
         "effective_rate": _round(effective_rate),
         "metal_value": _round(metal_value),
         "margin_amount": _round(margin_amount),
+        "stone_value": _round(stone_value),
         "final_price": _round(final_price),
     }
 
