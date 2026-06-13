@@ -163,6 +163,7 @@ async def _checkout_product_line(
         margin_percent=product.margin_percent,
         making_charge=product.making_charge,
         karat_markup=karat_markup,
+        stone_value=product.stone_value_usd or Decimal("0"),
     )
 
     # One OrderItem row per product line (quantity captured in the column, like
@@ -180,6 +181,8 @@ async def _checkout_product_line(
         margin_percent=product.margin_percent,
         making_charge=product.making_charge,
         final_price=line_total,
+        stone_value_at_sale=product.stone_value_usd,
+        stone_cost_at_sale=product.stone_cost_usd,
     )
     product.on_hand_qty = product.on_hand_qty - line.quantity
     # Derived compatibility flag: SOLD once nothing is left on hand.
@@ -197,6 +200,7 @@ async def _checkout_product_line(
             "unit_price": str(priced["final_price"]),
             "line_total": str(line_total),
             "gold_rate_at_sale": str(rate_24k),
+            "stone_value": str(product.stone_value_usd or 0),
             "qty_after": product.on_hand_qty,
             "status_after": product.status.value,
         },

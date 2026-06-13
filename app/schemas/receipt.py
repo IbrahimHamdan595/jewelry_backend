@@ -52,6 +52,7 @@ class ReceiptLine(BaseModel):
     weight_grams: Decimal | None = None
     quantity: Decimal | None = None
     unit_price: Decimal | None = None
+    stone_value: Decimal | None = None
     line_total: Decimal
 
 

@@ -44,6 +44,8 @@ class OrderItemOut(BaseModel):
     margin_percent: Decimal
     making_charge: Decimal
     final_price: Decimal
+    stone_value_at_sale: Decimal | None = None
+    stone_cost_at_sale: Decimal | None = None
     refunded_qty: int = 0
     refunded_amount: Decimal = Decimal("0")
     refunded_at: datetime | None = None

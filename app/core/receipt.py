@@ -64,6 +64,7 @@ def build_sale_receipt(order: Order, settings: Settings) -> ReceiptOut:
             unit_price=(
                 (item.final_price / item.quantity) if item.quantity else item.final_price
             ),
+            stone_value=getattr(item, "stone_value_at_sale", None),
             line_total=item.final_price,
         )
         for item in order.items

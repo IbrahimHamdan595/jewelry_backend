@@ -7,6 +7,7 @@ caller's transaction (no commit). All mappers are gated by the
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -20,6 +21,8 @@ from app.models import (
     DebtUnit, GLAccount, GLJournalEntry, GLPeriod, OrderItemKind, PaymentMethod,
     PeriodStatus, Product, Settings, SupplierItemKind, SupplierPurchaseItem,
 )
+
+logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0")
 _Q_MONEY = Decimal("0.01")
@@ -148,6 +151,18 @@ async def post_sale(db: AsyncSession, order, settings: Settings, actor_user_id: 
         lines.append(gl.GLLine(account_id=inv_id, denomination="DUAL",
                                base_credit=v["cost"], metal_credit_grams=v["grams"], karat=k, memo="metal out"))
 
+    # Stone COGS (money-only): one aggregated pair when any line carries stone cost.
+    stone_cogs_total = sum(
+        ((it.stone_cost_at_sale or ZERO) * it.quantity for it in order.items), ZERO
+    ).quantize(_Q_MONEY)
+    if stone_cogs_total > 0:
+        stone_cogs_id = await resolve_account_id(db, "STONE_COGS")
+        stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+        lines.append(gl.GLLine(account_id=stone_cogs_id, denomination="MONEY",
+                               base_debit=stone_cogs_total, money_debit=stone_cogs_total, memo="stone COGS"))
+        lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                               base_credit=stone_cogs_total, money_credit=stone_cogs_total, memo="stone out"))
+
     return await gl.post_entry(
         db, entry_date=entry_date, memo=f"Sale {order.order_number}",
         source_type=SOURCE_ORDER, source_id=order.id, lines=lines, actor_user_id=actor_user_id,
@@ -164,6 +179,7 @@ class _RefundItemView:
         self.weight_grams = item.weight_grams
         self.gold_rate_at_sale = item.gold_rate_at_sale
         self.quantity = qty
+        self.stone_cost_at_sale = getattr(item, "stone_cost_at_sale", None)
 
 
 async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
@@ -225,6 +241,15 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     if discount_slice > 0:
         lines.append(gl.GLLine(account_id=discount_id, denomination="MONEY",
                                base_credit=discount_slice, money_credit=discount_slice, memo="reverse discount"))
+    stone_cost = (refunded_item.stone_cost_at_sale or ZERO) * qty
+    if stone_cost > 0:
+        stone_cost = stone_cost.quantize(_Q_MONEY)
+        stone_cogs_id = await resolve_account_id(db, "STONE_COGS")
+        stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+        lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                               base_debit=stone_cost, money_debit=stone_cost, memo="stone back"))
+        lines.append(gl.GLLine(account_id=stone_cogs_id, denomination="MONEY",
+                               base_credit=stone_cost, money_credit=stone_cost, memo="reverse stone COGS"))
     return await gl.post_entry(
         db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
         source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
@@ -262,16 +287,37 @@ async def post_supplier_purchase(db: AsyncSession, purchase, settings: Settings,
             k = it.karat.value
             gold_cost_by_karat[k] = gold_cost_by_karat.get(k, ZERO) + (it.unit_cost_usd or ZERO)
 
-    # Cash side (NET owed): DR Product Inventory full; CR AP net owed; CR Cash paid.
+    # Cash side (NET owed): DR Product Inventory + Stone Inventory; CR AP net owed; CR Cash paid.
     # M1 over-credited AP by the pay-at-creation portion; this nets it so GL AP
     # ties to SupplierBalance (Module 4).
+
+    # Of the product cash cost, the stone portion (for diamond products) is held
+    # in STONE_INVENTORY so it ties out against stone COGS relieved at sale.
+    stone_slice = ZERO
+    for it in items:
+        if it.item_kind == SupplierItemKind.PRODUCT and it.product_id:
+            prod = (await db.execute(select(Product).where(Product.id == it.product_id))).scalar_one_or_none()
+            if prod is not None and prod.stone_cost_usd:
+                stone_slice += prod.stone_cost_usd * (it.quantity or 1)
+    stone_slice = stone_slice.quantize(_Q_MONEY)
+
     total_cash_due = (purchase.total_cash_due or ZERO)
     cash_paid = (purchase.cash_paid_at_creation or ZERO)
     cash_owed = (total_cash_due - cash_paid).quantize(_Q_MONEY)
     if total_cash_due > 0:
-        lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
-                               base_debit=total_cash_due.quantize(_Q_MONEY),
-                               money_debit=total_cash_due.quantize(_Q_MONEY), memo="product purchase"))
+        # Guard against a stone slice exceeding the cash cost (data error): clamp + log.
+        if stone_slice > total_cash_due:
+            logger.warning("stone slice %s exceeds product cash cost %s on purchase %s; clamping",
+                           stone_slice, total_cash_due, purchase.id)
+            stone_slice = ZERO
+        product_slice = (total_cash_due - stone_slice).quantize(_Q_MONEY)
+        if product_slice > 0:
+            lines.append(gl.GLLine(account_id=prod_inv_id, denomination="MONEY",
+                                   base_debit=product_slice, money_debit=product_slice, memo="product purchase"))
+        if stone_slice > 0:
+            stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+            lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                                   base_debit=stone_slice, money_debit=stone_slice, memo="stone inventory in"))
         if cash_owed > 0:
             lines.append(gl.GLLine(account_id=ap_id, denomination="MONEY",
                                    base_credit=cash_owed, money_credit=cash_owed, memo="AP (net owed)"))

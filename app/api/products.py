@@ -76,6 +76,12 @@ async def create_product(
         on_hand_qty=body.on_hand_qty,
         min_stock_qty=body.min_stock_qty,
         status=ProductStatus.AVAILABLE if body.on_hand_qty > 0 else ProductStatus.SOLD,
+        stone_value_usd=body.stone_value_usd,
+        stone_cost_usd=body.stone_cost_usd,
+        stone_carats=body.stone_carats,
+        stone_count=body.stone_count,
+        stone_cert=body.stone_cert,
+        stone_note=body.stone_note,
     )
     db.add(product)
     await db.commit()
