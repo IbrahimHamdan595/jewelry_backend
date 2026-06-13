@@ -17,6 +17,13 @@ class ProductCreate(BaseModel):
     # Phase 3 — initial stock on hand and optional low-stock threshold.
     on_hand_qty: int = 1
     min_stock_qty: int | None = None
+    # Diamond/stone fields
+    stone_value_usd: Decimal | None = None
+    stone_cost_usd: Decimal | None = None
+    stone_carats: Decimal | None = None
+    stone_count: int | None = None
+    stone_cert: str | None = None
+    stone_note: str | None = None
 
 
 class ProductUpdate(BaseModel):
@@ -32,6 +39,13 @@ class ProductUpdate(BaseModel):
     is_active: bool | None = None
     on_hand_qty: int | None = None
     min_stock_qty: int | None = None
+    # Diamond/stone fields
+    stone_value_usd: Decimal | None = None
+    stone_cost_usd: Decimal | None = None
+    stone_carats: Decimal | None = None
+    stone_count: int | None = None
+    stone_cert: str | None = None
+    stone_note: str | None = None
 
 
 class ProductOut(BaseModel):
@@ -56,6 +70,13 @@ class ProductOut(BaseModel):
     status: str
     source_ref_type: str | None
     source_ref_id: str | None
+    # Diamond/stone fields
+    stone_value_usd: Decimal | None
+    stone_cost_usd: Decimal | None
+    stone_carats: Decimal | None
+    stone_count: int | None
+    stone_cert: str | None
+    stone_note: str | None
     created_at: datetime
     updated_at: datetime
 
