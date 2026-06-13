@@ -176,6 +176,7 @@ class _RefundItemView:
         self.weight_grams = item.weight_grams
         self.gold_rate_at_sale = item.gold_rate_at_sale
         self.quantity = qty
+        self.stone_cost_at_sale = getattr(item, "stone_cost_at_sale", None)
 
 
 async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
@@ -237,6 +238,15 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     if discount_slice > 0:
         lines.append(gl.GLLine(account_id=discount_id, denomination="MONEY",
                                base_credit=discount_slice, money_credit=discount_slice, memo="reverse discount"))
+    stone_cost = (refunded_item.stone_cost_at_sale or ZERO) * qty
+    if stone_cost > 0:
+        stone_cost = stone_cost.quantize(_Q_MONEY)
+        stone_cogs_id = await resolve_account_id(db, "STONE_COGS")
+        stone_inv_id = await resolve_account_id(db, "STONE_INVENTORY")
+        lines.append(gl.GLLine(account_id=stone_inv_id, denomination="MONEY",
+                               base_debit=stone_cost, money_debit=stone_cost, memo="stone back"))
+        lines.append(gl.GLLine(account_id=stone_cogs_id, denomination="MONEY",
+                               base_credit=stone_cost, money_credit=stone_cost, memo="reverse stone COGS"))
     return await gl.post_entry(
         db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
         source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
