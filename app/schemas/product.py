@@ -96,6 +96,7 @@ class ProductLookupOut(BaseModel):
     purity_rate: Decimal
     final_price: Decimal
     on_hand_qty: int
+    photo_url: str | None = None
 
     model_config = {"from_attributes": True}
 

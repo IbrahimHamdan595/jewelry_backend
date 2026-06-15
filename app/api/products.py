@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.cloudflare import upload_image
+from app.core.r2 import upload_image
 from app.core.gold_api import get_current_gold_rate
 from app.core.permissions import require_admin
 from app.core.pricing import KARAT_PURITY, calculate_price, generate_item_code
@@ -134,6 +134,10 @@ async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User 
         karat_markup=karat_markup,
     )
 
+    photos = product.photos or []
+    hero = next((p for p in photos if p.get("isHero")), None) or (photos[0] if photos else None)
+    photo_url = hero.get("url") if hero else None
+
     return ProductLookupOut(
         id=product.id,
         code=product.code,
@@ -147,6 +151,7 @@ async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User 
         purity_rate=priced["purity_rate"],
         final_price=priced["final_price"],
         on_hand_qty=product.on_hand_qty,
+        photo_url=photo_url,
     )
 
 
