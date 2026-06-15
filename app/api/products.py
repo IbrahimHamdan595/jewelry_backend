@@ -134,6 +134,10 @@ async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User 
         karat_markup=karat_markup,
     )
 
+    photos = product.photos or []
+    hero = next((p for p in photos if p.get("isHero")), None) or (photos[0] if photos else None)
+    photo_url = hero.get("url") if hero else None
+
     return ProductLookupOut(
         id=product.id,
         code=product.code,
@@ -147,6 +151,7 @@ async def lookup_product(code: str, db: AsyncSession = Depends(get_db), _: User 
         purity_rate=priced["purity_rate"],
         final_price=priced["final_price"],
         on_hand_qty=product.on_hand_qty,
+        photo_url=photo_url,
     )
 
 
