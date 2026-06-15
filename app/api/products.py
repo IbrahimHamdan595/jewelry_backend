@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.cloudflare import upload_image
+from app.core.r2 import upload_image
 from app.core.gold_api import get_current_gold_rate
 from app.core.permissions import require_admin
 from app.core.pricing import KARAT_PURITY, calculate_price, generate_item_code
