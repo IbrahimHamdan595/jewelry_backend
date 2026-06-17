@@ -6,6 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.r2 import upload_image
 from app.core.gold_api import get_current_gold_rate
+from app.core.ledger import (
+    record,
+    EVENT_PRODUCT_CREATED,
+    EVENT_PRODUCT_UPDATED,
+    EVENT_PRODUCT_DELETED,
+)
 from app.core.permissions import require_admin
 from app.core.pricing import KARAT_PURITY, calculate_price, generate_item_code
 from app.deps import get_current_user, get_db
@@ -60,7 +66,7 @@ async def list_products(
 async def create_product(
     body: ProductCreate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    user: User = Depends(require_admin),
 ):
     code = await generate_item_code(db, Karat(body.karat))
     product = Product(
@@ -84,6 +90,15 @@ async def create_product(
         stone_note=body.stone_note,
     )
     db.add(product)
+    await db.flush()
+    await record(
+        db,
+        event_type=EVENT_PRODUCT_CREATED,
+        actor_user_id=user.id,
+        ref_type="product",
+        ref_id=product.id,
+        payload={"code": product.code, "name_en": product.name_en, "karat": product.karat.value},
+    )
     await db.commit()
     await db.refresh(product)
     return ProductOut.model_validate(product)
@@ -168,14 +183,24 @@ async def update_product(
     product_id: str,
     body: ProductUpdate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    user: User = Depends(require_admin),
 ):
     product = (await db.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(product, field, value)
+    await db.flush()
+    await record(
+        db,
+        event_type=EVENT_PRODUCT_UPDATED,
+        actor_user_id=user.id,
+        ref_type="product",
+        ref_id=product.id,
+        payload={"changes": {k: str(v) for k, v in changes.items()}},
+    )
     await db.commit()
     await db.refresh(product)
     return ProductOut.model_validate(product)
@@ -200,10 +225,19 @@ async def toggle_status(
 async def delete_product(
     product_id: str,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    user: User = Depends(require_admin),
 ):
     product = (await db.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
     product.is_active = False
+    await db.flush()
+    await record(
+        db,
+        event_type=EVENT_PRODUCT_DELETED,
+        actor_user_id=user.id,
+        ref_type="product",
+        ref_id=product.id,
+        payload={"soft_delete": True},
+    )
     await db.commit()
