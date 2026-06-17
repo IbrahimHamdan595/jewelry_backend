@@ -37,3 +37,17 @@ async def test_filter_by_category_id(client, db):
     assert r.status_code == 200
     assert r.json()["total"] == 2
     assert (await client.get("/api/products?category_id=c2")).json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_create_persists_category_id(client, db):
+    from app.models import Category
+    db.add(Category(id="cR", name_en="Rings", name_ar="", slug="rings"))
+    await db.flush()
+    r = await client.post("/api/products", json={
+        "name_en": "Ring", "name_ar": "", "category": "Rings", "category_id": "cR",
+        "karat": "K18", "weight_grams": "5", "margin_percent": "15", "making_charge": "20",
+    })
+    assert r.status_code in (200, 201), r.text
+    assert r.json()["category_id"] == "cR"
+    assert (await client.get("/api/products?category_id=cR")).json()["total"] == 1

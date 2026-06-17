@@ -77,6 +77,7 @@ async def create_product(
         name_en=body.name_en,
         name_ar=body.name_ar,
         category=body.category,
+        category_id=body.category_id,
         karat=Karat(body.karat),
         weight_grams=body.weight_grams,
         margin_percent=body.margin_percent,
