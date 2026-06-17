@@ -11,11 +11,12 @@ from app.core.ledger import (
     EVENT_PRODUCT_CREATED,
     EVENT_PRODUCT_UPDATED,
     EVENT_PRODUCT_DELETED,
+    EVENT_PRODUCT_HARD_DELETED,
 )
 from app.core.permissions import require_admin
 from app.core.pricing import KARAT_PURITY, calculate_price, generate_item_code
 from app.deps import get_current_user, get_db
-from app.models import Karat, Product, ProductStatus, Settings, User
+from app.models import Karat, OrderItem, Product, ProductStatus, Settings, SupplierPurchaseItem, User, WalkinBuyback
 from app.schemas.product import (
     ProductCreate, ProductListOut, ProductLookupOut, ProductOut, ProductUpdate,
 )
@@ -228,12 +229,53 @@ async def toggle_status(
 @router.delete("/{product_id}", status_code=204)
 async def delete_product(
     product_id: str,
+    hard: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
     product = (await db.execute(select(Product).where(Product.id == product_id))).scalar_one_or_none()
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
+
+    if hard:
+        # Reference guard: count rows in all three tables that FK to this product.
+        order_item_count = (await db.execute(
+            select(func.count()).select_from(OrderItem).where(OrderItem.product_id == product_id)
+        )).scalar_one()
+        buyback_count = (await db.execute(
+            select(func.count()).select_from(WalkinBuyback).where(WalkinBuyback.product_id == product_id)
+        )).scalar_one()
+        purchase_item_count = (await db.execute(
+            select(func.count()).select_from(SupplierPurchaseItem).where(SupplierPurchaseItem.product_id == product_id)
+        )).scalar_one()
+
+        if order_item_count or buyback_count or purchase_item_count:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot permanently delete: this product has sales/buyback/purchase history. Deactivate it instead.",
+            )
+
+        # Audit first, then delete — one transaction.
+        await record(
+            db,
+            event_type=EVENT_PRODUCT_HARD_DELETED,
+            actor_user_id=user.id,
+            ref_type="product",
+            ref_id=product.id,
+            payload={
+                "code": product.code,
+                "name_en": product.name_en,
+                "karat": product.karat.value,
+                "weight_grams": str(product.weight_grams),
+                "category": product.category,
+                "category_id": product.category_id,
+            },
+        )
+        await db.delete(product)
+        await db.commit()
+        return
+
+    # Soft-delete (existing behaviour unchanged).
     product.is_active = False
     await db.flush()
     await record(
