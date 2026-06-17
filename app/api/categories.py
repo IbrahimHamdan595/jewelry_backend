@@ -1,16 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ledger import (
     EVENT_CATEGORY_CREATED,
     EVENT_CATEGORY_DELETED,
+    EVENT_CATEGORY_HARD_DELETED,
     EVENT_CATEGORY_UPDATED,
     record,
 )
 from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db
-from app.models import Category, User
+from app.models import Category, Product, User
 from app.schemas.category import CategoryCreate, CategoryOut, CategoryUpdate
 
 router = APIRouter(prefix="/categories", tags=["categories"])
@@ -83,12 +84,43 @@ async def update_category(
 @router.delete("/{category_id}", status_code=204)
 async def delete_category(
     category_id: str,
+    hard: bool = False,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
     cat = (await db.execute(select(Category).where(Category.id == category_id))).scalar_one_or_none()
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
+
+    if hard:
+        product_count = (await db.execute(
+            select(func.count()).select_from(Product).where(Product.category_id == category_id)
+        )).scalar_one()
+
+        if product_count:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot permanently delete: this category is used by products. Reassign or deactivate instead.",
+            )
+
+        # Audit first, then delete — one transaction.
+        await record(
+            db,
+            event_type=EVENT_CATEGORY_HARD_DELETED,
+            actor_user_id=user.id,
+            ref_type="category",
+            ref_id=cat.id,
+            payload={
+                "name_en": cat.name_en,
+                "name_ar": cat.name_ar,
+                "slug": cat.slug,
+            },
+        )
+        await db.delete(cat)
+        await db.commit()
+        return
+
+    # Soft-delete (existing behaviour unchanged).
     cat.is_active = False
     await db.flush()
     await record(
