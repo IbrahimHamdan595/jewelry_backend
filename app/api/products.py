@@ -27,6 +27,7 @@ router = APIRouter(prefix="/products", tags=["products"])
 async def list_products(
     search: str = "",
     category: str = "",
+    category_id: str = "",
     karat: str = "",
     status: str = "",
     page: int = Query(1, ge=1),
@@ -41,6 +42,8 @@ async def list_products(
         )
     if category:
         q = q.where(Product.category == category)
+    if category_id:
+        q = q.where(Product.category_id == category_id)
     if karat:
         q = q.where(Product.karat == karat)
     if status == "active":
