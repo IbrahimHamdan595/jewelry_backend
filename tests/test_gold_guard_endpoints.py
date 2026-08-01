@@ -1,4 +1,4 @@
-"""Integration: the stale-rate guard on the sale endpoint.
+"""Integration: the stale-rate guard on the sale and buyback endpoints.
 
 The point of these tests is the SIDE EFFECT, not the status code. A guard that
 returns 409 after already writing an Order row would be worse than no guard, so
@@ -17,8 +17,19 @@ import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from app.api.buybacks import create_buyback
 from app.api.orders import create_order
-from app.models import GoldRateHistory, InventoryLedger, Karat, Order, Product, Settings, User
+from app.models import (
+    GoldRateHistory,
+    InventoryLedger,
+    Karat,
+    Order,
+    Product,
+    Settings,
+    User,
+    WalkinBuyback,
+)
+from app.schemas.buyback import BuybackCreate
 from app.schemas.gold_rate import StaleRateAck
 from app.schemas.order import CheckoutRequest, OrderItemIn
 
@@ -133,10 +144,20 @@ async def test_stale_sale_with_matching_ack_completes_and_records_one_row(
 ):
     """The whole point of the task: the sale lands, and its justification row
     lands with it, in the same chain."""
+    cashier_id = cashier.id  # read before the rollback below expires the object
+
     ack = StaleRateAck(rate_fetched_at=STALE_FETCHED_AT)
     out = await create_order(_checkout(ack), db=db, user=cashier)
 
     assert out.id
+
+    # Assert against COMMITTED state only. create_order commits internally, so
+    # anything still pending here was written outside its transaction. Without
+    # this rollback the assertions below would also pass for an ack row appended
+    # *after* db.commit() — it would sit uncommitted in this very session and
+    # still be visible to these queries.
+    await db.rollback()
+
     rows = (
         await db.execute(
             select(InventoryLedger).where(
@@ -147,7 +168,7 @@ async def test_stale_sale_with_matching_ack_completes_and_records_one_row(
     assert len(rows) == 1
     assert rows[0].ref_type == "order"
     assert rows[0].ref_id == out.id
-    assert rows[0].actor_user_id == cashier.id
+    assert rows[0].actor_user_id == cashier_id
     assert rows[0].payload["context"] == "ORDER"
 
     # Chained to the SALE row, not merely present. `prev_hash and entry_hash !=
@@ -195,10 +216,6 @@ async def test_unnecessary_ack_on_a_fresh_rate_writes_no_row(
 
 # ── Buybacks ─────────────────────────────────────────────────────────────────
 
-from app.api.buybacks import create_buyback  # noqa: E402
-from app.models import WalkinBuyback  # noqa: E402
-from app.schemas.buyback import BuybackCreate  # noqa: E402
-
 
 def _buyback(ack=None):
     """PURE_GOLD with a manual price — the cheapest complete path.
@@ -208,9 +225,10 @@ def _buyback(ack=None):
     default Settings row. The handler creates its own GoldLot, so no lot fixture.
 
     NOT using USED_PRODUCT despite it being simpler: `_create_used_product_buyback`
-    references an undefined `cfg` at buybacks.py:472 (its signature takes no `cfg`),
-    so that kind raises NameError before it ever commits. Pre-existing bug, out of
-    scope — see the note at the end of this task.
+    passes an undefined `cfg` to `gl_postings.post_buyback` (its signature never
+    receives one), so that kind raises NameError before it ever commits. That is a
+    pre-existing bug, deliberately left unfixed here so it is not buried inside a
+    feature commit; `test_used_product_buyback_records_the_ack` below pins it.
     """
     return BuybackCreate(
         seller_name="Walk-in Seller",
@@ -276,7 +294,9 @@ async def test_stale_buyback_with_ack_completes_and_records_one_chained_row(
     assert rows[0].actor_user_id == cashier_id
     assert rows[0].payload["context"] == "BUYBACK"
     assert rows[0].payload["rate_24k"] == "84.31"
-    assert rows[0].payload["age_minutes"] >= 179
+    # Bounded on both sides: `>= 179` alone would also accept a unit bug that
+    # reported 10800 seconds.
+    assert 179 <= rows[0].payload["age_minutes"] <= 181
 
     # Chained to the buyback's own ledger row, not merely present. Asserting
     # `prev_hash` is truthy would be vacuous — it is non-nullable and seeded to
@@ -352,3 +372,49 @@ async def test_ack_row_rolls_back_with_the_buyback(
         )
     ).scalar()
     assert acks == 0
+
+
+@pytest.mark.xfail(
+    raises=NameError,
+    strict=True,
+    reason=(
+        "pre-existing bug: _create_used_product_buyback passes an undefined cfg to "
+        "gl_postings.post_buyback. When that is fixed this test XPASSes and strict=True "
+        "turns it into a failure — remove the marker and confirm the ack row lands."
+    ),
+)
+@pytest.mark.asyncio
+async def test_used_product_buyback_records_the_ack(
+    db, stale_rate, cashier, settings_row
+):
+    """USED_PRODUCT is wired identically to the other kinds but unreachable today."""
+    body = BuybackCreate(
+        seller_name="Walk-in Seller",
+        seller_phone="+96170000000",
+        kind="USED_PRODUCT",
+        karat="K21",
+        weight_grams=Decimal("10"),
+        manual_price=Decimal("500"),
+        stale_rate_ack=StaleRateAck(rate_fetched_at=STALE_FETCHED_AT),
+    )
+    receipt = await create_buyback(body, db=db, user=cashier)
+
+    assert receipt.id
+
+    # Committed state only — see the sibling PURE_GOLD test for why.
+    await db.rollback()
+
+    assert (
+        await db.execute(select(func.count()).select_from(WalkinBuyback))
+    ).scalar() == 1
+
+    rows = (
+        await db.execute(
+            select(InventoryLedger)
+            .where(InventoryLedger.event_type == "SALE_ON_STALE_RATE_ACK")
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].ref_type == "walkin_buyback"
+    assert rows[0].ref_id == receipt.id
+    assert rows[0].payload["context"] == "BUYBACK"
