@@ -91,9 +91,9 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
     age = _age_minutes(fetched_at)
 
     # Rule (3), spec §3.1 — stale and unacknowledged. The body must carry
-    # everything a client needs
-    # to render the confirmation, because a stale browser tab (or any non-POS API
-    # consumer) hits this without ever having seen the banner.
+    # everything a client needs to render the confirmation, because a stale
+    # browser tab (or any non-POS API consumer) hits this without ever having
+    # seen the banner.
     if ack is None:
         raise HTTPException(
             status_code=409,
@@ -110,9 +110,8 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
         )
 
     # Rule (4), spec §3.1 — acknowledged, but not the rate we are about to
-    # charge. The feed
-    # recovered between the dialog and the submit, or the tab is stale. Either
-    # way the cashier confirmed a different number.
+    # charge. The feed recovered between the dialog and the submit, or the tab
+    # is stale. Either way the cashier confirmed a different number.
     #
     # Tolerance, not identity. Postgres stores microseconds (server_default=
     # now()); JS Date — and most client date libraries — are millisecond-
