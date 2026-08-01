@@ -18,8 +18,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.api.orders import create_order
-from app.core.gold_guard import StaleRateAck
 from app.models import GoldRateHistory, InventoryLedger, Karat, Order, Product, Settings, User
+from app.schemas.gold_rate import StaleRateAck
 from app.schemas.order import CheckoutRequest, OrderItemIn
 
 STALE_FETCHED_AT = datetime.now(timezone.utc) - timedelta(hours=3)
@@ -183,6 +183,167 @@ async def test_unnecessary_ack_on_a_fresh_rate_writes_no_row(
     out = await create_order(_checkout(ack), db=db, user=cashier)
 
     assert out.id
+    acks = (
+        await db.execute(
+            select(func.count())
+            .select_from(InventoryLedger)
+            .where(InventoryLedger.event_type == "SALE_ON_STALE_RATE_ACK")
+        )
+    ).scalar()
+    assert acks == 0
+
+
+# ── Buybacks ─────────────────────────────────────────────────────────────────
+
+from app.api.buybacks import create_buyback  # noqa: E402
+from app.models import WalkinBuyback  # noqa: E402
+from app.schemas.buyback import BuybackCreate  # noqa: E402
+
+
+def _buyback(ack=None):
+    """PURE_GOLD with a manual price — the cheapest complete path.
+
+    `manual_price` makes _resolve_margin return MANUAL, so no Settings margin
+    defaults are needed, and post_buyback no-ops because auto-posting is off on a
+    default Settings row. The handler creates its own GoldLot, so no lot fixture.
+
+    NOT using USED_PRODUCT despite it being simpler: `_create_used_product_buyback`
+    references an undefined `cfg` at buybacks.py:472 (its signature takes no `cfg`),
+    so that kind raises NameError before it ever commits. Pre-existing bug, out of
+    scope — see the note at the end of this task.
+    """
+    return BuybackCreate(
+        seller_name="Walk-in Seller",
+        seller_phone="+96170000000",
+        kind="PURE_GOLD",
+        karat="K21",
+        weight_grams=Decimal("10"),
+        manual_price=Decimal("500"),
+        stale_rate_ack=ack,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_buyback_without_ack_is_rejected_and_writes_nothing(
+    db, stale_rate, cashier, settings_row
+):
+    with pytest.raises(HTTPException) as exc:
+        await create_buyback(_buyback(), db=db, user=cashier)
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "STALE_RATE_ACK_REQUIRED"
+    assert (
+        await db.execute(select(func.count()).select_from(WalkinBuyback))
+    ).scalar() == 0
+    assert (
+        await db.execute(select(func.count()).select_from(InventoryLedger))
+    ).scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_buyback_with_ack_completes_and_records_one_chained_row(
+    db, stale_rate, cashier, settings_row
+):
+    """The whole design in one test: the buyback lands, and its justification
+    row lands with it, in the same chain."""
+    cashier_id = cashier.id  # read before the rollback below expires the object
+
+    ack = StaleRateAck(rate_fetched_at=STALE_FETCHED_AT)
+    receipt = await create_buyback(_buyback(ack), db=db, user=cashier)
+
+    assert receipt.id
+
+    # Assert against COMMITTED state only. The handler commits internally, so
+    # anything still pending here was written outside its transaction. Without
+    # this rollback the assertions below would also pass for an ack row appended
+    # *after* db.commit() — it would sit unflushed/uncommitted in this very
+    # session and still be visible to these queries.
+    await db.rollback()
+
+    assert (
+        await db.execute(select(func.count()).select_from(WalkinBuyback))
+    ).scalar() == 1
+
+    rows = (
+        await db.execute(
+            select(InventoryLedger)
+            .where(InventoryLedger.event_type == "SALE_ON_STALE_RATE_ACK")
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].ref_type == "walkin_buyback"
+    assert rows[0].ref_id == receipt.id
+    assert rows[0].actor_user_id == cashier_id
+    assert rows[0].payload["context"] == "BUYBACK"
+    assert rows[0].payload["rate_24k"] == "84.31"
+    assert rows[0].payload["age_minutes"] >= 179
+
+    # Chained to the buyback's own ledger row, not merely present. Asserting
+    # `prev_hash` is truthy would be vacuous — it is non-nullable and seeded to
+    # GENESIS.
+    buyback_row = (
+        await db.execute(
+            select(InventoryLedger)
+            .where(InventoryLedger.event_type == "BUYBACK_PURE_GOLD")
+        )
+    ).scalar_one()
+    assert rows[0].prev_hash == buyback_row.entry_hash
+
+
+@pytest.mark.asyncio
+async def test_unnecessary_ack_on_a_fresh_buyback_writes_no_row(
+    db, cashier, settings_row
+):
+    """A client that always attaches an ack must not pollute the audit trail."""
+    fresh = GoldRateHistory(
+        id="fresh-2",
+        rate_24k=Decimal("84.31"),
+        source="live",
+        fetched_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db.add(fresh)
+    await db.commit()
+
+    ack = StaleRateAck(rate_fetched_at=datetime.now(timezone.utc))
+    receipt = await create_buyback(_buyback(ack), db=db, user=cashier)
+    assert receipt.id
+
+    acks = (
+        await db.execute(
+            select(func.count())
+            .select_from(InventoryLedger)
+            .where(InventoryLedger.event_type == "SALE_ON_STALE_RATE_ACK")
+        )
+    ).scalar()
+    assert acks == 0
+
+
+@pytest.mark.asyncio
+async def test_ack_row_rolls_back_with_the_buyback(
+    db, stale_rate, cashier, settings_row, monkeypatch
+):
+    """The reason the ack is recorded INSIDE the handler, not after it.
+
+    Inject a failure between the ack row and the commit. Neither the buyback nor
+    its justification row may survive — a committed sale with no justification is
+    exactly the state the hash chain exists to make impossible.
+    """
+    from app.api import buybacks as buybacks_module
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure before commit")
+
+    monkeypatch.setattr(buybacks_module.gl_postings, "post_buyback", boom)
+
+    ack = StaleRateAck(rate_fetched_at=STALE_FETCHED_AT)
+    with pytest.raises(RuntimeError):
+        await create_buyback(_buyback(ack), db=db, user=cashier)
+
+    await db.rollback()
+
+    assert (
+        await db.execute(select(func.count()).select_from(WalkinBuyback))
+    ).scalar() == 0
     acks = (
         await db.execute(
             select(func.count())
