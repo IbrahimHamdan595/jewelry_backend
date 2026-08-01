@@ -103,9 +103,10 @@ R2_BUCKET_NAME="..."
 R2_PUBLIC_URL="https://pub-....r2.dev"
 
 # Discord webhook (gold-rate poller alerts + reconcile drift alerts)
+# GOLD_ALERT_FAILURE_THRESHOLD lives in the Gold rate block above — it gates the
+# Discord alert AND the market_closed threshold. See "Gold rate staleness".
 DISCORD_WEBHOOK_URL="..."
 DISCORD_ALERT_USER_ID="..."
-GOLD_ALERT_FAILURE_THRESHOLD=3
 
 # Auth audit (default 540 days = 18 months)
 AUTH_AUDIT_RETENTION_DAYS=540
