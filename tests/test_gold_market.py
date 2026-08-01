@@ -77,3 +77,37 @@ async def test_6_4b_history_derives_for_legacy_null_rows(db):
     points = await history(range="24h", db=db)
     p = next(x for x in points if x.rate_24k == 100.0)
     assert p.rate_21k == 87.5  # derived fallback
+
+
+# ── Shop-tuned thresholds (GOLD_REFRESH_MINUTES=10, FAILURE_THRESHOLD=2) ──────
+# Warn at 10 min, require sale acknowledgement at 20 min. These pin the
+# derivation in gold_api.py so a future config change cannot silently move the
+# point at which the till starts demanding a confirmation.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "age_minutes,expect_stale,expect_closed",
+    [
+        (9, False, False),   # fresh
+        (11, True, False),   # warn only — amber strip, no friction
+        (21, True, True),    # acknowledgement required
+    ],
+)
+async def test_shop_tuned_staleness_boundaries(
+    db, monkeypatch, age_minutes, expect_stale, expect_closed
+):
+    from app.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "gold_refresh_minutes", 10)
+    monkeypatch.setattr(app_settings, "gold_alert_failure_threshold", 2)
+
+    row = GoldRateHistory(
+        id=f"age-{age_minutes}", rate_24k=Decimal("100"), source="live",
+        fetched_at=datetime.now(timezone.utc) - timedelta(minutes=age_minutes),
+    )
+    db.add(row)
+    await db.commit()
+
+    info = await get_current_gold_rate(db)
+    assert info["is_stale"] is expect_stale
+    assert info["market_closed"] is expect_closed
