@@ -104,8 +104,11 @@ async def test_stale_sale_without_ack_is_rejected_and_writes_nothing(
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "STALE_RATE_ACK_REQUIRED"
 
-    # The guard must fire BEFORE any row is built.
+    # The guard must fire BEFORE any row is built — order OR ledger.
     assert (await db.execute(select(func.count()).select_from(Order))).scalar() == 0
+    assert (
+        await db.execute(select(func.count()).select_from(InventoryLedger))
+    ).scalar() == 0
 
 
 @pytest.mark.asyncio
@@ -116,8 +119,12 @@ async def test_stale_sale_with_mismatched_ack_is_rejected(
     with pytest.raises(HTTPException) as exc:
         await create_order(_checkout(wrong), db=db, user=cashier)
 
+    assert exc.value.status_code == 409
     assert exc.value.detail["code"] == "STALE_RATE_ACK_MISMATCH"
     assert (await db.execute(select(func.count()).select_from(Order))).scalar() == 0
+    assert (
+        await db.execute(select(func.count()).select_from(InventoryLedger))
+    ).scalar() == 0
 
 
 @pytest.mark.asyncio
@@ -142,7 +149,18 @@ async def test_stale_sale_with_matching_ack_completes_and_records_one_row(
     assert rows[0].ref_id == out.id
     assert rows[0].actor_user_id == cashier.id
     assert rows[0].payload["context"] == "ORDER"
-    assert rows[0].prev_hash and rows[0].entry_hash != rows[0].prev_hash
+
+    # Chained to the SALE row, not merely present. `prev_hash and entry_hash !=
+    # prev_hash` would be vacuous: prev_hash is non-nullable and seeded to
+    # GENESIS, and entry_hash is a sha256 over content including prev_hash, so
+    # they can never be equal. Asserting the actual link is what catches the ack
+    # row being appended somewhere it can be detached from the sale.
+    sale_row = (
+        await db.execute(
+            select(InventoryLedger).where(InventoryLedger.event_type == "SALE_PRODUCT")
+        )
+    ).scalar_one()
+    assert rows[0].prev_hash == sale_row.entry_hash
 
 
 @pytest.mark.asyncio
