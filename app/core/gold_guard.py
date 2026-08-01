@@ -91,7 +91,8 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
     fetched_at = _as_utc(rate_info["fetched_at"])
     age = _age_minutes(fetched_at)
 
-    # (3) Stale and unacknowledged. The body must carry everything a client needs
+    # Rule (3), spec §3.1 — stale and unacknowledged. The body must carry
+    # everything a client needs
     # to render the confirmation, because a stale browser tab (or any non-POS API
     # consumer) hits this without ever having seen the banner.
     if ack is None:
@@ -109,7 +110,8 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
             },
         )
 
-    # (4) Acknowledged, but not the rate we are about to charge. The feed
+    # Rule (4), spec §3.1 — acknowledged, but not the rate we are about to
+    # charge. The feed
     # recovered between the dialog and the submit, or the tab is stale. Either
     # way the cashier confirmed a different number.
     #

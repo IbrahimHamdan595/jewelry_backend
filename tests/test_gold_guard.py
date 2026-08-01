@@ -90,8 +90,8 @@ def test_ack_in_a_different_offset_compares_equal():
 def test_ack_truncated_to_milliseconds_still_matches():
     """Postgres stores microseconds; JS Date truncates to milliseconds. The ack
     must survive that round-trip or the till hard-blocks for the whole outage."""
-    precise = datetime(2026, 8, 1, 9, 12, 0, 123456, tzinfo=timezone.utc)
-    truncated = datetime(2026, 8, 1, 9, 12, 0, 123000, tzinfo=timezone.utc)
+    precise = _FETCHED_AT.replace(microsecond=123456)
+    truncated = precise.replace(microsecond=123000)
     info = _rate_info(market_closed=True, fetched_at=precise)
     assert_rate_acceptable(info, StaleRateAck(rate_fetched_at=truncated))  # must not raise
 
