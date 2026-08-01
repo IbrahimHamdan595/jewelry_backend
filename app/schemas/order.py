@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
-from app.core.gold_guard import StaleRateAck
+from app.schemas.gold_rate import StaleRateAck
 
 
 class OrderItemIn(BaseModel):
@@ -30,7 +30,7 @@ class CheckoutRequest(BaseModel):
     # Phase 2 — order-level discount %. Server rejects > Settings.max_discount_percent.
     discount_percent: Decimal = Decimal("0")
     # Cashier's explicit acceptance of a market_closed gold rate. Optional: only
-    # required when the server flags the rate stale (app/core/gold_guard.py).
+    # required when the server flags the rate `market_closed` (app/core/gold_guard.py).
     stale_rate_ack: StaleRateAck | None = None
 
 

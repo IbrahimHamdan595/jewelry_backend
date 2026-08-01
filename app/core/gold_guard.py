@@ -29,21 +29,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ledger import EVENT_SALE_ON_STALE_RATE_ACK, record
+# StaleRateAck is a request DTO; its layer-consistent home is app/schemas/. Kept
+# importable from here too so existing `from app.core.gold_guard import
+# StaleRateAck` call sites (and tests) keep working.
+from app.schemas.gold_rate import StaleRateAck
+
+__all__ = ["StaleRateAck", "assert_rate_acceptable", "record_stale_rate_ack"]
 
 # Tolerance for comparing an ack's timestamp to the rate's `fetched_at`. See
 # the mismatch check in assert_rate_acceptable for why this isn't exact
 # equality.
 _ACK_TOLERANCE = timedelta(seconds=1)
-
-
-class StaleRateAck(BaseModel):
-    """A cashier's explicit acceptance of one specific stale rate."""
-
-    rate_fetched_at: datetime
 
 
 def _as_utc(value: datetime) -> datetime:

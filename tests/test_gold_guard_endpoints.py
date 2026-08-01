@@ -1,4 +1,4 @@
-"""Integration: the stale-rate guard on the two money-moving endpoints.
+"""Integration: the stale-rate guard on the sale endpoint.
 
 The point of these tests is the SIDE EFFECT, not the status code. A guard that
 returns 409 after already writing an Order row would be worse than no guard, so
@@ -19,17 +19,13 @@ from sqlalchemy import func, select
 
 from app.api.orders import create_order
 from app.core.gold_guard import StaleRateAck
-from app.models import GoldRateHistory, InventoryLedger, Order, Settings, User
+from app.models import GoldRateHistory, InventoryLedger, Karat, Order, Product, Settings, User
 from app.schemas.order import CheckoutRequest, OrderItemIn
 
 STALE_FETCHED_AT = datetime.now(timezone.utc) - timedelta(hours=3)
 
 
-# NOTE: async fixtures MUST use @pytest_asyncio.fixture, not @pytest.fixture.
-# pytest-asyncio runs in strict mode here (1.x), where a plain @pytest.fixture
-# async function is never awaited — the test receives a coroutine object and
-# fails with a confusing AttributeError. tests/conftest.py uses the same
-# decorator for its `db` fixture.
+# Async fixtures need @pytest_asyncio.fixture (strict mode) — see conftest.py.
 @pytest_asyncio.fixture
 async def stale_rate(db):
     """A rate old enough that get_current_gold_rate flags market_closed."""
@@ -67,6 +63,29 @@ async def settings_row(db):
     return cfg
 
 
+@pytest_asyncio.fixture
+async def product(db):
+    """Minimal sellable product so a checkout can actually complete.
+
+    Without this every test aborts in _checkout_product_line and never reaches
+    the audit-row wiring this task exists to add.
+    """
+    p = Product(
+        id="p-1",
+        code="TEST-001",
+        name_en="Test Ring",
+        category="RING",
+        karat=Karat.K21,
+        weight_grams=Decimal("5"),
+        margin_percent=Decimal("10"),
+        making_charge=Decimal("0"),
+        on_hand_qty=5,
+    )
+    db.add(p)
+    await db.commit()
+    return p
+
+
 def _checkout(ack=None):
     return CheckoutRequest(
         items=[OrderItemIn(item_kind="PRODUCT", product_id="p-1", quantity=1)],
@@ -77,7 +96,7 @@ def _checkout(ack=None):
 
 @pytest.mark.asyncio
 async def test_stale_sale_without_ack_is_rejected_and_writes_nothing(
-    db, stale_rate, cashier, settings_row
+    db, stale_rate, cashier, settings_row, product
 ):
     with pytest.raises(HTTPException) as exc:
         await create_order(_checkout(), db=db, user=cashier)
@@ -91,7 +110,7 @@ async def test_stale_sale_without_ack_is_rejected_and_writes_nothing(
 
 @pytest.mark.asyncio
 async def test_stale_sale_with_mismatched_ack_is_rejected(
-    db, stale_rate, cashier, settings_row
+    db, stale_rate, cashier, settings_row, product
 ):
     wrong = StaleRateAck(rate_fetched_at=STALE_FETCHED_AT + timedelta(minutes=7))
     with pytest.raises(HTTPException) as exc:
@@ -102,8 +121,37 @@ async def test_stale_sale_with_mismatched_ack_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_ack_is_not_recorded_when_the_rate_is_fresh(db, cashier, settings_row):
-    """No ack required, no audit noise. Normal trading adds zero extra rows."""
+async def test_stale_sale_with_matching_ack_completes_and_records_one_row(
+    db, stale_rate, cashier, settings_row, product
+):
+    """The whole point of the task: the sale lands, and its justification row
+    lands with it, in the same chain."""
+    ack = StaleRateAck(rate_fetched_at=STALE_FETCHED_AT)
+    out = await create_order(_checkout(ack), db=db, user=cashier)
+
+    assert out.id
+    rows = (
+        await db.execute(
+            select(InventoryLedger).where(
+                InventoryLedger.event_type == "SALE_ON_STALE_RATE_ACK"
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].ref_type == "order"
+    assert rows[0].ref_id == out.id
+    assert rows[0].actor_user_id == cashier.id
+    assert rows[0].payload["context"] == "ORDER"
+    assert rows[0].prev_hash and rows[0].entry_hash != rows[0].prev_hash
+
+
+@pytest.mark.asyncio
+async def test_unnecessary_ack_on_a_fresh_rate_writes_no_row(
+    db, cashier, settings_row, product
+):
+    """A client that always attaches an ack must not pollute the audit trail —
+    otherwise 'cashier knowingly traded on an old price' becomes indistinguishable
+    from routine noise."""
     fresh = GoldRateHistory(
         id="fresh-1",
         rate_24k=Decimal("84.31"),
@@ -113,13 +161,10 @@ async def test_ack_is_not_recorded_when_the_rate_is_fresh(db, cashier, settings_
     db.add(fresh)
     await db.commit()
 
-    with pytest.raises(HTTPException) as exc:
-        await create_order(_checkout(), db=db, user=cashier)
-    # Fails on the missing product, NOT on the guard — proves the guard let it through.
-    # (_checkout_product_line raises 400 "Invalid product ..." for a missing/
-    # inactive product, not 404 — confirmed by reading app/api/orders.py.)
-    assert exc.value.status_code == 400
+    ack = StaleRateAck(rate_fetched_at=datetime.now(timezone.utc))
+    out = await create_order(_checkout(ack), db=db, user=cashier)
 
+    assert out.id
     acks = (
         await db.execute(
             select(func.count())

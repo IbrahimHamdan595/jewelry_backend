@@ -34,3 +34,9 @@ class OverrideRequest(BaseModel):
     # Short minimum stops empty / whitespace-only submissions; cap is just
     # to keep the payload reasonable.
     reason: str = Field(min_length=3, max_length=500)
+
+
+class StaleRateAck(BaseModel):
+    """A cashier's explicit acceptance of one specific stale rate."""
+
+    rate_fetched_at: datetime
