@@ -14,17 +14,30 @@ a busy counter until the admin is reachable. A confirmation keeps the shop
 trading and leaves a signed, hash-chained record of who chose to trade on an old
 price.
 
-The ack carries a timestamp rather than a boolean on purpose: a boolean can be
-hardcoded `true` by a client forever, and the resulting audit row would prove
-nothing.
+The ack carries a timestamp rather than a boolean on purpose. A boolean can be
+hardcoded `true` by a client forever; a timestamp at least stops being valid the
+moment the feed recovers, and it pins each audit row to the exact price that was
+accepted. It does not prove a human looked — nothing at this layer can.
+
+NOTE: `detail` here is a dict, not the plain string used by the other ~100
+HTTPException sites in this codebase — a client needs `code` and
+`rate_fetched_at` to render the confirmation. `frontend/src/lib/api-client.ts`
+is updated (later task) to preserve structured detail; it previously stringified
+it, which would render as "[object Object]".
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ledger import EVENT_SALE_ON_STALE_RATE_ACK, record
+
+# Tolerance for comparing an ack's timestamp to the rate's `fetched_at`. See
+# the mismatch check in assert_rate_acceptable for why this isn't exact
+# equality.
+_ACK_TOLERANCE = timedelta(seconds=1)
 
 
 class StaleRateAck(BaseModel):
@@ -46,24 +59,33 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _age_minutes(fetched_at: datetime) -> int:
-    return int((datetime.now(timezone.utc) - fetched_at).total_seconds() // 60)
+    """Whole minutes since the rate was fetched, floored at 0.
+
+    Clamped because app-vs-DB clock skew can put a DB-side now() timestamp in the
+    future, and "(-90 minutes ago)" is not something to show a cashier.
+    """
+    seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+    return max(0, int(seconds // 60))
+
+
+def _requires_ack(rate_info: dict) -> bool:
+    """True when this rate may only be traded on with an explicit acknowledgement.
+
+    An active override is a deliberate, admin-set, already-audited price — stated
+    explicitly rather than relying on get_current_gold_rate continuing to set
+    market_closed=False for overrides.
+    """
+    if rate_info.get("source") == "override":
+        return False
+    return bool(rate_info.get("market_closed"))
 
 
 def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
-    """Raise 409 unless it is safe — or explicitly accepted — to trade on this rate.
-
-    Returns None and lets the caller proceed unchanged. This is a gate, not a
-    transform.
-    """
-    # (1) An active override is a deliberate, admin-set, already-audited price.
-    # Redundant with (2) today, because the override branch of
-    # get_current_gold_rate also sets market_closed=False — stated explicitly so
-    # the shop's offline escape hatch does not depend on that staying true.
-    if rate_info.get("source") == "override":
-        return
-
-    # (2) The normal case: rate is fresh enough to trade on unchallenged.
-    if not rate_info.get("market_closed"):
+    """Raise 409 unless it is safe — or explicitly accepted — to trade on this rate."""
+    # `rate` and `fetched_at` are contractually always present (non-nullable
+    # columns); the flags are treated as optional here, matching
+    # gold_price.py:35's `info.get("market_closed", False)`.
+    if not _requires_ack(rate_info):
         return
 
     fetched_at = _as_utc(rate_info["fetched_at"])
@@ -90,7 +112,14 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
     # (4) Acknowledged, but not the rate we are about to charge. The feed
     # recovered between the dialog and the submit, or the tab is stale. Either
     # way the cashier confirmed a different number.
-    if _as_utc(ack.rate_fetched_at) != fetched_at:
+    #
+    # Tolerance, not identity. Postgres stores microseconds (server_default=
+    # now()); JS Date — and most client date libraries — are millisecond-
+    # precision, so a round-tripped timestamp loses digits and would never
+    # match. Rates are at least 10 minutes apart, so a 1s window still pins
+    # the ack to exactly one rate, while a strict compare would hard-block the
+    # till for the whole outage with a 409 no cashier could clear.
+    if abs(_as_utc(ack.rate_fetched_at) - fetched_at) >= _ACK_TOLERANCE:
         raise HTTPException(
             status_code=409,
             detail={
@@ -113,17 +142,23 @@ async def record_stale_rate_ack(
     rate_info: dict,
     ref_type: str,
     ref_id: str,
-    context: str,
+    context: Literal["ORDER", "BUYBACK"],
     ack: StaleRateAck | None,
 ) -> None:
-    """Append the SALE_ON_STALE_RATE_ACK ledger row. No-op when `ack` is None.
+    """Append the SALE_ON_STALE_RATE_ACK ledger row.
+
+    No-op unless an ack was actually required and supplied — a client that
+    attaches an ack unconditionally (e.g. to never show the dialog twice) must
+    not pollute the ledger with a row on every ordinary fresh-rate or
+    admin-override sale. That would make the event useless to an auditor
+    trying to find the sales that actually traded on a stale price.
 
     Does NOT commit — the row must land in the caller's transaction so it is
     atomic with the order/buyback it justifies. A committed sale with no
     justification row is exactly the state the hash chain exists to make
     impossible.
     """
-    if ack is None:
+    if ack is None or not _requires_ack(rate_info):
         return
 
     fetched_at = _as_utc(rate_info["fetched_at"])
