@@ -418,3 +418,14 @@ async def test_used_product_buyback_records_the_ack(
     assert rows[0].ref_type == "walkin_buyback"
     assert rows[0].ref_id == receipt.id
     assert rows[0].payload["context"] == "BUYBACK"
+
+    # Chained, not merely present — the property the feature actually guarantees.
+    # Written now so whoever fixes `cfg` inherits the full assertion rather than
+    # a weaker one; it does not execute until this test stops xfailing.
+    buyback_row = (
+        await db.execute(
+            select(InventoryLedger)
+            .where(InventoryLedger.event_type == "BUYBACK_USED_PRODUCT")
+        )
+    ).scalar_one()
+    assert rows[0].prev_hash == buyback_row.entry_hash
