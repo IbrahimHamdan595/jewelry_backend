@@ -1,4 +1,5 @@
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.core.coa_seed import seed_chart_of_accounts
@@ -67,20 +68,6 @@ async def _seeded(db):
     await seed_chart_of_accounts(db)
     db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
     await db.flush()
-
-
-async def _seed_current_period(db):
-    """Open the period the *reversal* lands in.
-
-    Voids/refunds are stamped date.today() by design (gl_postings.py:203/254),
-    and gl.post_entry hard-fails on a month with no open period. The sale itself
-    is pinned to June 2026, so today's month has to be opened separately. Guarded
-    so the row isn't duplicated when the clock happens to sit inside June 2026.
-    """
-    today = date.today()
-    if (today.year, today.month) != (2026, 6):
-        db.add(GLPeriod(year=today.year, period_no=today.month, status=PeriodStatus.OPEN))
-        await db.flush()
 
 
 def _settings(on=True):
@@ -152,7 +139,6 @@ from app.core.gl_postings import post_order_refund
 @pytest.mark.asyncio
 async def test_full_void_reverses_sale(db):
     await _seeded(db)
-    await _seed_current_period(db)
     order = await _make_order(db)
     await gl_postings_post_sale(db, order, _settings(on=True), "u1")
     rev = await post_order_refund(db, order, _settings(on=True), "u1", refunded_item=None)
@@ -175,9 +161,82 @@ async def test_full_void_flag_off_noop(db):
 
 
 @pytest.mark.asyncio
+async def test_void_opens_the_current_period_if_missing(db):
+    """Reversals are stamped today and can land in a month with no period row.
+
+    Every other posting path auto-opens a missing month; this one used to 422,
+    making the first void of a new month fail while an identical sale succeeded.
+    NOTE: deliberately does NOT call _seed_current_period — that workaround is
+    what this fix removes the need for.
+    """
+    await _seeded(db)
+    order = await _make_order(db)
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+
+    rev = await post_order_refund(db, order, _settings(on=True), "u1", refunded_item=None)
+
+    assert rev is not None and rev.reverses_entry_id is not None
+    assert rev.entry_date == date.today()
+    # The period must now exist, and be OPEN.
+    today = date.today()
+    period = (
+        await db.execute(
+            select(GLPeriod).where(
+                GLPeriod.year == today.year, GLPeriod.period_no == today.month
+            )
+        )
+    ).scalar_one()
+    assert period.status == PeriodStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_void_still_refused_when_the_current_period_is_closed(db):
+    """ensure_period must only create a MISSING period, never reopen a CLOSED one."""
+    await _seeded(db)
+    order = await _make_order(db)
+    # Post the sale into the OPEN June-2026 period FIRST — closing the current
+    # month before this would break the sale whenever the clock sits in June 2026.
+    sale = await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    assert sale is not None
+
+    today = date.today()
+    if (today.year, today.month) != (2026, 6):
+        db.add(GLPeriod(year=today.year, period_no=today.month, status=PeriodStatus.CLOSED))
+        await db.flush()
+    else:
+        # Clock is inside the seeded period — close that one instead.
+        p = (await db.execute(
+            select(GLPeriod).where(GLPeriod.year == 2026, GLPeriod.period_no == 6)
+        )).scalar_one()
+        p.status = PeriodStatus.CLOSED
+        await db.flush()
+
+    with pytest.raises(HTTPException) as exc:
+        await post_order_refund(db, order, _settings(on=True), "u1", refunded_item=None)
+    assert exc.value.status_code == 422
+    assert "CLOSED" in str(exc.value.detail)
+
+    # The period stayed CLOSED, and no reversal was written.
+    period = (
+        await db.execute(
+            select(GLPeriod).where(
+                GLPeriod.year == today.year, GLPeriod.period_no == today.month
+            )
+        )
+    ).scalar_one()
+    assert period.status == PeriodStatus.CLOSED
+    from app.models import GLJournalEntry
+    reversals = (
+        await db.execute(
+            select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id.is_not(None))
+        )
+    ).scalars().all()
+    assert reversals == []
+
+
+@pytest.mark.asyncio
 async def test_partial_refund_reverses_only_that_event(db):
     await _seeded(db)
-    await _seed_current_period(db)
     # Order with a 2-unit coin line @ 50 each = 100 subtotal, vat 11.
     order = Order(
         order_number="ORD-2", cashier_id="u1", payment_method=PaymentMethod.CASH,
@@ -248,7 +307,6 @@ async def test_post_sale_splits_discount_to_contra_revenue(db):
 @pytest.mark.asyncio
 async def test_partial_refund_reverses_discount_prorata(db):
     await _seeded(db)
-    await _seed_current_period(db)
     # 2-unit line @50 = subtotal 100, 10% discount = 10, vat 11, total 101.
     order = Order(
         order_number="ORD-DR", cashier_id="u1", payment_method=PaymentMethod.CASH,
