@@ -7,6 +7,7 @@ from app.core import gl
 from app.core import gl_postings as glp
 from app.core.coa_seed import seed_chart_of_accounts
 from app.models import GLPeriod, PeriodStatus, Settings, Karat
+from tests.conftest import BOOK_DATETIME
 
 D = Decimal
 
@@ -24,7 +25,7 @@ def _settings(on=True):
 class _Buyback:
     def __init__(self):
         self.id = "bb1"; self.buy_price_usd = D("500"); self.weight_grams = D("10.000")
-        self.karat = Karat.K21; self.quantity = 1; self.occurred_at = None
+        self.karat = Karat.K21; self.quantity = 1; self.occurred_at = BOOK_DATETIME
 
 
 @pytest.mark.asyncio
@@ -42,7 +43,7 @@ async def test_buyback_balances_via_clearing(db):
 
 class _Melt:
     def __init__(self):
-        self.id = "m1"; self.occurred_at = None
+        self.id = "m1"; self.occurred_at = BOOK_DATETIME
         self.from_karat = Karat.K21; self.from_grams = D("20.000")
         self.to_karat = Karat.K24; self.to_grams = D("17.000"); self.cost_usd = D("1200")
 
@@ -60,7 +61,7 @@ async def test_melt_balances_each_karat_via_clearing(db):
 
 class _Adjustment:
     def __init__(self):
-        self.id = "a1"; self.occurred_at = None
+        self.id = "a1"; self.occurred_at = BOOK_DATETIME
         self.karat = Karat.K21; self.grams = D("5.000"); self.cost_usd = D("300")
 
 

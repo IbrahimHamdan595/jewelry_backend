@@ -9,6 +9,7 @@ from app.models import (
     GLPeriod, PeriodStatus, Settings, Supplier, SupplierPurchase, SupplierPurchaseItem,
     SupplierPurchaseMode, SupplierItemKind, Karat,
 )
+from tests.conftest import BOOK_DATETIME
 
 
 async def _seed(db):
@@ -29,7 +30,8 @@ async def test_cash_purchase_partial_pay_nets_ap(db):
     pur = SupplierPurchase(supplier_id=sup.id, payment_mode=SupplierPurchaseMode.CASH,
                            total_cash_due=D("1000"), total_grams_due_by_karat={},
                            cash_paid_at_creation=D("300"), grams_paid_at_creation_by_karat={},
-                           created_by_user_id="u1")
+                           created_by_user_id="u1",
+                           occurred_at=BOOK_DATETIME)  # inside the seeded June-2026 period
     pur.items = [SupplierPurchaseItem(item_kind=SupplierItemKind.PRODUCT, unit_cost_usd=D("1000"))]
     db.add(pur); await db.flush()
     await gl_postings.post_supplier_purchase(db, pur, _settings(), "u1")
@@ -49,7 +51,8 @@ async def test_gold_purchase_partial_pay_nets_metal_ap(db):
     pur = SupplierPurchase(supplier_id=sup.id, payment_mode=SupplierPurchaseMode.GOLD,
                            total_cash_due=D("0"), total_grams_due_by_karat={"K21": "50.000"},
                            cash_paid_at_creation=D("0"), grams_paid_at_creation_by_karat={"K21": "20.000"},
-                           created_by_user_id="u1")
+                           created_by_user_id="u1",
+                           occurred_at=BOOK_DATETIME)  # inside the seeded June-2026 period
     pur.items = [SupplierPurchaseItem(item_kind=SupplierItemKind.PURE_GOLD, karat=Karat.K21,
                                       weight_grams=D("50.000"), unit_cost_usd=D("3000"))]
     db.add(pur); await db.flush()

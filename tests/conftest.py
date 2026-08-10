@@ -16,6 +16,8 @@ locks, NOTIFY/LISTEN), add a separate pg-backed fixture rather than promoting
 this one — the speed/portability win of in-memory SQLite is worth keeping
 for the simple cases.
 """
+from datetime import date, datetime
+
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -24,6 +26,16 @@ from app.db.base import Base
 # Importing app.models triggers all model class registration on Base.metadata.
 import app.models  # noqa: F401
 from app.models import AuthAuditChainHead, InventoryLedgerChainHead, GLJournalChainHead
+
+
+# Tests that post to the general ledger seed an open June-2026 period and assert
+# against a June cutoff. Domain objects must therefore carry a date inside that
+# period — otherwise the posting helpers fall back to date.today(), the lines fall
+# outside the trial-balance window, and the assertions fail with a misleading
+# KeyError on an account that was seeded but simply has no activity in range.
+# Pinned rather than derived from today so these tests are deterministic forever.
+BOOK_DATE = date(2026, 6, 15)
+BOOK_DATETIME = datetime(2026, 6, 15, 12, 0, 0)
 
 
 @pytest_asyncio.fixture

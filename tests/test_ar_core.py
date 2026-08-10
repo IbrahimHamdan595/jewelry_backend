@@ -59,6 +59,7 @@ async def test_open_balance_and_credit_limit(db):
 from app.core import gl, gl_postings
 from app.core.coa_seed import seed_chart_of_accounts
 from app.models import GLPeriod, PeriodStatus, Order, OrderItem, OrderItemKind, Karat, Settings
+from tests.conftest import BOOK_DATETIME
 
 
 def _settings(on=True):
@@ -75,7 +76,8 @@ async def test_credit_order_debits_ar_and_creates_invoice(db):
     order = Order(order_number="ORD-9", cashier_id="u1", payment_method=PaymentMethod.CREDIT,
                   customer_id=cust.id, subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
                   discount_percent=D("0"), discount_amount=D("0"), total_usd=D("111"),
-                  total_lbp=D("0"), lbp_exchange_rate=D("89500"))
+                  total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+                  created_at=BOOK_DATETIME)  # inside the seeded June-2026 period
     order.items = [OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="Coin",
                              karat=Karat.K21, weight_grams=D("10"), gold_rate_at_sale=D("60"),
                              margin_percent=D("0"), making_charge=D("0"), final_price=D("100"), quantity=1)]
