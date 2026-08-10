@@ -195,12 +195,20 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     if original is None:
         return None  # nothing was posted (e.g. flag was off at sale time)
 
+    # Reversals are booked when they happen, not when the original sale was — so
+    # they can land in a month that has no period row yet. Every other posting
+    # path calls ensure_period; this one didn't, which made the first void of a
+    # new month 422 while an identical sale succeeded. A CLOSED period is still
+    # refused downstream by gl.post_entry — this only auto-opens a MISSING one.
+    entry_date = date.today()
+    await ensure_period(db, entry_date)
+
     if refunded_item is None:
         if await find_live_entry(db, SOURCE_ORDER_REFUND, order.id):
             return None
         return await gl.reverse_entry(
             db, original_entry_id=original.id, actor_user_id=actor_user_id,
-            entry_date=date.today(), memo=f"Void {order.order_number}",
+            entry_date=entry_date, memo=f"Void {order.order_number}",
         )
 
     # Partial per-item refund: reverse only this event's portion.
@@ -251,7 +259,7 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
         lines.append(gl.GLLine(account_id=stone_cogs_id, denomination="MONEY",
                                base_credit=stone_cost, money_credit=stone_cost, memo="reverse stone COGS"))
     return await gl.post_entry(
-        db, entry_date=date.today(), memo=f"Refund {order.order_number} line",
+        db, entry_date=entry_date, memo=f"Refund {order.order_number} line",
         source_type=SOURCE_ORDER_REFUND, source_id=src_id, lines=lines, actor_user_id=actor_user_id,
     )
 
