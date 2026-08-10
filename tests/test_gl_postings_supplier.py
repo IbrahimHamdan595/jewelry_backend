@@ -11,6 +11,7 @@ from app.models import (
     GLPeriod, PeriodStatus, Settings, Supplier, SupplierPurchase, SupplierPurchaseItem,
     SupplierPurchaseMode, SupplierItemKind, SupplierPayment, DebtUnit, Karat,
 )
+from tests.conftest import BOOK_DATETIME
 
 D = Decimal
 
@@ -33,7 +34,7 @@ async def test_supplier_gold_purchase_balances(db):
         supplier_id=sup.id, payment_mode=SupplierPurchaseMode.GOLD,
         total_cash_due=D("0"), total_grams_due_by_karat={"K21": "50.000"},
         cash_paid_at_creation=D("0"), grams_paid_at_creation_by_karat={},
-        created_by_user_id="u1",
+        created_by_user_id="u1", occurred_at=BOOK_DATETIME,  # inside the seeded June-2026 period
     )
     pur.items = [SupplierPurchaseItem(item_kind=SupplierItemKind.PURE_GOLD, karat=Karat.K21,
                                       weight_grams=D("50.000"), unit_cost_usd=D("3000"))]
@@ -52,7 +53,8 @@ async def test_supplier_cash_payment_balances(db):
     await _seeded(db)
     sup = Supplier(name="ACME"); db.add(sup); await db.flush()
     pay = SupplierPayment(supplier_id=sup.id, unit=DebtUnit.CASH, karat=None,
-                          amount=D("2000"), paid_by_user_id="u1")
+                          amount=D("2000"), paid_by_user_id="u1",
+                          paid_at=BOOK_DATETIME)  # inside the seeded June-2026 period
     db.add(pay); await db.flush()
     entry = await glp.post_supplier_payment(db, pay, _settings(), "u1")
     assert entry is not None
@@ -67,7 +69,8 @@ async def test_supplier_gold_payment_balances_metal(db):
     await _seeded(db)
     sup = Supplier(name="ACME"); db.add(sup); await db.flush()
     pay = SupplierPayment(supplier_id=sup.id, unit=DebtUnit.GOLD, karat=Karat.K21,
-                          amount=D("30.000"), paid_by_user_id="u1")
+                          amount=D("30.000"), paid_by_user_id="u1",
+                          paid_at=BOOK_DATETIME)  # inside the seeded June-2026 period
     db.add(pay); await db.flush()
     entry = await glp.post_supplier_payment(db, pay, _settings(), "u1")
     tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))

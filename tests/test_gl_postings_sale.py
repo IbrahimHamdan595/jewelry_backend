@@ -58,6 +58,7 @@ from app.core.gl_postings import post_sale as gl_postings_post_sale
 from app.models import (
     Order, OrderItem, OrderItemKind, PaymentMethod, Karat, GLJournalLine,
 )
+from tests.conftest import BOOK_DATE, BOOK_DATETIME
 
 D = Decimal
 
@@ -66,6 +67,20 @@ async def _seeded(db):
     await seed_chart_of_accounts(db)
     db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
     await db.flush()
+
+
+async def _seed_current_period(db):
+    """Open the period the *reversal* lands in.
+
+    Voids/refunds are stamped date.today() by design (gl_postings.py:203/254),
+    and gl.post_entry hard-fails on a month with no open period. The sale itself
+    is pinned to June 2026, so today's month has to be opened separately. Guarded
+    so the row isn't duplicated when the clock happens to sit inside June 2026.
+    """
+    today = date.today()
+    if (today.year, today.month) != (2026, 6):
+        db.add(GLPeriod(year=today.year, period_no=today.month, status=PeriodStatus.OPEN))
+        await db.flush()
 
 
 def _settings(on=True):
@@ -79,6 +94,7 @@ async def _make_order(db, *, payment="CASH"):
         subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
         discount_percent=D("0"), discount_amount=D("0"),
         total_usd=D("111"), total_lbp=D("9934500"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,  # inside the seeded June-2026 period
     )
     order.items = [OrderItem(
         item_kind=OrderItemKind.COIN, product_code="C1", product_name="Coin", karat=Karat.K21,
@@ -105,6 +121,8 @@ async def test_post_sale_posts_balanced_entry_with_cogs(db):
     order = await _make_order(db)
     entry = await gl_postings_post_sale(db, order, _settings(on=True), "u1")
     assert entry is not None and entry.source_type == "ORDER" and entry.source_id == order.id
+    # The entry must be booked on the order's date, not whenever the suite runs.
+    assert entry.entry_date == BOOK_DATE
     tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
     assert tb["balanced"] is True and tb["metal_balanced"] is True
     accts = {a["system_key"]: a for a in tb["accounts"]}
@@ -134,11 +152,15 @@ from app.core.gl_postings import post_order_refund
 @pytest.mark.asyncio
 async def test_full_void_reverses_sale(db):
     await _seeded(db)
+    await _seed_current_period(db)
     order = await _make_order(db)
     await gl_postings_post_sale(db, order, _settings(on=True), "u1")
     rev = await post_order_refund(db, order, _settings(on=True), "u1", refunded_item=None)
     assert rev is not None and rev.reverses_entry_id is not None
-    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
+    # void is booked when it happens, not when the original sale did. So the
+    # cutoff has to reach today to see both entries.
+    tb = await gl.compute_trial_balance(db, as_of=date.today())
     assert tb["total_base_debit"] == tb["total_base_credit"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     assert accts["CASH"]["net_base"] == D("0.00")
@@ -155,11 +177,13 @@ async def test_full_void_flag_off_noop(db):
 @pytest.mark.asyncio
 async def test_partial_refund_reverses_only_that_event(db):
     await _seeded(db)
+    await _seed_current_period(db)
     # Order with a 2-unit coin line @ 50 each = 100 subtotal, vat 11.
     order = Order(
         order_number="ORD-2", cashier_id="u1", payment_method=PaymentMethod.CASH,
         subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"), discount_percent=D("0"),
         discount_amount=D("0"), total_usd=D("111"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,  # inside the seeded June-2026 period
     )
     item = OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="Coin",
                      karat=Karat.K21, weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"),
@@ -172,7 +196,10 @@ async def test_partial_refund_reverses_only_that_event(db):
     rev = await post_order_refund(db, order, _settings(on=True), "u1",
                                   refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
     assert rev is not None
-    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
+    # void is booked when it happens, not when the original sale did. So the
+    # cutoff has to reach today to see both entries.
+    tb = await gl.compute_trial_balance(db, as_of=date.today())
     assert tb["balanced"] and tb["metal_balanced"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     # Net cash = 111 in − (50 + 5.50 vat) out = 55.50; net inventory grams =
@@ -193,6 +220,7 @@ async def _make_order_discounted(db):
         subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
         discount_percent=D("10"), discount_amount=D("10"),
         total_usd=D("101"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,  # inside the seeded June-2026 period
     )
     order.items = [OrderItem(
         item_kind=OrderItemKind.COIN, product_code="C1", product_name="Coin", karat=Karat.K21,
@@ -220,12 +248,14 @@ async def test_post_sale_splits_discount_to_contra_revenue(db):
 @pytest.mark.asyncio
 async def test_partial_refund_reverses_discount_prorata(db):
     await _seeded(db)
+    await _seed_current_period(db)
     # 2-unit line @50 = subtotal 100, 10% discount = 10, vat 11, total 101.
     order = Order(
         order_number="ORD-DR", cashier_id="u1", payment_method=PaymentMethod.CASH,
         subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
         discount_percent=D("10"), discount_amount=D("10"),
         total_usd=D("101"), total_lbp=D("0"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,  # inside the seeded June-2026 period
     )
     item = OrderItem(item_kind=OrderItemKind.COIN, product_code="C", product_name="Coin",
                      karat=Karat.K21, weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"),
@@ -238,7 +268,10 @@ async def test_partial_refund_reverses_discount_prorata(db):
     rev = await post_order_refund(db, order, _settings(on=True), "u1",
                                   refunded_item=item, refund_value=D("50"), refund_qty=1, refund_seq=1)
     assert rev is not None
-    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
+    # void is booked when it happens, not when the original sale did. So the
+    # cutoff has to reach today to see both entries.
+    tb = await gl.compute_trial_balance(db, as_of=date.today())
     assert tb["balanced"] and tb["metal_balanced"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     # Discounts net: 10 (sale) − 5 (refund reversal) = 5 remaining debit.
