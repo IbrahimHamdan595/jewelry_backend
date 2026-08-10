@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core import ar, gl_postings
 from app.core.gold_api import get_current_gold_rate
+from app.core.gold_guard import assert_rate_acceptable, record_stale_rate_ack
 from app.core.ledger import (
     EVENT_ORDER_ITEM_REFUND,
     EVENT_ORDER_VOID,
@@ -311,6 +312,8 @@ async def create_order(
         raise HTTPException(status_code=400, detail="Order must have at least one item")
 
     rate_info = await get_current_gold_rate(db)
+    # Gate BEFORE anything is built — a 409 must leave zero rows behind.
+    assert_rate_acceptable(rate_info, payload.stale_rate_ack)
     rate_24k = Decimal(str(rate_info["rate"]))
     order_number = await generate_order_number(db, datetime.now(timezone.utc))
 
@@ -399,6 +402,16 @@ async def create_order(
             ref_id=rec["ref_id"],
             payload=rec["payload"],
         )
+
+    await record_stale_rate_ack(
+        db,
+        actor_user_id=user.id,
+        rate_info=rate_info,
+        ref_type="order",
+        ref_id=order.id,
+        context="ORDER",
+        ack=payload.stale_rate_ack,
+    )
 
     # Module 1 auto-posting (no-op unless the settings flag is ON).
     sale_entry = await gl_postings.post_sale(db, order, settings, user.id)

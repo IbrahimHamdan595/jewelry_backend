@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import gl_postings
 from app.core.gold_api import get_current_gold_rate
+from app.core.gold_guard import assert_rate_acceptable, record_stale_rate_ack
 from app.core.ledger import (
     EVENT_BUYBACK_COIN,
     EVENT_BUYBACK_OUNCE,
@@ -37,6 +38,7 @@ from app.core.receipt import build_buyback_receipt
 from app.schemas.buyback import (
     BuybackCreate, BuybackListOut, BuybackQuoteOut, BuybackReceiptOut,
 )
+from app.schemas.gold_rate import StaleRateAck
 from app.schemas.receipt import ReceiptOut
 
 router = APIRouter(prefix="/buybacks", tags=["buybacks"])
@@ -127,25 +129,51 @@ async def create_buyback(
 
     cfg = await _load_settings(db)
     rate_info = await get_current_gold_rate(db)
+    # Gate BEFORE anything is built — a 409 must leave zero rows behind.
+    assert_rate_acceptable(rate_info, body.stale_rate_ack)
     rate_24k = Decimal(str(rate_info["rate"]))
 
     # Drift check is keyed on the live rate vs. the quoted rate.
     if body.expected_rate is not None:
         _check_rate_drift(rate_24k, body.expected_rate, cfg.buyback_rate_drift_pct_max)
 
-    # Dispatch to per-kind handler.
+    # Dispatch to per-kind handler. `rate_info` travels down because the ack row
+    # must commit INSIDE the handler's transaction (they each call db.commit()
+    # themselves).
     if kind == BuybackKind.PURE_GOLD:
-        return await _create_pure_gold_buyback(db, user, body, cfg, rate_24k)
+        return await _create_pure_gold_buyback(db, user, body, cfg, rate_24k, rate_info)
     if kind == BuybackKind.COIN:
-        return await _create_coin_buyback(db, user, body, cfg, rate_24k)
+        return await _create_coin_buyback(db, user, body, cfg, rate_24k, rate_info)
     if kind == BuybackKind.OUNCE:
-        return await _create_ounce_buyback(db, user, body, cfg, rate_24k)
+        return await _create_ounce_buyback(db, user, body, cfg, rate_24k, rate_info)
     if kind == BuybackKind.USED_PRODUCT:
-        return await _create_used_product_buyback(db, user, body, rate_24k)
+        return await _create_used_product_buyback(db, user, body, rate_24k, rate_info)
     raise HTTPException(status_code=500, detail="unhandled buyback kind")
 
 
 # ── Per-kind handlers ─────────────────────────────────────────────────────────
+
+
+async def _record_ack(
+    db: AsyncSession, user: User, buyback_id: str,
+    rate_info: dict, ack: StaleRateAck | None,
+) -> None:
+    """Append the stale-rate ack row for this buyback, if one was required.
+
+    Called inside each handler before its db.commit() so the ack is atomic with
+    the buyback it justifies — recording it after the handler returns would be a
+    separate transaction, and a crash in between would leave a committed buyback
+    with no justification row.
+    """
+    await record_stale_rate_ack(
+        db,
+        actor_user_id=user.id,
+        rate_info=rate_info,
+        ref_type="walkin_buyback",
+        ref_id=buyback_id,
+        context="BUYBACK",
+        ack=ack,
+    )
 
 
 def _resolve_margin(
@@ -165,6 +193,7 @@ def _resolve_margin(
 
 async def _create_pure_gold_buyback(
     db: AsyncSession, user: User, body: BuybackCreate, cfg: Settings, rate_24k: Decimal,
+    rate_info: dict,
 ) -> BuybackReceiptOut:
     if body.karat is None or body.weight_grams is None:
         raise HTTPException(
@@ -253,6 +282,8 @@ async def _create_pure_gold_buyback(
         },
     )
 
+    await _record_ack(db, user, buyback.id, rate_info, body.stale_rate_ack)
+
     # Module 1 auto-posting (no-op unless the flag is ON).
     await gl_postings.post_buyback(db, buyback, cfg, user.id)
 
@@ -263,6 +294,7 @@ async def _create_pure_gold_buyback(
 
 async def _create_coin_buyback(
     db: AsyncSession, user: User, body: BuybackCreate, cfg: Settings, rate_24k: Decimal,
+    rate_info: dict,
 ) -> BuybackReceiptOut:
     if not body.coin_type_id or not body.quantity:
         raise HTTPException(
@@ -331,6 +363,9 @@ async def _create_coin_buyback(
             "qty_after": coin.on_hand_qty,
         },
     )
+
+    await _record_ack(db, user, buyback.id, rate_info, body.stale_rate_ack)
+
     # Module 1 auto-posting (no-op unless the flag is ON).
     await gl_postings.post_buyback(db, buyback, cfg, user.id)
 
@@ -341,6 +376,7 @@ async def _create_coin_buyback(
 
 async def _create_ounce_buyback(
     db: AsyncSession, user: User, body: BuybackCreate, cfg: Settings, rate_24k: Decimal,
+    rate_info: dict,
 ) -> BuybackReceiptOut:
     if not body.ounce_type_id or not body.quantity:
         raise HTTPException(
@@ -409,6 +445,9 @@ async def _create_ounce_buyback(
             "qty_after": bar.on_hand_qty,
         },
     )
+
+    await _record_ack(db, user, buyback.id, rate_info, body.stale_rate_ack)
+
     # Module 1 auto-posting (no-op unless the flag is ON).
     await gl_postings.post_buyback(db, buyback, cfg, user.id)
 
@@ -419,6 +458,7 @@ async def _create_ounce_buyback(
 
 async def _create_used_product_buyback(
     db: AsyncSession, user: User, body: BuybackCreate, rate_24k: Decimal,
+    rate_info: dict,
 ) -> BuybackReceiptOut:
     """USED_PRODUCT buyback in Phase 3: persist the row only.
 
@@ -468,6 +508,9 @@ async def _create_used_product_buyback(
             "pending_polish": True,
         },
     )
+
+    await _record_ack(db, user, buyback.id, rate_info, body.stale_rate_ack)
+
     # Module 1 auto-posting (no-op unless the flag is ON).
     await gl_postings.post_buyback(db, buyback, cfg, user.id)
 

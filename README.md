@@ -92,7 +92,8 @@ SEED_ADMIN_PASSWORD="..."
 # Gold rate
 GOLD_API_KEY="..."
 GOLD_API_URL="https://www.goldapi.io/api/XAU/USD"
-GOLD_REFRESH_MINUTES=15
+GOLD_REFRESH_MINUTES=10
+GOLD_ALERT_FAILURE_THRESHOLD=2
 
 # Cloudflare R2 (product image uploads)
 R2_ACCOUNT_ID="..."
@@ -102,9 +103,10 @@ R2_BUCKET_NAME="..."
 R2_PUBLIC_URL="https://pub-....r2.dev"
 
 # Discord webhook (gold-rate poller alerts + reconcile drift alerts)
+# GOLD_ALERT_FAILURE_THRESHOLD lives in the Gold rate block above — it gates the
+# Discord alert AND the market_closed threshold. See "Gold rate staleness".
 DISCORD_WEBHOOK_URL="..."
 DISCORD_ALERT_USER_ID="..."
-GOLD_ALERT_FAILURE_THRESHOLD=3
 
 # Auth audit (default 540 days = 18 months)
 AUTH_AUDIT_RETENTION_DAYS=540
@@ -112,6 +114,30 @@ AUTH_AUDIT_RETENTION_DAYS=540
 
 **Never commit `.env`.** It's gitignored. In production (Render), inject
 these as service-level env vars.
+
+### Gold rate staleness
+
+Two settings together control when the system starts warning about — and then
+gating on — an old gold rate:
+
+| Setting | Shop value | Effect |
+|---|---|---|
+| `GOLD_REFRESH_MINUTES` | `10` | Poll interval, **and** the `is_stale` threshold. |
+| `GOLD_ALERT_FAILURE_THRESHOLD` | `2` | Consecutive poll failures before the Discord alert. |
+
+Derived in `app/core/gold_api.py`:
+
+    is_stale      after GOLD_REFRESH_MINUTES                       -> 10 min
+    market_closed after max(stale x 2, FAILURE_THRESHOLD x stale)  -> 20 min
+
+`market_closed` is not cosmetic: past that point `POST /api/orders` and
+`POST /api/buybacks` return **409** unless the request carries a
+`stale_rate_ack` naming the exact rate timestamp being accepted, which is then
+written to the inventory ledger as `SALE_ON_STALE_RATE_ACK`
+(`app/core/gold_guard.py`). An active admin override clears the gate entirely.
+
+**Raising `GOLD_REFRESH_MINUTES` also delays the point at which the till starts
+prompting.** They are the same knob.
 
 ## Database migrations
 

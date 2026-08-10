@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.gold_rate import StaleRateAck
+
 
 class BuybackQuoteOut(BaseModel):
     """Live quote for a pure-gold walk-in. Cashier shows this on screen."""
@@ -47,6 +49,10 @@ class BuybackCreate(BaseModel):
     margin_value: Decimal | None = None
     expected_rate: Decimal | None = None  # if set, server rejects on > drift threshold
     notes: str | None = None
+
+    # Cashier's explicit acceptance of a market_closed gold rate. Optional: only
+    # required when the server flags the rate market_closed (app/core/gold_guard.py).
+    stale_rate_ack: StaleRateAck | None = None
 
 
 class BuybackReceiptOut(BaseModel):
