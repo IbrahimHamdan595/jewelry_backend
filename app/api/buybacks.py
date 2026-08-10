@@ -147,7 +147,7 @@ async def create_buyback(
     if kind == BuybackKind.OUNCE:
         return await _create_ounce_buyback(db, user, body, cfg, rate_24k, rate_info)
     if kind == BuybackKind.USED_PRODUCT:
-        return await _create_used_product_buyback(db, user, body, rate_24k, rate_info)
+        return await _create_used_product_buyback(db, user, body, cfg, rate_24k, rate_info)
     raise HTTPException(status_code=500, detail="unhandled buyback kind")
 
 
@@ -457,7 +457,7 @@ async def _create_ounce_buyback(
 
 
 async def _create_used_product_buyback(
-    db: AsyncSession, user: User, body: BuybackCreate, rate_24k: Decimal,
+    db: AsyncSession, user: User, body: BuybackCreate, cfg: Settings, rate_24k: Decimal,
     rate_info: dict,
 ) -> BuybackReceiptOut:
     """USED_PRODUCT buyback in Phase 3: persist the row only.
