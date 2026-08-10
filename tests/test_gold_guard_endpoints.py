@@ -374,15 +374,6 @@ async def test_ack_row_rolls_back_with_the_buyback(
     assert acks == 0
 
 
-@pytest.mark.xfail(
-    raises=NameError,
-    strict=True,
-    reason=(
-        "pre-existing bug: _create_used_product_buyback passes an undefined cfg to "
-        "gl_postings.post_buyback. When that is fixed this test XPASSes and strict=True "
-        "turns it into a failure — remove the marker and confirm the ack row lands."
-    ),
-)
 @pytest.mark.asyncio
 async def test_used_product_buyback_records_the_ack(
     db, stale_rate, cashier, settings_row
