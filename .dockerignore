@@ -1,0 +1,20 @@
+.env
+.env.*
+
+# Repo history and dev environments
+.git
+.gitignore
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Not needed at runtime
+tests
+docs
+*.sql
+*.md
+Dockerfile
+.dockerignore
+package-lock.json
