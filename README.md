@@ -78,7 +78,10 @@ JWT_SECRET="..."
 JWT_ALGORITHM="HS256"
 JWT_EXPIRES_MINUTES=480
 
-# CORS — comma-separated list of allowed frontend origins
+# CORS — comma-separated list of allowed frontend origins. Exact origins only:
+# there is deliberately no wildcard/regex (NEX-45). If you develop through a
+# dev tunnel, add YOUR tunnel's frontend origin to your local .env, e.g.
+# CORS_ORIGINS="http://localhost:3000,https://<your-tunnel>-3001.devtunnels.ms"
 CORS_ORIGINS="http://localhost:3000,https://your-frontend.example.com"
 
 # Cookie flags — for HTTPS cross-origin (Render etc.) set: true / none
