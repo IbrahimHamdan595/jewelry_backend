@@ -183,6 +183,11 @@ docker build -t fawaz-el-namel-backend .
 docker run --rm -p 8000:8000 --env-file .env fawaz-el-namel-backend
 ```
 
+The image runs as an unprivileged user and listens on `$PORT` (8000 when
+unset). Its `HEALTHCHECK` polls `GET /health`, which only reports that the
+process is serving — it never touches the database, so a slow query cannot
+restart the container.
+
 ---
 
 ## Tests
@@ -294,6 +299,7 @@ jewelry_backend/
 - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
+- **Health check path:** `/health` (no auth, no database access).
 - **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
   than `development` / `dev` / `local` / `test` keeps `/docs`, `/redoc` and
   `/openapi.json` at 404.
