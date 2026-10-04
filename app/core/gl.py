@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import ledger
@@ -198,6 +199,29 @@ def _line_to_hash_dict(ln: GLLine) -> dict:
     }
 
 
+# The partial unique indexes on gl_journal_entries (models + migration, NEX-49).
+# Postgres names the violated index in the error; SQLite names its columns.
+_UQ_REVERSAL_MARKERS = (
+    "uq_gl_entries_reverses_entry_id",
+    "UNIQUE constraint failed: gl_journal_entries.reverses_entry_id",
+)
+_UQ_LIVE_SOURCE_MARKERS = (
+    "uq_gl_entries_live_source",
+    "UNIQUE constraint failed: gl_journal_entries.source_type, gl_journal_entries.source_id",
+)
+
+
+def _duplicate_posting_detail(exc: IntegrityError) -> str | None:
+    """409 detail when `exc` is one of the two duplicate-posting indexes, else
+    None (any other integrity failure is a real bug and must stay loud)."""
+    msg = str(exc.orig)
+    if any(m in msg for m in _UQ_REVERSAL_MARKERS):
+        return "This entry has already been reversed."
+    if any(m in msg for m in _UQ_LIVE_SOURCE_MARKERS):
+        return "A journal entry has already been posted for this source."
+    return None
+
+
 async def post_entry(
     db: AsyncSession,
     *,
@@ -258,7 +282,17 @@ async def post_entry(
         prev_hash=head.latest_entry_hash, entry_hash=entry_hash,
     )
     db.add(entry)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # reverse_entry / find_live_entry check BEFORE the head lock, so two
+        # concurrent requests can both pass; the loser lands here. The failed
+        # flush has already rolled the transaction back (head and entry_no
+        # counter included), so answer with a conflict rather than a 500.
+        detail = _duplicate_posting_detail(exc)
+        if detail is None:
+            raise
+        raise HTTPException(status_code=409, detail=detail) from exc
 
     for i, ln in enumerate(lines):
         db.add(GLJournalLine(
