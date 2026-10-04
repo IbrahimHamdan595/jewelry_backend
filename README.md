@@ -70,6 +70,11 @@ Create a `.env` file in `jewelry_backend/`. The full schema lives in
 [`app/config.py`](app/config.py); the practical minimum is:
 
 ```ini
+# Environment — unset means "production", which is what hides /docs, /redoc
+# and /openapi.json (NEX-47). Set development on your own machine to get the
+# interactive docs back. Never set this on Render.
+ENVIRONMENT=development
+
 # Database
 DATABASE_URL="postgresql+asyncpg://user:pass@host/dbname?ssl=require"
 
@@ -165,7 +170,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 - API: http://localhost:8000
-- Interactive docs: http://localhost:8000/docs
+- Interactive docs: http://localhost:8000/docs — only with
+  `ENVIRONMENT=development` in your `.env`. In production (the default) `/docs`,
+  `/redoc` and `/openapi.json` return 404.
 
 ## Run with Docker
 
@@ -284,6 +291,9 @@ jewelry_backend/
 - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
+- **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
+  than `development` / `dev` / `local` / `test` keeps `/docs`, `/redoc` and
+  `/openapi.json` at 404.
 - **CORS:** set `CORS_ORIGINS` to the exact frontend Render URL.
 - **Cookies:** in production, set `COOKIE_SECURE=true` and
   `COOKIE_SAMESITE=none` since the frontend is on a different subdomain.
