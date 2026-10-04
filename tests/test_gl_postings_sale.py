@@ -145,8 +145,8 @@ async def test_full_void_reverses_sale(db):
     assert rev is not None and rev.reverses_entry_id is not None
     # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
     # void is booked when it happens, not when the original sale did. So the
-    # cutoff has to reach today to see both entries.
-    tb = await gl.compute_trial_balance(db, as_of=date.today())
+    # cutoff has to reach both entries, whichever side of BOOK_DATE the clock is on.
+    tb = await gl.compute_trial_balance(db, as_of=max(BOOK_DATE, rev.entry_date))
     assert tb["total_base_debit"] == tb["total_base_credit"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     assert accts["CASH"]["net_base"] == D("0.00")
@@ -257,8 +257,8 @@ async def test_partial_refund_reverses_only_that_event(db):
     assert rev is not None
     # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
     # void is booked when it happens, not when the original sale did. So the
-    # cutoff has to reach today to see both entries.
-    tb = await gl.compute_trial_balance(db, as_of=date.today())
+    # cutoff has to reach both entries, whichever side of BOOK_DATE the clock is on.
+    tb = await gl.compute_trial_balance(db, as_of=max(BOOK_DATE, rev.entry_date))
     assert tb["balanced"] and tb["metal_balanced"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     # Net cash = 111 in − (50 + 5.50 vat) out = 55.50; net inventory grams =
@@ -328,8 +328,8 @@ async def test_partial_refund_reverses_discount_prorata(db):
     assert rev is not None
     # The reversal is stamped date.today() by design (gl_postings.py:203/254) — a
     # void is booked when it happens, not when the original sale did. So the
-    # cutoff has to reach today to see both entries.
-    tb = await gl.compute_trial_balance(db, as_of=date.today())
+    # cutoff has to reach both entries, whichever side of BOOK_DATE the clock is on.
+    tb = await gl.compute_trial_balance(db, as_of=max(BOOK_DATE, rev.entry_date))
     assert tb["balanced"] and tb["metal_balanced"]
     accts = {a["system_key"]: a for a in tb["accounts"]}
     # Discounts net: 10 (sale) − 5 (refund reversal) = 5 remaining debit.
