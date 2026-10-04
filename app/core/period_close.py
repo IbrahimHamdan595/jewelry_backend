@@ -10,6 +10,7 @@ from decimal import Decimal
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core import gl, ledger
 from app.core.audit_chain import verify_gl_chain
@@ -102,11 +103,16 @@ async def close_readiness(db: AsyncSession, *, year: int, period_no: int) -> dic
 
 
 async def _year_already_closed(db: AsyncSession, year: int) -> bool:
+    """True while `year` has a YEAR_CLOSE entry still in force. One that has been
+    reversed does not count: a reversal cannot itself be reversed, so closing the
+    year again is the only way back from a closing entry reversed by mistake."""
     start, end = date(year, 1, 1), date(year, 12, 31)
+    reversal = aliased(GLJournalEntry)
     existing = (await db.execute(
         select(GLJournalEntry).where(
             GLJournalEntry.source_type == YEAR_CLOSE,
             GLJournalEntry.entry_date >= start, GLJournalEntry.entry_date <= end,
+            ~select(reversal.id).where(reversal.reverses_entry_id == GLJournalEntry.id).exists(),
         ))).scalars().first()
     return existing is not None
 
