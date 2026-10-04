@@ -5,11 +5,15 @@ date) and returns JSON-friendly primitives. Kept out of app/api/reports.py so
 each unit is independently testable. Windows are Beirut-local calendar days
 (see app/core/daterange).
 """
+import asyncio
+import os
+from collections import deque
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.daterange import BEIRUT_TZ, day_range
 from app.models import Order, OrderItem, OrderStatus
@@ -24,6 +28,78 @@ def week_window(today: date) -> tuple[datetime, datetime]:
     start = day_range(today - timedelta(days=6))[0]
     end = day_range(today)[1]
     return start, end
+
+
+# ── Concurrent fan-out (NEX-53) ───────────────────────────────────────────────
+
+def _max_concurrency() -> int:
+    """Most DB sessions (= pooled connections) one dashboard load holds at once.
+
+    Default 4: with the request's own auth session that is the engine's default
+    pool_size of 5, so a load stays out of overflow connections — raise
+    pool_size before raising this. Set DASHBOARD_MAX_CONCURRENCY in the process
+    environment (not .env: Settings rejects keys it does not declare)."""
+    return max(1, int(os.environ.get("DASHBOARD_MAX_CONCURRENCY", "4")))
+
+
+MAX_CONCURRENCY = _max_concurrency()
+
+
+@dataclass(frozen=True)
+class Windows:
+    """Every instant and boundary one dashboard load works from, all derived
+    from a single clock read so concurrent sections cannot straddle midnight
+    differently. Day windows are Beirut-local, held as UTC [start, end)."""
+    now: datetime
+    today: date
+    today_start: datetime
+    today_end: datetime
+    week_start: datetime
+    week_end: datetime
+    prev_week_start: datetime
+    prev_week_end: datetime
+
+
+def windows(now: datetime) -> Windows:
+    today = now.astimezone(BEIRUT_TZ).date()
+    today_start, today_end = day_range(today)
+    week_start, week_end = week_window(today)
+    return Windows(
+        now=now, today=today, today_start=today_start, today_end=today_end,
+        week_start=week_start, week_end=week_end,
+        prev_week_start=day_range(today - timedelta(days=13))[0], prev_week_end=week_start,
+    )
+
+
+async def run_sections(session_factory: async_sessionmaker[AsyncSession], sections, w: Windows,
+                       *, max_concurrency: int) -> list:
+    """Run every `section(db, w)` and return the results in `sections` order.
+
+    At most `max_concurrency` lanes run at once. Each lane opens ONE session and
+    keeps pulling the next unstarted section onto it, so no session is ever
+    shared between concurrent tasks and a load checks out no more connections
+    than it has lanes. Read-only — a lane never commits.
+
+    The first section to raise fails the whole call (no partial results); the
+    other lanes are cancelled and awaited so no query outlives the request."""
+    results: list = [None] * len(sections)
+    pending = deque(enumerate(sections))
+
+    async def lane() -> None:
+        async with session_factory() as db:
+            while pending:
+                i, section = pending.popleft()
+                results[i] = await section(db, w)
+
+    lanes = [asyncio.ensure_future(lane()) for _ in range(min(max_concurrency, len(sections)))]
+    try:
+        await asyncio.gather(*lanes)
+    except BaseException:
+        for task in lanes:
+            task.cancel()
+        await asyncio.gather(*lanes, return_exceptions=True)
+        raise
+    return results
 
 
 # ── Phase A — headline KPIs ───────────────────────────────────────────────────

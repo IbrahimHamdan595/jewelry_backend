@@ -4,7 +4,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.security import decode_token
 from app.db.session import async_session_factory
@@ -18,6 +18,13 @@ AUTH_COOKIE_NAME = "mz_token"
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session_factory() as session:
         yield session
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Session source for handlers that fan out over several sessions — an
+    AsyncSession must never be shared between concurrent tasks, so each branch
+    opens its own. A dependency so tests can point it at their own engine."""
+    return async_session_factory
 
 
 async def get_current_user(
