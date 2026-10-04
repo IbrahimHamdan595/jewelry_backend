@@ -17,13 +17,13 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.core.coa_seed import seed_chart_of_accounts
 from app.core.ledger import EVENT_SETTINGS_CHANGED
 from app.models import (
-    CoinType, GLJournalEntry, GLJournalLine, GoldRateHistory, InventoryLedger, Karat,
-    MarginMode, Role, Settings, User,
+    CoinType, GLAccount, GLJournalEntry, GLJournalLine, GoldRateHistory, InventoryLedger,
+    Karat, MarginMode, Role, Settings, User,
 )
 
 D = Decimal
@@ -45,6 +45,7 @@ async def api(db):
     }
     db.add_all(users.values())
     db.add(Settings(id="singleton"))
+    await seed_chart_of_accounts(db)  # like a shop that has opened the accounting section
     await db.flush()
     current = {"user": users[Role.ADMIN]}
 
@@ -115,6 +116,31 @@ async def test_non_admin_cannot_change_the_flag(api, db, role):
 
 
 @pytest.mark.asyncio
+async def test_flag_cannot_be_turned_on_before_the_chart_of_accounts_is_seeded(api, db):
+    """With the flag on, every sale resolves the system accounts and 422s if one
+    is missing — one click would stop the till. Refuse the click instead, and
+    say what to do; the settings screen shows this message in its prompt."""
+    await db.execute(delete(GLAccount))
+    await db.flush()
+
+    r = await api.client.patch("/api/settings", json={FLAG: True, "receipt_footer": "x"})
+
+    assert r.status_code == 409, r.text
+    assert "chart of accounts" in r.json()["detail"].lower()
+    assert await _stored_flag(db) is False
+    assert (await api.client.get("/api/settings")).json()["receipt_footer"] is None  # all or nothing
+
+    # Seeding is all it takes — and switching OFF is never blocked.
+    await seed_chart_of_accounts(db)
+    await db.flush()
+    assert (await api.client.patch("/api/settings", json={FLAG: True})).status_code == 200
+    await db.execute(delete(GLAccount))
+    await db.flush()
+    assert (await api.client.patch("/api/settings", json={FLAG: False})).status_code == 200
+    assert await _stored_flag(db) is False
+
+
+@pytest.mark.asyncio
 async def test_flipping_the_flag_is_recorded_on_the_audit_ledger(api, db):
     await api.client.patch("/api/settings", json={FLAG: True})
     rows = (
@@ -170,7 +196,6 @@ async def test_sale_after_admin_enables_the_flag_posts_a_balanced_entry(api, db)
     """Acceptance: flag switched on THROUGH THE API, on books as empty as
     production's (chart seeded, zero periods, zero entries) → the next sale
     posts a balanced entry and the trial balance holds in money and metal."""
-    await seed_chart_of_accounts(db)
     coin = CoinType(code="C-NEX52", name_en="Coin", karat=Karat.K21, weight_grams=D("10"),
                     margin_mode=MarginMode.USD, margin_value=D("5"), on_hand_qty=5)
     db.add(coin)

@@ -2,10 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.coa_seed import SYSTEM_ACCOUNTS
 from app.core.ledger import EVENT_SETTINGS_CHANGED, field_diff, record
 from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db
-from app.models import Settings, User
+from app.models import GLAccount, Settings, User
 from app.schemas.settings import SettingsOut, SettingsUpdate
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -44,6 +45,22 @@ async def update_settings(
     # reset the switch nor write NULL into its NOT NULL column.
     if incoming.get("accounting_auto_post_enabled", False) is None:
         del incoming["accounting_auto_post_enabled"]
+    # Switching it ON makes every sale resolve the GL system accounts and 422
+    # when one is missing (gl_postings.resolve_account_id) — one click could
+    # stop the till. Refuse until the chart of accounts is seeded, before
+    # anything in this PATCH is applied. Switching it OFF is never blocked.
+    if incoming.get("accounting_auto_post_enabled") and not s.accounting_auto_post_enabled:
+        seeded = {k for (k,) in (await db.execute(select(GLAccount.system_key))).all() if k}
+        missing = sorted({row[-1] for row in SYSTEM_ACCOUNTS} - seeded)
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"The chart of accounts is missing {len(missing)} system account(s) "
+                    f"({', '.join(missing[:5])}{', …' if len(missing) > 5 else ''}). Seed it under "
+                    "Accounting › Chart of accounts before turning auto-posting on."
+                ),
+            )
     # Snapshot only the fields the caller is trying to change so the diff
     # stays focused. SettingsOut.model_dump() would include 20+ fields most
     # of which the caller never touched.
