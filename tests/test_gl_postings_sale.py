@@ -347,3 +347,31 @@ async def test_card_sale_debits_clearing_not_bank(db):
     accts = {a["system_key"]: a for a in tb["accounts"]}
     assert accts["CREDIT_CARD_CLEARING"]["base_debit"] == D("111.00")
     assert accts.get("BANK", {}).get("base_debit", D("0")) == D("0.00")
+
+
+@pytest.mark.asyncio
+async def test_void_can_be_booked_on_an_explicit_date(db):
+    """NEX-52 — a historical replay books the reversal on the day the void
+    actually happened, not on the day the replay runs. Default stays today."""
+    await _seeded(db)
+    order = await _make_order(db)
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    rev = await post_order_refund(db, order, _settings(on=True), "u1",
+                                  refunded_item=None, entry_date=date(2026, 6, 20))
+    assert rev is not None and rev.reverses_entry_id is not None
+    assert rev.entry_date == date(2026, 6, 20)
+    # Booked inside June — no period was opened for the month the test runs in.
+    periods = (await db.execute(select(GLPeriod))).scalars().all()
+    assert [(p.year, p.period_no) for p in periods] == [(2026, 6)]
+
+
+@pytest.mark.asyncio
+async def test_partial_refund_can_be_booked_on_an_explicit_date(db):
+    await _seeded(db)
+    order = await _make_order(db)
+    await gl_postings_post_sale(db, order, _settings(on=True), "u1")
+    rev = await post_order_refund(db, order, _settings(on=True), "u1",
+                                  refunded_item=order.items[0], refund_value=D("100"),
+                                  refund_qty=1, refund_seq=1, entry_date=date(2026, 6, 20))
+    assert rev is not None and rev.source_type == "ORDER_REFUND"
+    assert rev.entry_date == date(2026, 6, 20)

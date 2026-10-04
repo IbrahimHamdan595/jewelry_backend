@@ -184,7 +184,7 @@ class _RefundItemView:
 
 async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
                             *, refunded_item=None, refund_value=None, refund_qty=None,
-                            refund_seq: int = 0):
+                            refund_seq: int = 0, entry_date: date | None = None):
     """Full void/refund → reverse the original ORDER entry. Per-item refund →
     a targeted reversing entry for only the units refunded in THIS event, using
     the explicit incremental `refund_value` (pre-VAT) and `refund_qty` (so a
@@ -200,7 +200,9 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     # path calls ensure_period; this one didn't, which made the first void of a
     # new month 422 while an identical sale succeeded. A CLOSED period is still
     # refused downstream by gl.post_entry — this only auto-opens a MISSING one.
-    entry_date = date.today()
+    # `entry_date` is only passed by the historical replay (app/core/gl_replay.py),
+    # which knows the day the void/refund really happened; live callers omit it.
+    entry_date = entry_date or date.today()
     await ensure_period(db, entry_date)
 
     if refunded_item is None:
