@@ -299,12 +299,37 @@ async def reverse_entry(
 ) -> GLJournalEntry:
     """Post a reversing entry: every original line's debit/credit swapped, in
     both the money and metal dimensions. Sets reverses_entry_id (design §3.4).
-    Reversal is the ONLY correction mechanism — posted entries are immutable."""
+    Reversal is the ONLY correction mechanism — posted entries are immutable.
+
+    An entry is reversed at most once, and a reversal is never itself reversed
+    (409 in both cases): a second reversal would leave the trial balance
+    balanced but every touched account wrong by the original's full value, in
+    USD and in grams per karat."""
     original = (
         await db.execute(select(GLJournalEntry).where(GLJournalEntry.id == original_entry_id))
     ).scalar_one_or_none()
     if original is None:
         raise HTTPException(status_code=404, detail="Entry to reverse not found")
+
+    # Refuse BEFORE post_entry, so a refused attempt never locks or advances the
+    # chain head and burns no entry_no. Deliberately not tied to the period: a
+    # reversal is booked when it happens, often a later month than the original.
+    if original.reverses_entry_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} is a reversal and cannot itself be reversed. "
+                   f"Post a new entry instead.",
+        )
+    existing = (
+        await db.execute(
+            select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id == original.id)
+        )
+    ).scalars().first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} has already been reversed by {existing.entry_no}.",
+        )
 
     orig_lines = (
         await db.execute(

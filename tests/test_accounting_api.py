@@ -126,3 +126,74 @@ async def test_unbalanced_entry_rejected_422(client):
     }
     r = await client.post("/api/accounting/journal-entries", json=payload)
     assert r.status_code == 422
+
+
+# ── NEX-49: a journal entry is reversed at most once ──────────────────────────
+
+async def _post_dual_sale_today(client):
+    """Seed, open the CURRENT month (the reverse endpoint books date.today()),
+    and post a manual sale touching both the money and the metal dimension."""
+    from datetime import date
+    today = date.today()
+    await client.post("/api/accounting/seed-coa")
+    r = await client.post("/api/accounting/periods", json={"year": today.year, "period_no": today.month})
+    assert r.status_code == 200, r.text
+    accts = (await client.get("/api/accounting/accounts")).json()["items"]
+    by_key = {a["system_key"]: a["id"] for a in accts}
+    payload = {
+        "entry_date": today.isoformat(), "memo": "cash sale", "source_type": "MANUAL",
+        "lines": [
+            {"account_id": by_key["CASH"], "base_debit": "100", "money_debit": "100"},
+            {"account_id": by_key["SALES_REVENUE"], "base_credit": "100", "money_credit": "100"},
+            {"account_id": by_key["METAL_COGS"], "base_debit": "60",
+             "metal_debit_grams": "10.000", "karat": "K21"},
+            {"account_id": by_key["METAL_INVENTORY"], "base_credit": "60",
+             "metal_credit_grams": "10.000", "karat": "K21"},
+        ],
+    }
+    r = await client.post("/api/accounting/journal-entries", json=payload)
+    assert r.status_code == 200, r.text
+    return r.json(), today
+
+
+@pytest.mark.asyncio
+async def test_reverse_endpoint_second_reversal_is_409_not_a_new_entry(client):
+    orig, today = await _post_dual_sale_today(client)
+
+    r1 = await client.post(f"/api/accounting/journal-entries/{orig['id']}/reverse")
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["reverses_entry_id"] == orig["id"]
+
+    # The double-click.
+    r2 = await client.post(f"/api/accounting/journal-entries/{orig['id']}/reverse")
+    assert r2.status_code == 409, r2.text
+    assert orig["entry_no"] in r2.json()["detail"]
+
+    # Nothing was posted and the chain has no gap.
+    assert (await client.get("/api/accounting/journal-entries")).json()["total"] == 2
+    v = (await client.get("/api/accounting/ledger/verify")).json()
+    assert v["status"] == "intact" and v["head_matches"] is True
+    assert v["head_row_count"] == 2 and v["head_latest_hash"] == r1.json()["entry_hash"]
+
+    # One reversal nets the original to zero — in USD and in grams per karat.
+    tb = (await client.get(f"/api/accounting/trial-balance?as_of={today.isoformat()}")).json()
+    assert tb["balanced"] is True and tb["metal_balanced"] is True
+    assert len(tb["accounts"]) == 4
+    for a in tb["accounts"]:
+        assert a["net_base"] == "0.00", a["code"]
+        for k, m in a["metal_by_karat"].items():
+            assert m["net_grams"] == "0.000", (a["code"], k)
+
+
+@pytest.mark.asyncio
+async def test_reverse_endpoint_refuses_to_reverse_a_reversal(client):
+    orig, _ = await _post_dual_sale_today(client)
+    rev = (await client.post(f"/api/accounting/journal-entries/{orig['id']}/reverse")).json()
+
+    r = await client.post(f"/api/accounting/journal-entries/{rev['id']}/reverse")
+    assert r.status_code == 409, r.text
+
+    assert (await client.get("/api/accounting/journal-entries")).json()["total"] == 2
+    v = (await client.get("/api/accounting/ledger/verify")).json()
+    assert v["status"] == "intact" and v["head_matches"] is True
+    assert v["head_row_count"] == 2 and v["head_latest_hash"] == rev["entry_hash"]
