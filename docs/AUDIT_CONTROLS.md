@@ -59,13 +59,13 @@ the verify endpoints. Each is enforced at the layer noted.
 ### Auth audit honesty
 
 8. **Auth events never block the auth path.** `record_auth_event_safe()` opens its own DB session and wraps every exception. If the recorder fails, the user still logs in or out. Verified by `test_record_auth_event_safe_never_raises_on_db_error`.
-   One deliberate exception since NEX-47: a wrong-password login writes its `LOGIN_FAILED` row inline, on the request's session, before the 401 is sent (still best effort — a recorder failure is swallowed and the 401 goes out). The per-account lockout is counted from those rows; see invariant 11.
+   One deliberate exception since NEX-47: a wrong-password login writes its `LOGIN_FAILED` row inline, on the request's session, before the 401 is sent (still best effort — a recorder failure is swallowed and the 401 goes out). The per-account lockout is counted from those rows; see the note under invariant 10.
 
 9. **Failed logins are captured as claimed-but-unverified.** `user_id = NULL`, `claimed_email` set to what was submitted. No FK to `users` — failed probes for non-existent accounts are recorded as evidence, not silently dropped.
 
 10. **Failed-login events land even when the endpoint raises.** A historical class of FastAPI bug: `BackgroundTasks` only fire when the endpoint returns successfully; raising `HTTPException` bypasses them. We use `asyncio.create_task` via `fire_auth_event()` so the recorder runs regardless. Pinned by `test_fire_auth_event_schedules_task_and_completes_after_caller_raises`.
 
-11. **The login lockout is derived from the auth audit log, not stored beside it.** Ten consecutive `LOGIN_FAILED` rows for one claimed email inside 15 minutes write an `ACCOUNT_LOCKED` row, and `/auth/login` answers 429 for that email for the next 15 minutes — correct password included. No counter column, no lockout table: the evidence and the control are the same rows. Keyed on the claimed email (lower-cased), so a non-existent account locks exactly like a real one. Requests refused while locked write nothing, so the lock cannot be extended by hammering it. Pinned by [`tests/test_login_throttling.py`](../tests/test_login_throttling.py); rationale in [`app/core/login_lockout.py`](../app/core/login_lockout.py).
+    **The login lockout is derived from this log, not stored beside it (NEX-47).** Ten consecutive `LOGIN_FAILED` rows for one claimed email inside 15 minutes write an `ACCOUNT_LOCKED` row, and `/auth/login` answers 429 for that email for the next 15 minutes — correct password included. No counter column, no lockout table: the evidence and the control are the same rows. Keyed on the claimed email (lower-cased), so a non-existent account locks exactly like a real one. Requests refused while locked write nothing, so the lock cannot be extended by hammering it. Pinned by [`tests/test_login_throttling.py`](../tests/test_login_throttling.py); rationale in [`app/core/login_lockout.py`](../app/core/login_lockout.py).
 
 ### Sensitive admin actions
 
