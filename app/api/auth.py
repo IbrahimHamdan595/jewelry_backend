@@ -13,7 +13,13 @@ from app.core.auth_audit import (
 )
 from app.core.login_lockout import LOCKOUT_DETAIL, is_locked, record_failed_login
 from app.core.rate_limit import limiter
-from app.core.security import create_access_token, hash_password, revoke_sessions, verify_password
+from app.core.security import (
+    DUMMY_PASSWORD_HASH,
+    create_access_token,
+    hash_password,
+    revoke_sessions,
+    verify_password,
+)
 from app.deps import AUTH_COOKIE_NAME, get_current_user, get_db
 from app.models import User
 from app.schemas.auth import ChangePasswordRequest, LoginRequest, TokenResponse, UserOut
@@ -91,7 +97,15 @@ async def login(
         await db.execute(select(User).where(User.email == body.email))
     ).scalar_one_or_none()
 
-    if not user or not verify_password(body.password, user.password_hash):
+    # NEX-54: verify on EVERY attempt, account or no account. This used to be
+    # `if not user or not verify_password(...)`, which returned before bcrypt
+    # ran for an unknown email: ~1 ms against a few hundred for a real one —
+    # a stopwatch was enough to tell which emails have accounts. The dummy is
+    # a real hash of the same cost, so both paths do one bcrypt verification.
+    password_ok = verify_password(
+        body.password, user.password_hash if user else DUMMY_PASSWORD_HASH
+    )
+    if not user or not password_ok:
         await record_failed_login(db, claimed_email=body.email, client_ip=client_ip, user_agent=ua)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 

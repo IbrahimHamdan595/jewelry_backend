@@ -26,12 +26,28 @@ _RSA_ALGORITHM = "RS256"
 _HMAC_ALGORITHMS = ("HS256", "HS384", "HS512")
 
 
+# NEX-54: what /auth/login verifies against when the email matches no user,
+# so an unknown email costs one bcrypt verification just like a real one
+# (otherwise the response time says which accounts exist). A real bcrypt hash
+# of a random password that was thrown away the moment this was generated;
+# nobody can log in with it — the caller rejects the attempt whatever
+# verify_password returns. Precomputed, so importing this module does no
+# bcrypt work and every worker verifies against the same thing. Its cost
+# factor ($12$) MUST equal what hash_password() produces; a test pins that.
+DUMMY_PASSWORD_HASH = "$2b$12$F0XlrDdoK9SQYcDP6E319uxuH16F3iYnuCoaHIQjrMk/W1FVQsLE."
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+    # bcrypt only ever reads the first 72 bytes of a password. Older releases
+    # of the library truncated silently; 5.x raises instead, which turned an
+    # over-long password into a 500 on login. Truncating here is exactly what
+    # bcrypt itself used to do, and it makes every verification the same
+    # fixed-size, fixed-cost operation whatever the caller sends.
+    return bcrypt.checkpw(plain.encode()[:72], hashed.encode())
 
 
 def _shared_secret_algorithm() -> str:

@@ -42,7 +42,9 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
   it stops a guess spread over many addresses, and it lets anyone who knows
   an email keep its owner out for 15 minutes at a time. An admin lifts a
   lock at once with `POST /api/staff/{id}/unlock` (audited as
-  `ACCOUNT_UNLOCKED`).
+  `ACCOUNT_UNLOCKED`). An unknown email costs the same single bcrypt
+  verification as a real one (against a fixed dummy hash), so neither the
+  response nor its timing says which accounts exist.
 - **Sessions can be ended server-side.** Every token carries the user's
   `token_version` and `get_current_user` re-checks it on each request.
   Changing a password (own, or an admin reset) and
