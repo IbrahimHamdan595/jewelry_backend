@@ -16,13 +16,14 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import Index, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import ledger
 from app.core.audit_chain import compute_gl_entry_hash
 from app.models import (
+    GL_UNIQUE_LIVE_SOURCE_TYPES, GL_UQ_LIVE_SOURCE_INDEX, GL_UQ_REVERSAL_INDEX,
     Denomination, GLAccount, GLEntrySequence, GLJournalChainHead,
     GLJournalEntry, GLJournalLine, GLPeriod, PeriodStatus,
 )
@@ -199,25 +200,65 @@ def _line_to_hash_dict(ln: GLLine) -> dict:
     }
 
 
-# The partial unique indexes on gl_journal_entries (models + migration, NEX-49).
-# Postgres names the violated index in the error; SQLite names its columns.
-_UQ_REVERSAL_MARKERS = (
-    "uq_gl_entries_reverses_entry_id",
-    "UNIQUE constraint failed: gl_journal_entries.reverses_entry_id",
-)
-_UQ_LIVE_SOURCE_MARKERS = (
-    "uq_gl_entries_live_source",
-    "UNIQUE constraint failed: gl_journal_entries.source_type, gl_journal_entries.source_id",
-)
+async def find_reversal(db: AsyncSession, entry_id: str) -> GLJournalEntry | None:
+    """The entry that reverses `entry_id`, if any."""
+    return (
+        await db.execute(
+            select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id == entry_id)
+        )
+    ).scalars().first()
+
+
+async def _refuse_duplicate_posting(
+    db: AsyncSession, *, source_type: str, source_id: str | None, reverses_entry_id: str | None,
+) -> None:
+    """409 if this posting would be a second reversal of one entry, or a second
+    live entry for an auto-post source. MUST be called with the chain head
+    locked: postings are serialised by that lock, so whatever a concurrent
+    winner posted is committed and visible by now. reverse_entry and
+    gl_postings.find_live_entry look earlier, before the lock, where two
+    requests can both pass.
+
+    Plain SELECTs on purpose — no FOR UPDATE / FOR SHARE on ledger tables, which
+    would need UPDATE privilege on rows that are append-only."""
+    if reverses_entry_id is not None:
+        existing = await find_reversal(db, reverses_entry_id)
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This entry has already been reversed by {existing.entry_no}.",
+            )
+    elif source_type in GL_UNIQUE_LIVE_SOURCE_TYPES and source_id is not None:
+        existing = (
+            await db.execute(
+                select(GLJournalEntry).where(
+                    GLJournalEntry.source_type == source_type,
+                    GLJournalEntry.source_id == source_id,
+                    GLJournalEntry.reverses_entry_id.is_(None),
+                )
+            )
+        ).scalars().first()
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A journal entry ({existing.entry_no}) has already been posted for this source.",
+            )
+
+
+def _violation_markers(index: Index) -> tuple[str, str]:
+    """How a violation of `index` is spelled in the driver error: Postgres names
+    the index, SQLite names its columns."""
+    cols = ", ".join(f"{index.table.name}.{c.name}" for c in index.columns)
+    return index.name, f"UNIQUE constraint failed: {cols}"
 
 
 def _duplicate_posting_detail(exc: IntegrityError) -> str | None:
     """409 detail when `exc` is one of the two duplicate-posting indexes, else
     None (any other integrity failure is a real bug and must stay loud)."""
     msg = str(exc.orig)
-    if any(m in msg for m in _UQ_REVERSAL_MARKERS):
+    if any(m in msg for m in _violation_markers(GL_UQ_REVERSAL_INDEX)):
         return "This entry has already been reversed."
-    if any(m in msg for m in _UQ_LIVE_SOURCE_MARKERS):
+    if any(m in msg for m in _violation_markers(GL_UQ_LIVE_SOURCE_INDEX)):
         return "A journal entry has already been posted for this source."
     return None
 
@@ -238,8 +279,9 @@ async def post_entry(
     """Post a balanced journal entry inside the caller's transaction (no commit).
 
     Order (design §3.4): resolve OPEN period → resolve denominations from DB →
-    validate balance → lock chain head → allocate entry_no → compute hash →
-    insert header+lines → advance head → record GL_ENTRY_POSTED audit event.
+    validate balance → lock chain head → refuse a duplicate reversal/auto-post →
+    allocate entry_no → compute hash → insert header+lines → advance head →
+    record GL_ENTRY_POSTED audit event.
 
     Lock ordering note: the GL chain head is locked BEFORE InventoryLedger's
     head (inside ledger.record). Always acquire GL-head-then-inventory-head to
@@ -263,6 +305,12 @@ async def post_entry(
         )
     ).scalar_one()
 
+    # Under the lock and before anything is written: the loser of a race is
+    # refused cleanly, with no entry_no burned and the caller's transaction intact.
+    await _refuse_duplicate_posting(
+        db, source_type=source_type, source_id=source_id, reverses_entry_id=reverses_entry_id,
+    )
+
     entry_no = await _next_entry_no(db, entry_date)
     occurred = occurred_at or datetime.now(timezone.utc)
 
@@ -285,10 +333,10 @@ async def post_entry(
     try:
         await db.flush()
     except IntegrityError as exc:
-        # reverse_entry / find_live_entry check BEFORE the head lock, so two
-        # concurrent requests can both pass; the loser lands here. The failed
-        # flush has already rolled the transaction back (head and entry_no
-        # counter included), so answer with a conflict rather than a 500.
+        # Last resort: the unique indexes caught a duplicate the re-check above
+        # could not see (e.g. a stricter isolation level hiding the winner's
+        # row). The failed flush has already rolled the transaction back (head
+        # and entry_no counter included); answer with a conflict, not a 500.
         detail = _duplicate_posting_detail(exc)
         if detail is None:
             raise
@@ -346,19 +394,16 @@ async def reverse_entry(
         raise HTTPException(status_code=404, detail="Entry to reverse not found")
 
     # Refuse BEFORE post_entry, so a refused attempt never locks or advances the
-    # chain head and burns no entry_no. Deliberately not tied to the period: a
-    # reversal is booked when it happens, often a later month than the original.
+    # chain head and burns no entry_no (post_entry looks again under the lock for
+    # the concurrent case). Deliberately not tied to the period: a reversal is
+    # booked when it happens, often a later month than the original.
     if original.reverses_entry_id is not None:
         raise HTTPException(
             status_code=409,
             detail=f"Entry {original.entry_no} is a reversal and cannot itself be reversed. "
-                   f"Post a new entry instead.",
+                   f"Post a correcting manual entry instead.",
         )
-    existing = (
-        await db.execute(
-            select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id == original.id)
-        )
-    ).scalars().first()
+    existing = await find_reversal(db, original.id)
     if existing is not None:
         raise HTTPException(
             status_code=409,

@@ -1035,6 +1035,20 @@ _GL_LIVE_SOURCE_WHERE = (
     + ", ".join(f"'{s}'" for s in GL_UNIQUE_LIVE_SOURCE_TYPES) + ")"
 )
 
+# NEX-49 backstops behind gl.post_entry's duplicate checks (both partial, and
+# declared for SQLite too so the test schema enforces them). Named here so the
+# posting engine can recognise a violation without repeating the index names.
+# An entry is reversed at most once ...
+GL_UQ_REVERSAL_INDEX = Index(
+    "uq_gl_entries_reverses_entry_id", "reverses_entry_id", unique=True,
+    postgresql_where=text(_GL_REVERSAL_WHERE), sqlite_where=text(_GL_REVERSAL_WHERE),
+)
+# ... and an auto-post source has at most one live entry.
+GL_UQ_LIVE_SOURCE_INDEX = Index(
+    "uq_gl_entries_live_source", "source_type", "source_id", unique=True,
+    postgresql_where=text(_GL_LIVE_SOURCE_WHERE), sqlite_where=text(_GL_LIVE_SOURCE_WHERE),
+)
+
 
 class GLJournalEntry(Base):
     """Append-only, hash-chained journal-entry header (design §3.3)."""
@@ -1062,18 +1076,8 @@ class GLJournalEntry(Base):
         Index("ix_gl_entries_entry_date", "entry_date"),
         Index("ix_gl_entries_period", "period_id"),
         Index("ix_gl_entries_source", "source_type", "source_id"),
-        # NEX-49 backstops for races the in-code checks cannot see (both partial,
-        # declared for SQLite too so the test schema enforces them):
-        # an entry is reversed at most once ...
-        Index(
-            "uq_gl_entries_reverses_entry_id", "reverses_entry_id", unique=True,
-            postgresql_where=text(_GL_REVERSAL_WHERE), sqlite_where=text(_GL_REVERSAL_WHERE),
-        ),
-        # ... and an auto-post source has at most one live entry.
-        Index(
-            "uq_gl_entries_live_source", "source_type", "source_id", unique=True,
-            postgresql_where=text(_GL_LIVE_SOURCE_WHERE), sqlite_where=text(_GL_LIVE_SOURCE_WHERE),
-        ),
+        GL_UQ_REVERSAL_INDEX,
+        GL_UQ_LIVE_SOURCE_INDEX,
     )
 
 

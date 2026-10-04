@@ -1,7 +1,8 @@
 """NEX-49 — a journal entry is reversed at most once, and a reversal is never
-reversed. Guarded twice: gl.reverse_entry refuses with a 409 before the chain
-head moves, and partial unique indexes on gl_journal_entries are the backstop
-for the race the in-code check cannot see (and for auto-post double-posts)."""
+reversed. Three layers: gl.reverse_entry refuses with a 409 before the chain
+head moves; gl.post_entry looks again under the chain-head lock, which settles
+concurrent attempts (and auto-post double-posts) without a failed write; and
+partial unique indexes on gl_journal_entries are the last resort."""
 from datetime import date
 from decimal import Decimal
 from uuid import uuid4
@@ -105,6 +106,8 @@ async def test_reversing_a_reversal_refused_and_chain_untouched(db):
         await gl.reverse_entry(db, original_entry_id=rev.id, actor_user_id="u1",
                                entry_date=date(2026, 6, 4))
     assert exc.value.status_code == 409
+    # The way out is a correcting manual entry, and the refusal says so.
+    assert rev.entry_no in exc.value.detail and "manual entry" in exc.value.detail
     assert await _chain_state(db) == before
 
 
@@ -195,13 +198,57 @@ async def test_index_rejects_duplicate_live_auto_post_source_inserted_directly(d
                                                source_id="order-1"))
 
 
-# ── Index backstop: the lost race surfaces as a clean 409 ─────────────────────
+# ── The lost race: re-checked under the chain-head lock ───────────────────────
+# reverse_entry and find_live_entry both look BEFORE the chain-head lock, so two
+# requests can both pass. post_entry looks again once it holds the lock: the
+# loser is refused before any insert, so nothing is flushed, nothing fails, and
+# the caller's transaction is left usable.
 
 @pytest.mark.asyncio
-async def test_lost_reversal_race_is_409_and_leaves_chain_untouched(db):
-    """Two requests can both pass reverse_entry's check before either commits.
-    The loser then trips the index inside post_entry: that must be a 409, not
-    an IntegrityError (500), and nothing of the attempt may persist."""
+async def test_lost_reversal_race_is_refused_under_the_lock_without_poisoning_the_transaction(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 4))
+    before = await _chain_state(db)
+
+    # The loser's view: its own check already passed, so it reaches post_entry.
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=orig.id,
+                    reverses_entry_id=orig.id, entry_date=date(2026, 6, 4))
+    assert exc.value.status_code == 409
+
+    # No rollback needed: nothing was written, and the same transaction carries on.
+    assert await _chain_state(db) == before
+    await _post(db, accts)
+    assert (await _chain_state(db))[0] == before[0] + 1
+
+
+@pytest.mark.asyncio
+async def test_lost_auto_post_race_is_refused_under_the_lock_without_poisoning_the_transaction(db):
+    accts = await _setup(db)
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    before = await _chain_state(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    assert exc.value.status_code == 409
+
+    assert await _chain_state(db) == before
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-2")
+    assert (await _chain_state(db))[0] == before[0] + 1
+
+
+# ── Last resort: the index, when even the re-check cannot see the winner ──────
+
+async def _sees_nothing(*args, **kwargs):
+    """The re-check as it would behave under an isolation level that hides the
+    winner's committed row (or any future path that skips it)."""
+    return None
+
+
+@pytest.mark.asyncio
+async def test_index_violation_on_a_duplicate_reversal_is_a_409_not_a_500(db, monkeypatch):
     accts = await _setup(db)
     orig = await _post(db, accts)
     orig_id = orig.id
@@ -210,31 +257,46 @@ async def test_lost_reversal_race_is_409_and_leaves_chain_untouched(db):
     await db.commit()
     before = await _chain_state(db)
 
-    # The loser's view: its check already passed, so it goes straight to the insert.
+    monkeypatch.setattr(gl, "_refuse_duplicate_posting", _sees_nothing)
     with pytest.raises(HTTPException) as exc:
         await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=orig_id,
                     reverses_entry_id=orig_id, entry_date=date(2026, 6, 4))
     assert exc.value.status_code == 409
 
-    await db.rollback()  # what closing the request's session does
+    await db.rollback()  # the failed flush killed the transaction; closing the session does this
     assert await _chain_state(db) == before
 
 
 @pytest.mark.asyncio
-async def test_lost_auto_post_race_is_409_and_leaves_chain_untouched(db):
-    """find_live_entry runs before the chain-head lock, so two simultaneous
-    posts of one source can both pass it. The index refuses the second."""
+async def test_index_violation_on_a_duplicate_auto_post_is_a_409_not_a_500(db, monkeypatch):
     accts = await _setup(db)
     await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
     await db.commit()
     before = await _chain_state(db)
 
+    monkeypatch.setattr(gl, "_refuse_duplicate_posting", _sees_nothing)
     with pytest.raises(HTTPException) as exc:
         await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
     assert exc.value.status_code == 409
 
     await db.rollback()
     assert await _chain_state(db) == before
+
+
+def test_integrity_markers_come_from_the_model_indexes():
+    """No second copy of the index names: the translation reads them (and the
+    SQLite column spelling) off the Index objects the schema is built from."""
+    from app.models import GL_UQ_LIVE_SOURCE_INDEX, GL_UQ_REVERSAL_INDEX, GLJournalEntry
+
+    assert {GL_UQ_REVERSAL_INDEX, GL_UQ_LIVE_SOURCE_INDEX} <= GLJournalEntry.__table__.indexes
+    assert gl._violation_markers(GL_UQ_REVERSAL_INDEX) == (
+        GL_UQ_REVERSAL_INDEX.name,
+        "UNIQUE constraint failed: gl_journal_entries.reverses_entry_id",
+    )
+    assert gl._violation_markers(GL_UQ_LIVE_SOURCE_INDEX) == (
+        GL_UQ_LIVE_SOURCE_INDEX.name,
+        "UNIQUE constraint failed: gl_journal_entries.source_type, gl_journal_entries.source_id",
+    )
 
 
 def test_only_the_two_duplicate_posting_indexes_become_a_409():
