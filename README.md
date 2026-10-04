@@ -379,6 +379,14 @@ jewelry_backend/
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
 - **Health check path:** `/health` (no auth, no database access).
+- **Migrations before code.** Migrations are applied by hand and the service
+  deploys from `main`, so a release that maps a new column must have its
+  migration applied first. In particular `e65d977573d3` (`users.token_version`,
+  NEX-54) has to be in place before the code that reads it is deployed: the
+  column is selected on every authenticated request. The migration on its own
+  is safe under the previous release.
+- **JWT keys:** see [JWT signing keys (RS256)](#jwt-signing-keys-rs256) for
+  key generation and the cutover order with the frontend.
 - **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
   than `development` / `dev` / `local` / `test` keeps `/docs`, `/redoc` and
   `/openapi.json` at 404.
