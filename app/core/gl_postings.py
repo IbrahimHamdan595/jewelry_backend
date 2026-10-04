@@ -194,6 +194,12 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     original = await find_live_entry(db, SOURCE_ORDER, order.id)
     if original is None:
         return None  # nothing was posted (e.g. flag was off at sale time)
+    # Full void/refund of a sale whose entry is already reversed — by an earlier
+    # void/refund, or by hand from the journal: nothing left to post. Skip, like
+    # the other mappers, so the void/refund itself still completes and the books
+    # are not reversed twice.
+    if refunded_item is None and await gl.find_reversal(db, original.id):
+        return None
 
     # Reversals are booked when they happen, not when the original sale was — so
     # they can land in a month that has no period row yet. Every other posting
@@ -204,8 +210,6 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     await ensure_period(db, entry_date)
 
     if refunded_item is None:
-        if await find_live_entry(db, SOURCE_ORDER_REFUND, order.id):
-            return None
         return await gl.reverse_entry(
             db, original_entry_id=original.id, actor_user_id=actor_user_id,
             entry_date=entry_date, memo=f"Void {order.order_number}",

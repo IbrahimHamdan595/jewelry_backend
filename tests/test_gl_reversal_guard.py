@@ -371,10 +371,9 @@ def test_live_source_index_covers_exactly_the_auto_post_sources():
     assert set(GL_UNIQUE_LIVE_SOURCE_TYPES) == auto_post_sources
 
 
-# ── Auto-post path: a second full void/refund of one order ────────────────────
+# ── Auto-post path: full void/refund of an order whose sale is already reversed ─
 
-@pytest.mark.asyncio
-async def test_second_full_void_of_an_order_is_refused_not_double_reversed(db):
+async def _sold_order(db):
     from app.core.coa_seed import seed_chart_of_accounts
     from app.models import Karat, Order, OrderItem, OrderItemKind, PaymentMethod, Settings
     from tests.conftest import BOOK_DATETIME
@@ -397,12 +396,35 @@ async def test_second_full_void_of_an_order_is_refused_not_double_reversed(db):
     await db.flush()
     cfg = Settings(id="singleton", accounting_auto_post_enabled=True, vat_percent=D("11"),
                    lbp_exchange_rate=D("89500"))
+    sale = await glp.post_sale(db, order, cfg, "u1")
+    return order, cfg, sale
 
-    await glp.post_sale(db, order, cfg, "u1")
+
+@pytest.mark.asyncio
+async def test_second_full_void_of_an_order_is_skipped_not_double_reversed(db):
+    order, cfg, _ = await _sold_order(db)
     assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is not None
     before = await _chain_state(db)
 
-    with pytest.raises(HTTPException) as exc:
-        await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None)
-    assert exc.value.status_code == 409
+    # Same skip semantics as every other mapper: already done → nothing to post.
+    assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is None
     assert await _chain_state(db) == before
+
+
+@pytest.mark.asyncio
+async def test_void_after_the_sale_entry_was_reversed_by_hand_skips_the_posting(db):
+    """An accountant reversed the sale entry from the journal; the order is
+    voided afterwards. The void must go through (stock comes back) and the books
+    must not be reversed a second time."""
+    order, cfg, sale = await _sold_order(db)
+    await gl.reverse_entry(db, original_entry_id=sale.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 20), memo="reversed by hand")
+    before = await _chain_state(db)
+
+    assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is None
+    assert await _chain_state(db) == before
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CASH"]["net_base"] == D("0.00")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")
