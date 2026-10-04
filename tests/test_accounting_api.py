@@ -197,3 +197,146 @@ async def test_reverse_endpoint_refuses_to_reverse_a_reversal(client):
     v = (await client.get("/api/accounting/ledger/verify")).json()
     assert v["status"] == "intact" and v["head_matches"] is True
     assert v["head_row_count"] == 2 and v["head_latest_hash"] == rev["entry_hash"]
+
+
+# ── NEX-49: a manual entry may not claim a source type the system posts under ─
+
+async def _manual_payload(client, **over):
+    """Seed + open June 2026 and return a balanced manual-entry payload."""
+    await client.post("/api/accounting/seed-coa")
+    await client.post("/api/accounting/periods", json={"year": 2026, "period_no": 6})
+    accts = (await client.get("/api/accounting/accounts")).json()["items"]
+    by_key = {a["system_key"]: a["id"] for a in accts}
+    return {
+        "entry_date": "2026-06-03", "memo": "manual",
+        "lines": [
+            {"account_id": by_key["CASH"], "base_debit": "100", "money_debit": "100"},
+            {"account_id": by_key["SALES_REVENUE"], "base_credit": "100", "money_credit": "100"},
+        ],
+        **over,
+    }
+
+
+async def _entry_total(client) -> int:
+    return (await client.get("/api/accounting/journal-entries")).json()["total"]
+
+
+def test_reserved_source_types_cover_everything_the_system_posts_under():
+    """Enumerated from the code: every SOURCE_* constant (and YEAR_CLOSE) of every
+    app.core module that posts to the GL, except MANUAL. A new posting module or
+    source type fails here until it is reserved too."""
+    import importlib
+    import inspect
+    import pkgutil
+
+    import app.core as core_pkg
+    from app.api.accounting import RESERVED_SOURCE_TYPES
+    from app.core import gl
+
+    system = set()
+    for info in pkgutil.iter_modules(core_pkg.__path__):
+        mod = importlib.import_module(f"app.core.{info.name}")
+        if "post_entry(" not in inspect.getsource(mod):
+            continue
+        system |= {v for k, v in vars(mod).items()
+                   if isinstance(v, str) and (k.startswith("SOURCE_") or k == "YEAR_CLOSE")}
+    system.discard(gl.SOURCE_MANUAL)
+
+    assert len(system) == 15, sorted(system)
+    assert RESERVED_SOURCE_TYPES == system
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_rejects_every_reserved_source_type(client):
+    from app.api.accounting import RESERVED_SOURCE_TYPES
+
+    payload = await _manual_payload(client)
+    for st in sorted(RESERVED_SOURCE_TYPES):
+        r = await client.post("/api/accounting/journal-entries", json={**payload, "source_type": st})
+        assert r.status_code == 422, (st, r.text)
+        assert "reserved" in r.json()["detail"], st
+    # Spelling tricks do not get round it.
+    r = await client.post("/api/accounting/journal-entries", json={**payload, "source_type": " order "})
+    assert r.status_code == 422, r.text
+    assert await _entry_total(client) == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_still_accepts_what_the_frontend_sends(client):
+    payload = await _manual_payload(client)
+    # The journal page posts source_type "MANUAL" and no source_id ...
+    r = await client.post("/api/accounting/journal-entries", json={**payload, "source_type": "MANUAL"})
+    assert r.status_code == 200, r.text
+    assert r.json()["source_type"] == "MANUAL" and r.json()["source_id"] is None
+    # ... and leaving source_type out means MANUAL too.
+    r = await client.post("/api/accounting/journal-entries", json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json()["source_type"] == "MANUAL"
+    # A free-text reference on a manual entry is still fine, and may repeat.
+    for _ in range(2):
+        r = await client.post("/api/accounting/journal-entries",
+                              json={**payload, "source_type": "MANUAL", "source_id": "ref-1"})
+        assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_manual_order_entry_cannot_preempt_the_real_sale_posting(client, db):
+    """A manual (ORDER, <order id>) entry used to be accepted; find_live_entry
+    then took it for the sale's entry and post_sale silently posted nothing."""
+    from decimal import Decimal as D
+    from app.core import gl_postings
+    from app.models import (
+        GLJournalEntry, Karat, Order, OrderItem, OrderItemKind, PaymentMethod, Settings,
+    )
+    from tests.conftest import BOOK_DATETIME
+
+    payload = await _manual_payload(client)
+    order = Order(
+        order_number="ORD-1", cashier_id="u-admin", payment_method=PaymentMethod.CASH,
+        subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
+        discount_percent=D("0"), discount_amount=D("0"),
+        total_usd=D("111"), total_lbp=D("9934500"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,
+    )
+    order.items = [OrderItem(
+        item_kind=OrderItemKind.COIN, product_code="C1", product_name="Coin", karat=Karat.K21,
+        weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"), margin_percent=D("0"),
+        making_charge=D("0"), final_price=D("100"), quantity=1,
+    )]
+    db.add(order)
+    await db.flush()
+
+    r = await client.post("/api/accounting/journal-entries",
+                          json={**payload, "source_type": "ORDER", "source_id": order.id})
+    assert r.status_code == 422, r.text
+
+    cfg = Settings(id="singleton", accounting_auto_post_enabled=True, vat_percent=D("11"),
+                   lbp_exchange_rate=D("89500"))
+    sale = await gl_postings.post_sale(db, order, cfg, "u-admin")
+    assert sale is not None and sale.source_type == "ORDER" and sale.source_id == order.id
+    from sqlalchemy import select
+    assert len((await db.execute(select(GLJournalEntry))).scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_year_close_entry_is_rejected_and_does_not_close_the_year(client, db):
+    from app.core import period_close
+
+    payload = await _manual_payload(client)
+    r = await client.post("/api/accounting/journal-entries",
+                          json={**payload, "source_type": "YEAR_CLOSE"})
+    assert r.status_code == 422, r.text
+    assert await period_close._year_already_closed(db, 2026) is False
+
+
+@pytest.mark.asyncio
+async def test_manual_reversal_without_reverses_entry_id_is_rejected(client):
+    """A manual entry labelled REVERSAL carries no reverses_entry_id, so neither
+    the guard nor the index would know the entry it claims to reverse."""
+    payload = await _manual_payload(client)
+    orig = (await client.post("/api/accounting/journal-entries", json=payload)).json()
+
+    r = await client.post("/api/accounting/journal-entries",
+                          json={**payload, "source_type": "REVERSAL", "source_id": orig["id"]})
+    assert r.status_code == 422, r.text
+    assert await _entry_total(client) == 1
