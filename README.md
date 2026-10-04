@@ -42,6 +42,13 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
   an email keep its owner out for 15 minutes at a time. An admin lifts a
   lock at once with `POST /api/staff/{id}/unlock` (audited as
   `ACCOUNT_UNLOCKED`).
+- **Sessions can be ended server-side.** Every token carries the user's
+  `token_version` and `get_current_user` re-checks it on each request.
+  Changing a password (own, or an admin reset) and
+  `POST /api/staff/{id}/force-logout` bump it, which signs that user out
+  everywhere; the person changing their own password gets a fresh cookie in
+  the same response. Plain logout only drops the cookie on that device, so
+  shop tills sharing one account do not log each other out.
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
@@ -244,7 +251,7 @@ jewelry_backend/
 │   │   ├── products.py
 │   │   ├── reports.py          # dashboard aggregates
 │   │   ├── settings.py
-│   │   ├── staff.py            # cashier user management (audited) + lockout unlock
+│   │   ├── staff.py            # cashier user management (audited) + unlock, force-logout
 │   │   ├── stock_takes.py      # physical-count workflow (audit B2)
 │   │   ├── suppliers.py        # suppliers + purchases + payments
 │   │   └── zakat.py            # live computation + snapshots
@@ -261,7 +268,7 @@ jewelry_backend/
 │   │   ├── permissions.py      # require_admin
 │   │   ├── pricing.py          # KARAT_PURITY, calculate_price, etc.
 │   │   ├── rate_limit.py       # SlowAPI limiter (login), keyed on the client IP
-│   │   ├── security.py         # JWT + bcrypt
+│   │   ├── security.py         # JWT + bcrypt + revoke_sessions (token_version)
 │   │   ├── stock_take.py       # StockTakeRefType → AdjustmentTarget mapping
 │   │   └── zakat.py            # holdings aggregator + integrity hash
 │   │

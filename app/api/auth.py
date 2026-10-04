@@ -13,7 +13,7 @@ from app.core.auth_audit import (
 )
 from app.core.login_lockout import LOCKOUT_DETAIL, is_locked, record_failed_login
 from app.core.rate_limit import limiter
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import create_access_token, hash_password, revoke_sessions, verify_password
 from app.deps import AUTH_COOKIE_NAME, get_current_user, get_db
 from app.models import User
 from app.schemas.auth import ChangePasswordRequest, LoginRequest, TokenResponse, UserOut
@@ -30,6 +30,15 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         secure=settings.cookie_secure,
         samesite=settings.cookie_samesite,
         path="/",
+    )
+
+
+def _issue_token(user: User) -> str:
+    # `role` is what the frontend middleware reads; `ver` is what
+    # get_current_user compares against users.token_version (NEX-54).
+    return create_access_token(
+        subject=user.id,
+        extra={"role": user.role.value, "ver": user.token_version},
     )
 
 
@@ -97,7 +106,7 @@ async def login(
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
 
-    token = create_access_token(subject=user.id, extra={"role": user.role.value})
+    token = _issue_token(user)
     _set_auth_cookie(response, token)
 
     fire_auth_event(
@@ -119,7 +128,14 @@ async def me(user: User = Depends(get_current_user)):
 @router.post("/logout", status_code=204)
 async def logout(request: Request, response: Response):
     """Clear the auth cookie. Best-effort audit even if the caller had no
-    valid session (they may have been holding a stale cookie)."""
+    valid session (they may have been holding a stale cookie).
+
+    Deliberately does NOT bump token_version (NEX-54). Shop terminals may
+    share one account, and logging one till out must not log out the till
+    next to it. This ends THIS device's session by dropping its cookie;
+    ending all of a user's sessions is a password change or an admin
+    force-logout (`POST /staff/{id}/force-logout`).
+    """
     response.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
     fire_auth_event(
         event_type=EVENT_LOGOUT,
@@ -131,17 +147,34 @@ async def logout(request: Request, response: Response):
     return None
 
 
-@router.post("/change-password", status_code=204)
+@router.post("/change-password", response_model=TokenResponse)
 async def change_password(
     request: Request,
+    response: Response,
     body: ChangePasswordRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Change the caller's password and end every other session of theirs.
+
+    NEX-54: replacing the hash used to invalidate nothing — a token minted
+    before the change stayed valid for the rest of its 8 hours, which is
+    exactly the window someone who knew the old password needs. The same
+    transaction now bumps token_version, so every token issued so far is
+    refused from the next request on.
+
+    That includes the one this request arrived with, so a fresh token is
+    issued in the same response (cookie + body, the login shape) and the
+    person who changed their own password stays signed in on this device.
+    """
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
     user.password_hash = hash_password(body.new_password)
+    await revoke_sessions(db, user)
     await db.commit()
+
+    token = _issue_token(user)
+    _set_auth_cookie(response, token)
 
     fire_auth_event(
         event_type=EVENT_PASSWORD_CHANGED,
@@ -150,3 +183,5 @@ async def change_password(
         client_ip=get_client_ip(request),
         user_agent=_ua(request),
     )
+
+    return TokenResponse(access_token=token, user=UserOut.model_validate(user))

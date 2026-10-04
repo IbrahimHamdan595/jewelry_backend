@@ -101,6 +101,8 @@ EVENT_GOLD_RATE_REFRESH_TRIGGERED = "GOLD_RATE_REFRESH_TRIGGERED"
 EVENT_SALE_ON_STALE_RATE_ACK = "SALE_ON_STALE_RATE_ACK"
 EVENT_STAFF_CREATED = "STAFF_CREATED"
 EVENT_STAFF_UPDATED = "STAFF_UPDATED"
+# NEX-54: an admin ended every session of a user (token_version bump).
+EVENT_STAFF_FORCE_LOGOUT = "STAFF_FORCE_LOGOUT"
 
 # Audit phase B2 — stock-take workflow events. These are the workflow
 # wrappers; APPROVE additionally emits a COIN_STOCK_ADJUSTED or

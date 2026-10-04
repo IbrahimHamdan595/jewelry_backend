@@ -3,10 +3,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_audit import get_client_ip
-from app.core.ledger import EVENT_STAFF_CREATED, EVENT_STAFF_UPDATED, field_diff, record
+from app.core.ledger import (
+    EVENT_STAFF_CREATED,
+    EVENT_STAFF_FORCE_LOGOUT,
+    EVENT_STAFF_UPDATED,
+    field_diff,
+    record,
+)
 from app.core.login_lockout import record_unlock
 from app.core.permissions import require_admin
-from app.core.security import hash_password
+from app.core.security import hash_password, revoke_sessions
 from app.deps import get_db
 from app.models import Role, User
 from app.schemas.settings import StaffCreate, StaffOut, StaffUpdate
@@ -91,6 +97,9 @@ async def update_staff(
         user.name = body.name
     if body.password is not None:
         user.password_hash = hash_password(body.password)
+        # NEX-54: a reset is a password change — whoever was signed in with
+        # the old password is signed out.
+        await revoke_sessions(db, user)
     if body.is_active is not None:
         user.is_active = body.is_active
 
@@ -182,5 +191,43 @@ async def unlock_staff(
         actor=actor,
         client_ip=get_client_ip(request),
         user_agent=request.headers.get("user-agent"),
+    )
+    await db.commit()
+
+
+@router.post("/{user_id}/force-logout", status_code=204)
+async def force_logout_staff(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    """End every session of a user, on every device, from their next request.
+
+    For a lost or stolen device, or a token that may have leaked. NOT a ban:
+    the account stays usable and the person can sign straight back in — to
+    keep someone out, deactivate them (DELETE) or reset their password.
+
+    Unlike the rest of this router this is not limited to cashiers: a stolen
+    accountant or admin session has to be revocable too.
+
+    AUDIT: STAFF_FORCE_LOGOUT carries the target's email and the
+    token_version step, in the same transaction as the bump itself.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    await revoke_sessions(db, user)
+    await record(
+        db,
+        event_type=EVENT_STAFF_FORCE_LOGOUT,
+        actor_user_id=actor.id,
+        ref_type="user",
+        ref_id=user.id,
+        payload={
+            "email": user.email,
+            # This request's own step, read back after the increment.
+            "token_version": {"from": user.token_version - 1, "to": user.token_version},
+        },
     )
     await db.commit()

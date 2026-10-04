@@ -223,6 +223,10 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[Role] = mapped_column(Enum(Role, name="role_enum"), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # NEX-54: every JWT carries the version it was issued under and
+    # get_current_user refuses any other, so bumping this ends all of the
+    # user's sessions at once (see revoke_sessions in app/core/security.py).
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
