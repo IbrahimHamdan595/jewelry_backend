@@ -120,8 +120,14 @@ cd jewelry_backend
 ./.venv/bin/python -m scripts.replay_gl_history --actor-email <admin email>
 ```
 
-It runs against whatever `DATABASE_URL` the environment points at and prints
-the host and database first. **Read that line.**
+It runs against whatever `DATABASE_URL` the environment points at — the `.env`
+in the directory you run it from, unless the variable is set in the shell — and
+prints the host and database first. **Read that line.** To rehearse on a Neon
+branch instead of the live database, set the variable for that one command:
+
+```bash
+DATABASE_URL='<branch url>' ./.venv/bin/python -m scripts.replay_gl_history --actor-email <admin email>
+```
 
 The dry run performs the real replay inside a transaction and rolls it back,
 so the report is exactly what `--execute` would post:
