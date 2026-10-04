@@ -33,8 +33,9 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
 - **Alembic** for every schema change. Never `create_all` in production.
 - **APScheduler** for the gold-rate poller (runs every N minutes, alerts
   via Discord webhook after N consecutive failures).
-- **JWT auth** via `python-jose`, HttpOnly cookie set by the backend on
-  login; bcrypt for password hashing. Login is throttled twice: SlowAPI
+- **JWT auth** via `python-jose` (HS256, or RS256 once a key pair is
+  provisioned so the frontend only ever holds a public key), HttpOnly cookie
+  set by the backend on login; bcrypt for password hashing. Login is throttled twice: SlowAPI
   rate-limit (5/min per client IP, taken from `X-Forwarded-For`) and a
   per-account lockout (10 consecutive failures in 15 min lock that email
   for 15 min, derived from the auth audit log). The lockout cuts both ways:
@@ -95,6 +96,11 @@ DATABASE_URL="postgresql+asyncpg://user:pass@host/dbname?ssl=require"
 JWT_SECRET="..."
 JWT_ALGORITHM="HS256"
 JWT_EXPIRES_MINUTES=480
+# RS256 signing — optional; see "JWT signing keys (RS256)" below. With none of
+# these set, tokens are HS256 signed with JWT_SECRET.
+# JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+# JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+# JWT_ACCEPT_HS256=true
 
 # CORS — comma-separated list of allowed frontend origins. Exact origins only:
 # there is deliberately no wildcard/regex (NEX-45). If you develop through a
@@ -159,6 +165,66 @@ written to the inventory ledger as `SALE_ON_STALE_RATE_ACK`
 
 **Raising `GOLD_REFRESH_MINUTES` also delays the point at which the till starts
 prompting.** They are the same knob.
+
+### JWT signing keys (RS256)
+
+The Next.js middleware verifies the session token itself. With HS256 that
+means the frontend host holds `JWT_SECRET` — the same key that **mints**
+tokens. With RS256 the backend keeps a private key and the frontend gets a
+public key that can only verify (NEX-54).
+
+| Setting | Default | Effect |
+|---|---|---|
+| `JWT_PRIVATE_KEY` | unset | When set, new tokens are signed **RS256** with it. Unset: HS256 with `JWT_SECRET`, as before. |
+| `JWT_PUBLIC_KEY` | unset | Verifies RS256 tokens. Derived from the private key if left unset. The frontend needs this value. |
+| `JWT_ACCEPT_HS256` | `true` | Keep accepting `JWT_SECRET`-signed tokens. Set `false` to end the migration window. |
+
+Both keys are PEM. Newlines may be real or written as the two characters `\n`.
+`JWT_ALGORITHM` is **not** how RS256 is selected — it only names the
+shared-secret algorithm; leave it alone on the backend.
+
+Merging this changes nothing until `JWT_PRIVATE_KEY` is set. If the keys are
+unusable (not PEM, public pasted as private, a public key that does not belong
+to the private one) the service refuses to start, so a bad key fails the deploy
+instead of breaking every login.
+
+**Generate a pair:**
+
+```bash
+# Private key (PKCS#8). Stays on the backend host; never goes to Vercel.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+
+# Public key (SPKI, "BEGIN PUBLIC KEY"). This is the half the frontend gets.
+openssl rsa -in jwt_private.pem -pubout -out jwt_public.pem
+
+# One-line forms, for env-var fields that do not take multi-line values:
+awk 'NF {printf "%s\\n", $0}' jwt_private.pem; echo
+awk 'NF {printf "%s\\n", $0}' jwt_public.pem; echo
+
+# Once both are in Render / Vercel, do not keep them on disk or in git:
+rm jwt_private.pem jwt_public.pem
+```
+
+**Cutover order** (do steps 2 and 3 back to back, outside shop hours):
+
+1. Generate the pair.
+2. **Render (backend):** set `JWT_PRIVATE_KEY` and `JWT_PUBLIC_KEY`. Leave
+   `JWT_ACCEPT_HS256`, `JWT_SECRET` and `JWT_ALGORITHM` as they are. Deploy.
+   New logins are RS256; sessions already open (HS256) keep working.
+3. **Vercel (frontend):** set `JWT_PUBLIC_KEY` to the same public key and
+   `JWT_ALGORITHM=RS256`. Redeploy. If the middleware checks one algorithm at
+   a time, a login made between steps 2 and 3 bounces back to `/login` until
+   this step lands, and anyone still on an HS256 cookie afterwards is asked
+   to log in once.
+4. **Wait `JWT_EXPIRES_MINUTES` (8 hours)** so every HS256 token has expired.
+5. **Render:** set `JWT_ACCEPT_HS256=false`. From here `JWT_SECRET` can
+   neither mint nor verify a session.
+6. **Vercel:** remove `JWT_SECRET`. On Render `JWT_SECRET` must stay defined
+   (the config requires it) — leave its value in place rather than blanking it.
+
+Rollback before step 5: unset `JWT_PRIVATE_KEY` on Render (signing goes back to
+HS256; keep `JWT_PUBLIC_KEY` so RS256 sessions already issued stay valid) and
+restore `JWT_ALGORITHM=HS256` / remove `JWT_PUBLIC_KEY` on Vercel.
 
 ## Database migrations
 

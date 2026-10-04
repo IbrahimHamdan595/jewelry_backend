@@ -7,6 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _LOCAL_ENVIRONMENTS = {"development", "dev", "local", "test"}
 
 
+def _pem(value: str) -> str:
+    """A PEM as pasted into an env-var UI: often on one line, with newlines
+    written as the two characters backslash-n, sometimes still in quotes."""
+    return value.strip().strip("\"'").replace("\\n", "\n").strip()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -16,8 +22,22 @@ class Settings(BaseSettings):
 
     database_url: str
     jwt_secret: str
+    # The SHARED-SECRET algorithm only (HS256/HS384/HS512). RS256 is not
+    # selected here: it is switched on by JWT_PRIVATE_KEY below.
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 480
+    # NEX-54: asymmetric signing, so the frontend can verify a session without
+    # holding anything that can mint one. PEM; literal "\n" for newlines is fine.
+    #   JWT_PRIVATE_KEY set  → new tokens are signed RS256 with it.
+    #   JWT_PRIVATE_KEY unset → HS256 with JWT_SECRET, exactly as before.
+    #   JWT_PUBLIC_KEY       → verifies RS256 tokens (derived from the private
+    #                          key when left unset). This is the half Vercel gets.
+    #   JWT_ACCEPT_HS256     → keep accepting shared-secret tokens. True for the
+    #                          migration window; set false once every HS256
+    #                          session has expired (JWT_EXPIRES_MINUTES later).
+    jwt_private_key: str = ""
+    jwt_public_key: str = ""
+    jwt_accept_hs256: bool = True
     # Stored as a plain comma-separated string so pydantic-settings never
     # tries to JSON-parse it. Use the cors_origins property everywhere.
     cors_origins_raw: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
@@ -40,6 +60,14 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.strip().lower() not in _LOCAL_ENVIRONMENTS
+
+    @property
+    def jwt_private_key_pem(self) -> str:
+        return _pem(self.jwt_private_key)
+
+    @property
+    def jwt_public_key_pem(self) -> str:
+        return _pem(self.jwt_public_key)
     gold_api_key: str = ""
     gold_api_url: str = "https://www.goldapi.io/api/XAU/USD"
     gold_refresh_minutes: int = 15
