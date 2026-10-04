@@ -521,11 +521,16 @@ async def void_order(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
+    # Lock the order row and judge by the locked row (populate_existing), so a
+    # second concurrent void/refund waits here and is then refused below exactly
+    # like a sequential one — before any stock is restored.
     order = (
         await db.execute(
             select(Order)
             .options(selectinload(Order.cashier), selectinload(Order.items))
             .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if not order:
@@ -647,11 +652,15 @@ async def refund_order(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
+    # Same lock as void_order: one of two concurrent void/refund requests wins,
+    # the other sees the new status and is refused.
     order = (
         await db.execute(
             select(Order)
             .options(selectinload(Order.cashier), selectinload(Order.items))
             .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if not order:

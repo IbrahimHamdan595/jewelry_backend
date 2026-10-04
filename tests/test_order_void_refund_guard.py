@@ -91,3 +91,70 @@ async def test_refund_completes_when_the_sale_entry_was_already_reversed_by_hand
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "REFUNDED"
     assert await _reversals(db) == 1
+
+
+# ── One void wins: the order row is locked and its status re-read ─────────────
+# The real race needs two connections (proved on Postgres, see NEX-49); SQLite
+# has no row locks. These pin the two properties the handlers rely on: the
+# order is read FOR UPDATE, and the status that is checked is the locked row's.
+
+def _order_selects(db):
+    """Postgres SQL of every primary SELECT of Order the session runs."""
+    from sqlalchemy import event
+    from sqlalchemy.dialects import postgresql
+
+    seen: list[str] = []
+
+    @event.listens_for(db.sync_session, "do_orm_execute")
+    def _spy(state):
+        if not state.is_select or state.is_relationship_load or state.is_column_load:
+            return
+        if state.statement.column_descriptions[0].get("entity") is Order:
+            seen.append(str(state.statement.compile(dialect=postgresql.dialect())))
+
+    return seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action, body", [("void", {"reason": "x"}), ("refund", None)])
+async def test_void_and_refund_lock_the_order_row(client, db, action, body):
+    order_id, _, _ = await _sell_one_coin(client, db)
+    seen = _order_selects(db)
+
+    r = await client.post(f"/api/orders/{order_id}/{action}", json=body)
+    assert r.status_code == 200, r.text
+    assert seen and seen[0].rstrip().endswith("FOR UPDATE"), seen[:1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action, body", [("void", {"reason": "x"}), ("refund", None)])
+async def test_void_and_refund_check_the_locked_row_not_a_stale_copy(client, db, action, body):
+    """While this request waited for the lock, another one voided the order. The
+    session may still hold the pre-lock copy (status COMPLETED); the handler must
+    judge by the row it just locked, and refuse before restoring any stock."""
+    from sqlalchemy import text
+
+    order_id, coin, _ = await _sell_one_coin(client, db)
+    order = await db.get(Order, order_id)       # the copy the session already holds
+    await db.execute(text("UPDATE orders SET status = 'VOIDED' WHERE id = :id"), {"id": order_id})
+    assert order.status == OrderStatus.COMPLETED  # ... is now stale
+
+    r = await client.post(f"/api/orders/{order_id}/{action}", json=body)
+    assert r.status_code == 400, r.text
+    assert coin.on_hand_qty == 4                # nothing restored
+    assert await _reversals(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_second_void_is_refused_with_one_restore_and_one_reversal(client, db):
+    order_id, coin, _ = await _sell_one_coin(client, db)
+
+    r1 = await client.post(f"/api/orders/{order_id}/void", json={"reason": "x"})
+    assert r1.status_code == 200, r1.text
+    r2 = await client.post(f"/api/orders/{order_id}/void", json={"reason": "x"})
+    assert r2.status_code == 400 and "already voided" in r2.json()["detail"]
+    r3 = await client.post(f"/api/orders/{order_id}/refund")
+    assert r3.status_code == 400
+
+    assert coin.on_hand_qty == 5
+    assert await _reversals(db) == 1
