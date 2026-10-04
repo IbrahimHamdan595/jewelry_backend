@@ -38,6 +38,12 @@ async def update_settings(
         raise HTTPException(status_code=404, detail="Settings not found")
 
     incoming = body.model_dump(exclude_unset=True)
+    # The GL auto-post master switch (NEX-52) only moves on an explicit
+    # true/false. exclude_unset already drops it when another settings tab
+    # saves without it; a null is dropped too, so a stale form can neither
+    # reset the switch nor write NULL into its NOT NULL column.
+    if incoming.get("accounting_auto_post_enabled", False) is None:
+        del incoming["accounting_auto_post_enabled"]
     # Snapshot only the fields the caller is trying to change so the diff
     # stays focused. SettingsOut.model_dump() would include 20+ fields most
     # of which the caller never touched.
