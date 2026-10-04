@@ -34,8 +34,10 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
 - **APScheduler** for the gold-rate poller (runs every N minutes, alerts
   via Discord webhook after N consecutive failures).
 - **JWT auth** via `python-jose`, HttpOnly cookie set by the backend on
-  login; bcrypt for password hashing; SlowAPI rate-limit on login
-  (5/min/IP).
+  login; bcrypt for password hashing. Login is throttled twice: SlowAPI
+  rate-limit (5/min per client IP, taken from `X-Forwarded-For`) and a
+  per-account lockout (10 consecutive failures in 15 min lock that email
+  for 15 min, derived from the auth audit log).
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
@@ -245,10 +247,11 @@ jewelry_backend/
 │   │   ├── cloudflare.py       # R2 image upload
 │   │   ├── gold_api.py         # rate fetcher + override/history reader
 │   │   ├── ledger.py           # record() + field_diff() + event types
+│   │   ├── login_lockout.py    # per-account lockout, derived from auth_audit_log
 │   │   ├── notify.py           # Discord webhook
 │   │   ├── permissions.py      # require_admin
 │   │   ├── pricing.py          # KARAT_PURITY, calculate_price, etc.
-│   │   ├── rate_limit.py       # SlowAPI limiter (login)
+│   │   ├── rate_limit.py       # SlowAPI limiter (login), keyed on the client IP
 │   │   ├── security.py         # JWT + bcrypt
 │   │   ├── stock_take.py       # StockTakeRefType → AdjustmentTarget mapping
 │   │   └── zakat.py            # holdings aggregator + integrity hash

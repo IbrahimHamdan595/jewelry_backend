@@ -11,6 +11,7 @@ from app.core.auth_audit import (
     fire_auth_event,
     get_client_ip,
 )
+from app.core.login_lockout import LOCKOUT_DETAIL, is_locked, record_failed_login
 from app.core.rate_limit import limiter
 from app.core.security import create_access_token, hash_password, verify_password
 from app.deps import AUTH_COOKIE_NAME, get_current_user, get_db
@@ -53,26 +54,36 @@ async def login(
     `BackgroundTasks` only fire on successful return, which would silently
     drop failed-login events — the most important ones to audit.
 
-    Note: requests rejected by the rate limiter (HTTP 429) short-circuit
-    before this function body runs and are not currently audited. Future
-    work: custom slowapi handler that emits LOGIN_RATE_LIMITED events.
+    The one write that IS awaited is the wrong-password LOGIN_FAILED row:
+    the per-account lockout is counted from it (see
+    `app/core/login_lockout.py` for why it cannot be fire-and-forget).
+
+    THROTTLING (NEX-47), two layers:
+      • 5/minute per client IP (the decorator above).
+      • Per account: 10 consecutive failures inside 15 minutes lock the
+        claimed email for 15 minutes. The lock is checked BEFORE the user
+        lookup and the password check and is keyed on the claimed email
+        alone, so the response is identical whether or not the account
+        exists, and a correct password is refused too while it holds.
+        Same 429 as the rate limiter: both mean "too many attempts".
+
+    Note: requests rejected with HTTP 429 — by the rate limiter, which
+    short-circuits before this function body runs, or by the lockout — are
+    not audited individually. The lockout itself is (ACCOUNT_LOCKED).
+    Future work: custom slowapi handler that emits LOGIN_RATE_LIMITED events.
     """
     client_ip = get_client_ip(request)
     ua = _ua(request)
+
+    if await is_locked(db, body.email):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=LOCKOUT_DETAIL)
 
     user = (
         await db.execute(select(User).where(User.email == body.email))
     ).scalar_one_or_none()
 
     if not user or not verify_password(body.password, user.password_hash):
-        fire_auth_event(
-            event_type=EVENT_LOGIN_FAILED,
-            user_id=None,                # email is claimed-but-unverified
-            claimed_email=body.email,
-            client_ip=client_ip,
-            user_agent=ua,
-            detail="invalid credentials",
-        )
+        await record_failed_login(db, claimed_email=body.email, client_ip=client_ip, user_agent=ua)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user.is_active:

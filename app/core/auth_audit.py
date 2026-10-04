@@ -31,6 +31,16 @@ notes that make this MODULE different from `app/core/ledger.py`:
      load balancer and `request.client.host` would otherwise be the
      proxy's internal IP.
 
+  5. ONE exception to (1) and (2), added with the per-account lockout
+     (NEX-47): a wrong-password login writes its LOGIN_FAILED row (and the
+     ACCOUNT_LOCKED row it may trigger) INLINE, on the request's own
+     session, before the 401 goes out — see `app/core/login_lockout.py`.
+     The lockout is counted from those rows, and a background write can be
+     starved of a pool connection by the very flood it is meant to count.
+     It is still best effort (every exception is swallowed; the 401 is sent
+     regardless), and it only ever delays a FAILED login. Successful logins,
+     logouts and password changes are unchanged.
+
 This module deliberately does NOT mirror `record()` from `app/core/ledger.py`:
 that function is synchronous-within-a-transaction and would defeat the
 best-effort semantics above. Do not "consolidate" the two helpers.
@@ -45,6 +55,7 @@ from uuid import uuid4
 
 from fastapi import Request
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.audit_chain import compute_auth_entry_hash
@@ -60,6 +71,8 @@ EVENT_LOGIN_SUCCESS = "LOGIN_SUCCESS"
 EVENT_LOGIN_FAILED = "LOGIN_FAILED"
 EVENT_LOGOUT = "LOGOUT"
 EVENT_PASSWORD_CHANGED = "PASSWORD_CHANGED"
+# NEX-47: the failed login that tipped an email over the lockout threshold.
+EVENT_ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
 
 
 def get_client_ip(request: Request) -> str | None:
@@ -132,6 +145,67 @@ def fire_auth_event(
     )
 
 
+async def append_auth_event(
+    session: AsyncSession,
+    *,
+    event_type: str,
+    user_id: str | None,
+    claimed_email: str | None,
+    client_ip: str | None,
+    user_agent: str | None,
+    detail: str | None = None,
+) -> None:
+    """Chain one auth-audit row onto `session`. Does NOT commit, does NOT
+    swallow errors — the caller owns the transaction and the best-effort
+    wrapping.
+
+    The single place a row is built and the head advanced, shared by the
+    background recorder below and by the one inline writer
+    (`app/core/login_lockout.py`). The chain-head row is locked FOR UPDATE,
+    so writers serialize no matter which session they arrive on.
+    """
+    head = (
+        await session.execute(
+            select(AuthAuditChainHead)
+            .where(AuthAuditChainHead.id == 1)
+            .with_for_update()
+        )
+    ).scalar_one()
+
+    occurred_at = datetime.now(timezone.utc)
+    fields: dict[str, Any] = {
+        "event_type": event_type,
+        "occurred_at": occurred_at,
+        "user_id": user_id,
+        "claimed_email": claimed_email,
+        "client_ip": client_ip,
+        "user_agent": user_agent,
+        "detail": detail,
+    }
+    entry_hash = compute_auth_entry_hash(
+        prev_hash=head.latest_entry_hash,
+        fields=fields,
+    )
+
+    row = AuthAuditLog(
+        id=uuid4().hex,
+        event_type=event_type,
+        occurred_at=occurred_at,
+        user_id=user_id,
+        claimed_email=claimed_email,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        detail=detail,
+        retention_until_at=_retention_until(occurred_at),
+        prev_hash=head.latest_entry_hash,
+        entry_hash=entry_hash,
+    )
+    session.add(row)
+
+    head.latest_entry_hash = entry_hash
+    head.row_count = head.row_count + 1
+
+
 async def record_auth_event_safe(
     *,
     event_type: str,
@@ -154,47 +228,15 @@ async def record_auth_event_safe(
     """
     try:
         async with async_session_factory() as session:
-            head = (
-                await session.execute(
-                    select(AuthAuditChainHead)
-                    .where(AuthAuditChainHead.id == 1)
-                    .with_for_update()
-                )
-            ).scalar_one()
-
-            occurred_at = datetime.now(timezone.utc)
-            fields: dict[str, Any] = {
-                "event_type": event_type,
-                "occurred_at": occurred_at,
-                "user_id": user_id,
-                "claimed_email": claimed_email,
-                "client_ip": client_ip,
-                "user_agent": user_agent,
-                "detail": detail,
-            }
-            entry_hash = compute_auth_entry_hash(
-                prev_hash=head.latest_entry_hash,
-                fields=fields,
-            )
-
-            row = AuthAuditLog(
-                id=uuid4().hex,
+            await append_auth_event(
+                session,
                 event_type=event_type,
-                occurred_at=occurred_at,
                 user_id=user_id,
                 claimed_email=claimed_email,
                 client_ip=client_ip,
                 user_agent=user_agent,
                 detail=detail,
-                retention_until_at=_retention_until(occurred_at),
-                prev_hash=head.latest_entry_hash,
-                entry_hash=entry_hash,
             )
-            session.add(row)
-
-            head.latest_entry_hash = entry_hash
-            head.row_count = head.row_count + 1
-
             await session.commit()
     except Exception:
         # Logged but never re-raised. The auth path has already returned

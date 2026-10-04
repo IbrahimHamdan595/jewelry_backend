@@ -25,7 +25,8 @@ def client_ip_key(request: Request) -> str:
     X-Forwarded-For — the argument `get_client_ip` spells out, and one that
     must be re-checked for any other host. Where a client-supplied header is
     passed through instead, a caller can name a fresh bucket on every request
-    and this limit stops nothing.
+    and this limit stops nothing; what still holds there is the per-account
+    lockout (`app/core/login_lockout.py`), which does not look at addresses.
 
     Anything that is not a single well-formed IP (empty, "unknown", an
     address with a port, garbage) falls back to the socket address: a
