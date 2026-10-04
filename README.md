@@ -201,6 +201,23 @@ pytest -q
 Tests use an in-memory SQLite fixture ([`tests/conftest.py`](tests/conftest.py))
 — no external services required.
 
+### PDF export tests need Pango/HarfBuzz
+
+The PDF tests in [`tests/test_exports.py`](tests/test_exports.py) render through
+WeasyPrint, which loads Pango and HarfBuzz as native libraries. The Docker image
+installs them (see the `apt-get` list in the [`Dockerfile`](Dockerfile)); on
+macOS install them with Homebrew:
+
+```bash
+brew install pango harfbuzz   # pango also brings in fribidi, glib and fontconfig
+```
+
+Without them `import weasyprint` does not fail cleanly: the first attempt raises
+`OSError`, and retrying it segfaults the interpreter, which used to abort the
+whole `pytest` run. The suite therefore probes WeasyPrint in a child process at
+collection time and **skips** the PDF tests when the libraries cannot be loaded
+(`pytest -rs` prints the reason). The XLSX tests in the same file always run.
+
 ---
 
 ## Repository layout

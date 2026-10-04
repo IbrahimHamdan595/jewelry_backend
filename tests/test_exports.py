@@ -1,14 +1,18 @@
 """Phase 3 export tests: xlsx workbooks re-open via openpyxl; PDFs start with %PDF.
 
 The PDF tests exercise the bilingual RTL builders + WeasyPrint (Pango/HarfBuzz),
-so they require the system font/text stack from the backend Dockerfile.
+so they require the system font/text stack from the backend Dockerfile. Where
+that stack is missing they are skipped (see `requires_weasyprint`).
 """
 import io
+import subprocess
+import sys
 from datetime import date
 from decimal import Decimal as D
 from types import SimpleNamespace
 
 import openpyxl
+import pytest
 
 from app.api.accounting import _tb_sheets
 from app.api.ar import _invoice_html, _statement_html
@@ -17,6 +21,26 @@ from app.api.statements import _bs_pdf, _cf_pdf, _pnl_pdf
 from app.api.tax import _vat_sheets
 from app.core import pdf
 from app.core.xlsx import XLSX_MEDIA_TYPE, build_xlsx_bytes
+
+
+def _weasyprint_loads() -> bool:
+    """True when `import weasyprint` succeeds, i.e. Pango/HarfBuzz are installed.
+
+    Probed in a child interpreter on purpose. Without the native libraries (a Mac
+    with no `brew install pango`) the import raises OSError the first time and
+    SEGFAULTS the interpreter when retried — and `pdf.render_pdf` imports lazily,
+    so every PDF test retries it. A try/except in this process cannot contain
+    that; it took the whole pytest run down.
+    """
+    probe = subprocess.run([sys.executable, "-c", "import weasyprint"], capture_output=True)
+    return probe.returncode == 0
+
+
+requires_weasyprint = pytest.mark.skipif(
+    not _weasyprint_loads(),
+    reason="WeasyPrint cannot load its native libraries (Pango/HarfBuzz) — "
+           "on macOS: brew install pango harfbuzz; see README, 'Tests'",
+)
 
 
 # ── XLSX ──────────────────────────────────────────────────────────────────────
@@ -70,12 +94,14 @@ def _stmt_data():
             "closing_balance": D("600.00")}
 
 
+@requires_weasyprint
 def test_ar_statement_pdf_english():
     html = _statement_html(_stmt_data(), "Acme Trading", "en")
     assert 'dir="ltr"' in html and "Account Statement" in html
     assert pdf.render_pdf(html)[:4] == b"%PDF"
 
 
+@requires_weasyprint
 def test_ar_statement_pdf_arabic_rtl():
     html = _statement_html(_stmt_data(), "محمد العامل", "ar")
     # RTL shell + Arabic title + Arabic customer name embedded
@@ -86,6 +112,7 @@ def test_ar_statement_pdf_arabic_rtl():
     assert len(body) > 1500  # a real rendered page, not an empty stub
 
 
+@requires_weasyprint
 def test_invoice_pdf_arabic():
     inv = SimpleNamespace(invoice_no="INV-100", invoice_date=date(2026, 6, 5), customer_id="c1",
                           subtotal=D("1000.00"), vat_amount=D("110.00"), total=D("1110.00"),
@@ -96,6 +123,7 @@ def test_invoice_pdf_arabic():
     assert pdf.render_pdf(html)[:4] == b"%PDF"
 
 
+@requires_weasyprint
 def test_bill_pdf_english():
     bill = SimpleNamespace(bill_no="BILL-9", vendor_name="Gold Supplier", bill_date=date(2026, 6, 5),
                            subtotal=D("800.00"), vat_amount=D("0.00"), total=D("800.00"),
@@ -105,6 +133,7 @@ def test_bill_pdf_english():
     assert pdf.render_pdf(html)[:4] == b"%PDF"
 
 
+@requires_weasyprint
 def test_three_statements_pdf():
     pnl = {"start": date(2026, 6, 1), "end": date(2026, 6, 30),
            "revenue_lines": [{"name": "Sales", "amount": D("1000.00")}],
@@ -126,6 +155,7 @@ def test_three_statements_pdf():
         assert pdf.render_pdf(html)[:4] == b"%PDF"
 
 
+@requires_weasyprint
 def test_pdf_and_xlsx_response_headers():
     pdf_resp = pdf.pdf_response(_statement_html(_stmt_data(), "Acme", "en"), filename="statement-x")
     assert pdf_resp.media_type == "application/pdf"
