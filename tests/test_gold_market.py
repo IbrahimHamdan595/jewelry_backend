@@ -58,10 +58,10 @@ async def test_6_4_history_returns_stored_per_karat(db):
     points = await history(range="24h", db=db)
     assert len(points) == 1
     p = points[0]
-    assert p.rate_24k == 80.0
-    assert p.rate_22k == 73.36  # 80 * 0.917
-    assert p.rate_21k == 70.0   # 80 * 0.875
-    assert p.rate_18k == 60.0   # 80 * 0.750
+    assert p.rate_24k == Decimal("80.00")
+    assert p.rate_22k == Decimal("73.36")  # 80 * 0.917
+    assert p.rate_21k == Decimal("70.00")  # 80 * 0.875
+    assert p.rate_18k == Decimal("60.00")  # 80 * 0.750
     assert p.per_karat_backfilled is False
 
 
@@ -75,8 +75,9 @@ async def test_6_4b_history_derives_for_legacy_null_rows(db):
     db.add(legacy)
     await db.commit()
     points = await history(range="24h", db=db)
-    p = next(x for x in points if x.rate_24k == 100.0)
-    assert p.rate_21k == 87.5  # derived fallback
+    p = next(x for x in points if x.rate_24k == Decimal("100"))
+    assert p.rate_21k == Decimal("87.50")  # derived fallback
+    assert isinstance(p.rate_21k, Decimal)
 
 
 # ── Shop-tuned thresholds (GOLD_REFRESH_MINUTES=10, FAILURE_THRESHOLD=2) ──────

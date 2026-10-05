@@ -54,7 +54,7 @@ def test_market_closed_without_ack_is_rejected():
     assert exc.value.status_code == 409
     detail = exc.value.detail
     assert detail["code"] == "STALE_RATE_ACK_REQUIRED"
-    assert detail["rate_24k"] == 84.31
+    assert detail["rate_24k"] == "84.31"
     assert detail["rate_fetched_at"] == FETCHED_AWARE.isoformat()
     assert 179 <= detail["age_minutes"] <= 181
 

@@ -3,12 +3,14 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from app.core.money import Money
+
 
 class GoldRateOut(BaseModel):
-    rate_24k: float
-    rate_22k: float
-    rate_21k: float
-    rate_18k: float
+    rate_24k: Money
+    rate_22k: Money
+    rate_21k: Money
+    rate_18k: Money
     source: str
     fetched_at: datetime
     is_stale: bool
@@ -17,12 +19,12 @@ class GoldRateOut(BaseModel):
 
 
 class GoldRateHistoryPoint(BaseModel):
-    rate_24k: float
+    rate_24k: Money
     # Phase 6 (#7): per-karat series (stored exact; derived fallback for any
     # row predating the backfill).
-    rate_22k: float
-    rate_21k: float
-    rate_18k: float
+    rate_22k: Money
+    rate_21k: Money
+    rate_18k: Money
     per_karat_backfilled: bool = False
     fetched_at: datetime
 
