@@ -5,12 +5,16 @@ date) and returns JSON-friendly primitives. Kept out of app/api/reports.py so
 each unit is independently testable. Windows are Beirut-local calendar days
 (see app/core/daterange).
 """
+import asyncio
+from collections import deque
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import settings
 from app.core.daterange import BEIRUT_TZ, day_range
 from app.models import Order, OrderItem, OrderStatus
 
@@ -24,6 +28,95 @@ def week_window(today: date) -> tuple[datetime, datetime]:
     start = day_range(today - timedelta(days=6))[0]
     end = day_range(today)[1]
     return start, end
+
+
+# ── Concurrent fan-out (NEX-53) ───────────────────────────────────────────────
+# Two limits, both in Settings:
+#   dashboard_max_concurrency — lanes (sessions) ONE load runs at a time;
+#   dashboard_max_sessions    — lane sessions ALL loads in this process hold
+#                               together. Simultaneous loads queue for lanes
+#                               here instead of draining the connection pool
+#                               (5 + 10 overflow) from under the till.
+
+_lane_gate: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
+
+
+def lane_gate() -> asyncio.Semaphore:
+    """The process-wide cap on dashboard lane sessions, shared by every load.
+
+    Created on first use and kept per event loop, because an asyncio.Semaphore
+    belongs to the loop it first waits on; the app runs one loop, so in practice
+    this is a single gate for the life of the process."""
+    global _lane_gate
+    loop = asyncio.get_running_loop()
+    if _lane_gate is None or _lane_gate[0] is not loop:
+        _lane_gate = (loop, asyncio.Semaphore(settings.dashboard_max_sessions))
+    return _lane_gate[1]
+
+
+@dataclass(frozen=True)
+class Windows:
+    """Every instant and boundary one dashboard load works from, all derived
+    from a single clock read so concurrent sections cannot straddle midnight
+    differently. Day windows are Beirut-local, held as UTC [start, end)."""
+    now: datetime
+    today: date
+    today_start: datetime
+    today_end: datetime
+    week_start: datetime
+    week_end: datetime
+    prev_week_start: datetime
+    prev_week_end: datetime
+
+
+def windows(now: datetime) -> Windows:
+    today = now.astimezone(BEIRUT_TZ).date()
+    today_start, today_end = day_range(today)
+    week_start, week_end = week_window(today)
+    return Windows(
+        now=now, today=today, today_start=today_start, today_end=today_end,
+        week_start=week_start, week_end=week_end,
+        prev_week_start=day_range(today - timedelta(days=13))[0], prev_week_end=week_start,
+    )
+
+
+async def run_sections(session_factory: async_sessionmaker[AsyncSession], sections, w: Windows,
+                       *, max_concurrency: int, gate: asyncio.Semaphore) -> list:
+    """Run every `section(db, w)` and return the results in `sections` order.
+
+    At most `max_concurrency` lanes run at once. Each lane opens ONE session and
+    keeps pulling the next unstarted section onto it, so no session is ever
+    shared between concurrent tasks and a load checks out no more connections
+    than it has lanes. Read-only — a lane never commits.
+
+    A lane takes a slot from `gate` before it opens its session and holds it
+    until the session is closed, so every load sharing that gate is bounded
+    together; a lane that had to queue for its slot opens nothing if the work
+    is already done.
+
+    The first section to raise fails the whole call (no partial results); the
+    other lanes are cancelled and awaited so no query outlives the request."""
+    results: list = [None] * len(sections)
+    pending = deque(enumerate(sections))
+
+    async def lane() -> None:
+        async with gate:
+            if not pending:
+                return
+            async with session_factory() as db:
+                while pending:
+                    i, section = pending.popleft()
+                    results[i] = await section(db, w)
+
+    lanes = [asyncio.ensure_future(lane()) for _ in range(min(max_concurrency, len(sections)))]
+    try:
+        await asyncio.gather(*lanes)
+    except BaseException:
+        for task in lanes:
+            task.cancel()
+        await asyncio.gather(*lanes, return_exceptions=True)
+        raise
+    return results
 
 
 # ── Phase A — headline KPIs ───────────────────────────────────────────────────
@@ -167,15 +260,15 @@ async def payables_aging(db: AsyncSession, *, as_of: date) -> dict:
 
 
 async def cash_bank_balance(db: AsyncSession) -> Decimal:
-    """USD-base balance across active bank accounts (GL-derived → 0 while dormant)."""
+    """USD-base balance across active bank accounts (GL-derived → 0 while dormant).
+    Summed in SQL: one round-trip, and the ledger lines stay in the database."""
     from app.models import BankAccount, GLJournalLine
-    accts = (await db.execute(select(BankAccount).where(BankAccount.is_active.is_(True)))).scalars().all()
-    total = ZERO
-    for ba in accts:
-        rows = (await db.execute(
-            select(GLJournalLine).where(GLJournalLine.account_id == ba.gl_account_id))).scalars().all()
-        total += sum((l.base_debit - l.base_credit for l in rows), ZERO)
-    return total.quantize(_Q_MONEY)
+    total = (await db.execute(
+        select(func.coalesce(func.sum(GLJournalLine.base_debit - GLJournalLine.base_credit), 0))
+        .join(BankAccount, BankAccount.gl_account_id == GLJournalLine.account_id)
+        .where(BankAccount.is_active.is_(True))
+    )).scalar_one()
+    return Decimal(total).quantize(_Q_MONEY)
 
 
 async def vat_position(db: AsyncSession, today: date) -> dict:

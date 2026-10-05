@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import Index, select
+from sqlalchemy import Index, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -464,19 +464,33 @@ def _q_grams(v: Decimal) -> Decimal:
 
 
 async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
-    """Replay all immutable lines whose entry_date <= as_of into a trial
-    balance (design §3.5). Computes per account: USD-base debit/credit/net,
-    money per currency, and metal grams per karat. Asserts the global TB
-    identity (Σ base_debit == Σ base_credit) and per-karat metal balance.
+    """Trial balance over all immutable lines whose entry_date <= as_of
+    (design §3.5). Computes per account: USD-base debit/credit/net, money per
+    currency, and metal grams per karat. Asserts the global TB identity
+    (Σ base_debit == Σ base_credit) and per-karat metal balance.
 
-    Pure replay from immutable lines — no cached state, mirroring the zakat
-    as-of discipline."""
+    The per-(account, currency, karat) sums are taken in SQL — one GROUP BY
+    round-trip instead of shipping every journal line to Python. Still derived
+    from the immutable lines with no cached state, mirroring the zakat as-of
+    discipline. tests/gl_replay_oracle.py keeps the line-by-line replay this
+    replaced, as the reference it must agree with."""
+    has_metal = or_(GLJournalLine.metal_debit_grams != 0, GLJournalLine.metal_credit_grams != 0)
     rows = (
         await db.execute(
-            select(GLJournalLine, GLJournalEntry, GLAccount)
+            select(
+                GLAccount.id, GLAccount.code, GLAccount.name, GLAccount.type, GLAccount.system_key,
+                GLJournalLine.currency, GLJournalLine.karat,
+                func.sum(GLJournalLine.base_debit), func.sum(GLJournalLine.base_credit),
+                func.sum(GLJournalLine.money_debit), func.sum(GLJournalLine.money_credit),
+                func.sum(GLJournalLine.metal_debit_grams), func.sum(GLJournalLine.metal_credit_grams),
+                func.sum(case((has_metal, 1), else_=0)),
+            )
+            .select_from(GLJournalLine)
             .join(GLJournalEntry, GLJournalLine.entry_id == GLJournalEntry.id)
             .join(GLAccount, GLJournalLine.account_id == GLAccount.id)
             .where(GLJournalEntry.entry_date <= as_of)
+            .group_by(GLAccount.id, GLAccount.code, GLAccount.name, GLAccount.type,
+                      GLAccount.system_key, GLJournalLine.currency, GLJournalLine.karat)
         )
     ).all()
 
@@ -485,39 +499,49 @@ async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
     total_c = ZERO
     metal_totals: dict[str, dict[str, Decimal]] = {}
 
-    for line, entry, acct in rows:
-        a = accounts.setdefault(acct.id, {
-            "account_id": acct.id, "code": acct.code, "name": acct.name,
-            "type": acct.type.value, "system_key": acct.system_key,
+    for (acct_id, code, name, acct_type, system_key, currency, karat,
+         base_d, base_c, money_d, money_c, metal_d, metal_c, metal_lines) in rows:
+        a = accounts.setdefault(acct_id, {
+            "account_id": acct_id, "code": code, "name": name,
+            "type": acct_type.value, "system_key": system_key,
             "base_debit": ZERO, "base_credit": ZERO,
             "money_by_currency": {}, "metal_by_karat": {},
         })
-        a["base_debit"] += line.base_debit
-        a["base_credit"] += line.base_credit
-        total_d += line.base_debit
-        total_c += line.base_credit
+        # SUM() over a Numeric column comes back as an exact Decimal on Postgres;
+        # SQLite sums floats, which SQLAlchemy rounds to the column scale. Either
+        # way re-quantize so every group enters the totals at persisted scale.
+        base_d, base_c = _q_money(base_d), _q_money(base_c)
+        a["base_debit"] += base_d
+        a["base_credit"] += base_c
+        total_d += base_d
+        total_c += base_c
 
-        cur = a["money_by_currency"].setdefault(line.currency, {"debit": ZERO, "credit": ZERO})
-        cur["debit"] += line.money_debit
-        cur["credit"] += line.money_credit
+        cur = a["money_by_currency"].setdefault(currency, {"debit": ZERO, "credit": ZERO})
+        cur["debit"] += _q_money(money_d)
+        cur["credit"] += _q_money(money_c)
 
-        if line.metal_debit_grams or line.metal_credit_grams:
-            k = line.karat or "?"
+        # A karat bucket exists only where a line actually moved metal — a
+        # karat-tagged money-only line must not create one.
+        if metal_lines:
+            metal_d, metal_c = _q_grams(metal_d), _q_grams(metal_c)
+            k = karat or "?"
             mk = a["metal_by_karat"].setdefault(k, {"debit_grams": ZERO, "credit_grams": ZERO})
-            mk["debit_grams"] += line.metal_debit_grams
-            mk["credit_grams"] += line.metal_credit_grams
+            mk["debit_grams"] += metal_d
+            mk["credit_grams"] += metal_c
             mt = metal_totals.setdefault(k, {"debit_grams": ZERO, "credit_grams": ZERO})
-            mt["debit_grams"] += line.metal_debit_grams
-            mt["credit_grams"] += line.metal_credit_grams
+            mt["debit_grams"] += metal_d
+            mt["credit_grams"] += metal_c
 
     out_accounts = []
     for a in sorted(accounts.values(), key=lambda x: x["code"]):
         a["base_debit"] = _q_money(a["base_debit"])
         a["base_credit"] = _q_money(a["base_credit"])
         a["net_base"] = _q_money(a["base_debit"] - a["base_credit"])
+        # GROUP BY returns groups in no particular order; sort the breakdowns so
+        # the payload is stable across engines and runs.
         a["money_by_currency"] = {
             c: {"debit": _q_money(v["debit"]), "credit": _q_money(v["credit"])}
-            for c, v in a["money_by_currency"].items()
+            for c, v in sorted(a["money_by_currency"].items())
         }
         a["metal_by_karat"] = {
             k: {
@@ -525,7 +549,7 @@ async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
                 "credit_grams": _q_grams(v["credit_grams"]),
                 "net_grams": _q_grams(v["debit_grams"] - v["credit_grams"]),
             }
-            for k, v in a["metal_by_karat"].items()
+            for k, v in sorted(a["metal_by_karat"].items())
         }
         out_accounts.append(a)
 
