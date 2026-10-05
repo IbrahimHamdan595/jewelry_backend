@@ -292,3 +292,30 @@ async def test_trial_balance_aggregates_in_sql(db):
 
     assert len(statements) == 1
     assert "GROUP BY" in statements[0] and "sum(" in statements[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_trial_balance_xlsx_export_is_unchanged_by_sql_aggregation(db):
+    """The Excel export consumes the same dict: same rows, numeric cells."""
+    import io
+
+    import openpyxl
+
+    from app.api.accounting import _tb_sheets
+    from app.core.xlsx import build_xlsx_bytes
+
+    a = await _setup_wide(db)
+    await _post_wide_ledger(db, a)
+    sql = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    replay = await gl.compute_trial_balance_replay(db, as_of=date(2026, 6, 30))
+
+    def rows(tb):   # the karat order inside the metal cell is the only free choice
+        return [[*r[:4], sorted(r[4].split(", "))] for r in _tb_sheets(tb)[0].rows]
+
+    assert rows(sql) == rows(replay)
+
+    ws = openpyxl.load_workbook(io.BytesIO(build_xlsx_bytes(_tb_sheets(sql))))["Trial Balance"]
+    assert ws.cell(row=ws.max_row, column=2).value == "Total"
+    assert ws.cell(row=ws.max_row, column=3).value == float(sql["total_base_debit"])
+    assert all(isinstance(ws.cell(row=r, column=c).value, (int, float))
+               for r in range(3, ws.max_row + 1) for c in (3, 4))
