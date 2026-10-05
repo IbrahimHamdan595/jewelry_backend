@@ -2,9 +2,11 @@
 a shallow /health, and the container that serves them.
 
 Like tests/test_cors.py these run against the real `app.main.app`, because the
-thing under test IS the line in app/main.py that ships. The suite runs with no
-ENVIRONMENT variable, so the module-level app here is the production
-configuration — the default a deploy gets when nobody sets anything.
+thing under test IS the line in app/main.py that ships.
+
+Nothing here reads the ENVIRONMENT of the shell running the suite: every
+test names the environment it is about, so the file passes unchanged with
+ENVIRONMENT=test or ENVIRONMENT=development exported.
 
 The TestClient is used without its context manager so the lifespan (gold
 rate poller) never starts.
@@ -28,49 +30,72 @@ DOC_PATHS = ("/docs", "/redoc", "/openapi.json")
 
 # ── API docs ──────────────────────────────────────────────────────────────────
 
-def test_environment_defaults_to_production():
-    """Fail closed: a deploy that sets nothing is a production deploy."""
-    assert Settings.model_fields["environment"].default == "production"
-    assert settings.is_production
-
-
-@pytest.mark.parametrize("path", DOC_PATHS)
-def test_docs_are_not_served_in_production(path):
-    """/openapi.json publishes every route, parameter and schema."""
-    assert client.get(path).status_code == 404
+def _settings(**values) -> Settings:
+    """Settings from explicit values only — no .env file, and `environment`
+    is whatever the test passes (or the class default when it passes none)."""
+    return Settings(
+        _env_file=None,
+        database_url="sqlite+aiosqlite:///:memory:",
+        jwt_secret="test-secret-not-prod",
+        **values,
+    )
 
 
 @pytest.fixture
-def dev_client(monkeypatch):
-    """The same app/main.py, built with ENVIRONMENT=development.
+def client_for(monkeypatch):
+    """The real app/main.py, rebuilt under an explicitly named ENVIRONMENT.
 
-    The app is assembled at import time, so the module is reloaded under the
-    patched setting and reloaded again afterwards to put production back.
+    The app is assembled at import time from the global settings, so the
+    module is reloaded under the given value and reloaded again afterwards to
+    put back whatever the suite was started with.
     """
     import app.main as main
 
-    monkeypatch.setattr(settings, "environment", "development")
-    yield TestClient(importlib.reload(main).app)
+    def _build(environment: str) -> TestClient:
+        monkeypatch.setattr(settings, "environment", environment)
+        return TestClient(importlib.reload(main).app)
+
+    yield _build
     monkeypatch.undo()
     importlib.reload(main)
 
 
+def test_environment_defaults_to_production(monkeypatch):
+    """Fail closed: a deploy that sets nothing is a production deploy."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    unset = _settings()
+    assert unset.environment == "production"
+    assert unset.is_production
+
+
 @pytest.mark.parametrize("path", DOC_PATHS)
-def test_docs_are_served_in_development(dev_client, path):
-    assert dev_client.get(path).status_code == 200
+def test_docs_are_not_served_in_production(client_for, path):
+    """/openapi.json publishes every route, parameter and schema."""
+    assert client_for("production").get(path).status_code == 404
+
+
+@pytest.mark.parametrize("path", DOC_PATHS)
+def test_docs_are_served_in_development(client_for, path):
+    assert client_for("development").get(path).status_code == 200
 
 
 @pytest.mark.parametrize("value", ["production", "PRODUCTION", " production ", "prod", "produciton", "staging", ""])
-def test_unrecognised_environment_is_treated_as_production(monkeypatch, value):
+def test_unrecognised_environment_is_treated_as_production(value):
     """A typo must not publish the docs: only names known to be local opt out."""
-    monkeypatch.setattr(settings, "environment", value)
-    assert settings.is_production
+    assert _settings(environment=value).is_production
 
 
 @pytest.mark.parametrize("value", ["development", "Development", "dev", "local", "test"])
-def test_local_environments_are_not_production(monkeypatch, value):
-    monkeypatch.setattr(settings, "environment", value)
-    assert not settings.is_production
+def test_local_environments_are_not_production(value):
+    assert not _settings(environment=value).is_production
+
+
+@pytest.mark.parametrize("value", ["production", "development"])
+def test_explicit_settings_ignore_the_ambient_environment(monkeypatch, value):
+    """The helper above really is independent of the shell: an exported
+    ENVIRONMENT must not leak into a Settings that names its own."""
+    monkeypatch.setenv("ENVIRONMENT", "development" if value == "production" else "production")
+    assert _settings(environment=value).environment == value
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
