@@ -15,7 +15,9 @@ change on Postgres 11+ — no table rewrite.
 
 DEPLOY ORDER: apply this BEFORE the code that maps the column runs. The User
 model selects token_version on every authenticated request, so new code on
-an un-migrated database fails every one of them.
+an un-migrated database would fail every one of them. The startup guard
+(app/core/schema_guard.py) enforces the order: that code refuses to start
+until this revision is in place.
 """
 from alembic import op
 import sqlalchemy as sa

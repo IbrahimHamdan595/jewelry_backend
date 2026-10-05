@@ -9,7 +9,9 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
 from app.core.rate_limit import limiter
+from app.core.schema_guard import check_schema_is_current
 from app.core.security import PasswordTooLongError
+from app.db.session import engine
 from app.jobs.gold_rate_poller import scheduler, start_gold_rate_poller
 from app.api import (
     accounting, adjustments, ap, ar, auth, auth_audit, bank, buybacks, categories, coins,
@@ -24,6 +26,12 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First, before anything is started: a database that is behind this
+    # code's migrations stops the process here (NEX-54). Migrations are
+    # applied by hand and main deploys by itself, so this is what turns
+    # "deployed before migrating" from every login failing into a deploy
+    # that fails while the previous release keeps serving.
+    await check_schema_is_current(engine)
     log.info("CORS allowed origins: %s", settings.cors_origins)
     start_gold_rate_poller(interval_minutes=settings.gold_refresh_minutes)
     yield

@@ -247,6 +247,12 @@ migrations):
 alembic upgrade head
 ```
 
+The server checks this itself: started against a database that is behind
+its migrations it exits at once with the revision it found, the one it
+needs and this command. A database built without Alembic (`python -m
+app.seed` on an empty database uses `create_all`) has no revision to
+compare, so it only logs a warning.
+
 To seed the initial admin user from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD`:
 
 ```bash
@@ -345,6 +351,7 @@ jewelry_backend/
 │   │   ├── permissions.py      # require_admin
 │   │   ├── pricing.py          # KARAT_PURITY, calculate_price, etc.
 │   │   ├── rate_limit.py       # SlowAPI limiter (login), keyed on the client IP
+│   │   ├── schema_guard.py     # refuse to start on a database behind the migrations
 │   │   ├── security.py         # JWT + bcrypt + revoke_sessions (token_version)
 │   │   ├── stock_take.py       # StockTakeRefType → AdjustmentTarget mapping
 │   │   └── zakat.py            # holdings aggregator + integrity hash
@@ -388,12 +395,25 @@ jewelry_backend/
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
 - **Health check path:** `/health` (no auth, no database access).
-- **Migrations before code.** Migrations are applied by hand and the service
-  deploys from `main`, so a release that maps a new column must have its
-  migration applied first. In particular `e65d977573d3` (`users.token_version`,
-  NEX-54) has to be in place before the code that reads it is deployed: the
-  column is selected on every authenticated request. The migration on its own
-  is safe under the previous release.
+- **Migrations before code — checked at startup.** Migrations are applied by
+  hand and the service deploys from `main`, so a release can reach production
+  before its migration. On startup the service reads the database's
+  `alembic_version` and compares it with the head of the migration scripts it
+  was built with (`app/core/schema_guard.py`):
+  - **database behind the code** → the service refuses to start. The deploy
+    fails with a message naming both revisions, and the previous release keeps
+    serving — instead of the new one answering 500 on every query that touches
+    a column that is not there yet. To recover: run `alembic upgrade head`
+    against the production database, then trigger the deploy again (a failed
+    deploy is not retried by itself).
+  - **database ahead of the code** (after rolling the code back), **no
+    `alembic_version` table**, or **database unreachable** → a warning in the
+    log and a normal start. The guard only refuses when it is sure.
+
+  The comfortable order is still migration first: every migration here is
+  additive, so it is safe under the release that is already running. That
+  includes `e65d977573d3` (`users.token_version`, NEX-54), which the new code
+  selects on every authenticated request.
 - **JWT keys:** see [JWT signing keys (RS256)](#jwt-signing-keys-rs256) for
   key generation and the cutover order with the frontend.
 - **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
