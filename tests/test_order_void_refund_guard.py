@@ -6,6 +6,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from app.core.coa_seed import seed_chart_of_accounts
 from app.models import (
@@ -133,34 +134,70 @@ def _order_selects(db):
     return seen
 
 
+_ACTIONS = ("void", "refund", "item-refund")
+
+
+async def _target(client, action, order_id):
+    """(url, json body) of one of the three handlers that undo a sale; the
+    per-item refund targets the order's only line."""
+    if action == "void":
+        return f"/api/orders/{order_id}/void", {"reason": "x"}
+    if action == "refund":
+        return f"/api/orders/{order_id}/refund", None
+    item_id = (await client.get(f"/api/orders/{order_id}")).json()["items"][0]["id"]
+    return f"/api/orders/{order_id}/items/{item_id}/refund", {}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action, body", [("void", {"reason": "x"}), ("refund", None)])
-async def test_void_and_refund_lock_the_order_row(client, db, action, body):
+@pytest.mark.parametrize("action", _ACTIONS)
+async def test_void_and_refunds_lock_the_order_row(client, db, action):
     order_id, _, _ = await _sell_one_coin(client, db)
+    url, body = await _target(client, action, order_id)
     seen = _order_selects(db)
 
-    r = await client.post(f"/api/orders/{order_id}/{action}", json=body)
+    r = await client.post(url, json=body)
     assert r.status_code == 200, r.text
+    # The handler's first read of the order is the locking one.
     assert seen and seen[0].rstrip().endswith("FOR UPDATE"), seen[:1]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action, body", [("void", {"reason": "x"}), ("refund", None)])
-async def test_void_and_refund_check_the_locked_row_not_a_stale_copy(client, db, action, body):
+@pytest.mark.parametrize("action", _ACTIONS)
+async def test_void_and_refunds_check_the_locked_row_not_a_stale_copy(client, db, action):
     """While this request waited for the lock, another one voided the order. The
     session may still hold the pre-lock copy (status COMPLETED); the handler must
     judge by the row it just locked, and refuse before restoring any stock."""
     from sqlalchemy import text
 
     order_id, coin, _ = await _sell_one_coin(client, db)
+    url, body = await _target(client, action, order_id)
     order = await db.get(Order, order_id)       # the copy the session already holds
     await db.execute(text("UPDATE orders SET status = 'VOIDED' WHERE id = :id"), {"id": order_id})
     assert order.status == OrderStatus.COMPLETED  # ... is now stale
 
-    r = await client.post(f"/api/orders/{order_id}/{action}", json=body)
+    r = await client.post(url, json=body)
     assert r.status_code == 400, r.text
     assert coin.on_hand_qty == 4                # nothing restored
     assert await _reversals(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_item_refund_checks_the_locked_lines_not_a_stale_copy(client, db):
+    """Two per-item refunds of the same line: the one that waited must see the
+    line as already refunded, not the quantity it read before the lock."""
+    from sqlalchemy import text
+
+    order_id, coin, _ = await _sell_one_coin(client, db)
+    order = (await db.execute(
+        select(Order).options(selectinload(Order.items)).where(Order.id == order_id))).scalar_one()
+    item = order.items[0]
+    await db.execute(text("UPDATE order_items SET refunded_qty = quantity WHERE id = :id"), {"id": item.id})
+    await db.execute(text("UPDATE orders SET status = 'REFUNDED' WHERE id = :id"), {"id": order_id})
+    assert item.refunded_qty == 0 and order.status == OrderStatus.COMPLETED  # stale
+
+    r = await client.post(f"/api/orders/{order_id}/items/{item.id}/refund", json={})
+    assert r.status_code == 400, r.text
+    assert coin.on_hand_qty == 4
 
 
 @pytest.mark.asyncio
