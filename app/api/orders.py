@@ -87,10 +87,15 @@ async def list_orders(
     total_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(total_q)).scalar_one()
 
-    revenue_q = select(func.coalesce(func.sum(Order.total_usd), 0)).select_from(
-        q.where(Order.status == OrderStatus.COMPLETED).subquery()
-    )
-    total_revenue = (await db.execute(revenue_q)).scalar_one()
+    # Revenue counts COMPLETED orders only, under the same filters as the list.
+    # Aggregate over the subquery's own column — summing Order.total_usd would add
+    # `orders` to FROM a second time (cartesian product).
+    # PARTIALLY_REFUNDED is excluded for now, pending a decision from the shop.
+    completed = q.where(Order.status == OrderStatus.COMPLETED).subquery()
+    revenue_q = select(
+        func.coalesce(func.sum(completed.c.total_usd), 0), func.count()
+    ).select_from(completed)
+    total_revenue, completed_count = (await db.execute(revenue_q)).one()
 
     q = q.order_by(Order.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     orders = (await db.execute(q)).scalars().all()
@@ -110,7 +115,7 @@ async def list_orders(
             created_at=o.created_at,
         ))
 
-    avg = Decimal(str(total_revenue)) / total if total else Decimal(0)
+    avg = Decimal(str(total_revenue)) / completed_count if completed_count else Decimal(0)
     return OrderListOut(items=summaries, total=total, total_revenue=Decimal(str(total_revenue)), avg_order_value=avg)
 
 
