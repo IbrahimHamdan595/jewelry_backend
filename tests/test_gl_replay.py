@@ -209,6 +209,9 @@ async def _history(db) -> None:
                    weight_remaining_grams=D("17.000"), source=LotSource.MELT,
                    source_ref_type="product", source_ref_id="p-melt",
                    cost_basis_usd=D("1200"), acquired_at=_at(5, 10)))
+    await db.flush()
+    await _melt_event(db, _at(5, 10), lot_id="lot-melt", product_id="p-melt", karat="K24",
+                      grams="17.000", cost="1200", karat_override=True, weight_override=True)
     # 05-20  5 g of the supplier lot written off (cost 3000 × 5/50 = 300).
     db.add(ManualAdjustment(id="adj1", target_type=AdjustmentTarget.LOT, target_id="lot-sup",
                             delta=D("-5.000"), reason=AdjustmentReason.LOSS,
@@ -332,6 +335,8 @@ async def test_dry_run_reports_counts_totals_and_the_periods_it_would_open(db):
     assert report.trial_balance["balanced"] is True
     assert report.trial_balance["metal_balanced"] is True
     assert report.auto_post_enabled is False
+    # The melt overrode karat and weight: what went IN is only on the product row.
+    assert len(report.master_data) == 1 and "melt lot lot-melt" in report.master_data[0]
 
     text = gl_replay.format_report(report)
     assert "DRY RUN" in text and "nothing was written" in text.lower()
@@ -730,17 +735,39 @@ async def test_undated_whole_order_refund_is_reversed_on_the_sale_date_with_a_wa
 
 # ── other document types ──────────────────────────────────────────────────────
 
+def _melted_product(**now) -> Product:
+    """The melted piece as the catalogue shows it TODAY (it may have been edited since)."""
+    fields = dict(karat=Karat.K21, weight_grams=D("20.000"))
+    fields.update(now)
+    return Product(id="p2", code="P-2", name_en="Bar", category="Bars", margin_percent=D("0"),
+                   making_charge=D("0"), status=ProductStatus.MELTED, on_hand_qty=1, **fields)
+
+
+def _melt_lot(karat: Karat, grams: str, cost: str = "900", *, source: str = "product",
+              source_id: str = "p2") -> GoldLot:
+    return GoldLot(id="lot-m", karat=karat, weight_grams=D(grams), weight_remaining_grams=D(grams),
+                   source=LotSource.MELT, source_ref_type=source, source_ref_id=source_id,
+                   cost_basis_usd=D(cost), acquired_at=_at(5, 10))
+
+
+async def _melt_lines(db) -> set:
+    """(memo, karat, debit grams, credit grams) of the single melt entry."""
+    lines = (await db.execute(select(GLJournalLine))).scalars().all()
+    return {(ln.memo, ln.karat, ln.metal_debit_grams, ln.metal_credit_grams) for ln in lines}
+
+
 @pytest.mark.asyncio
 async def test_melt_that_changed_nothing_is_counted_but_not_posted(db):
-    """Same karat, same weight = the live path posts nothing; so does the replay."""
+    """No karat or weight override on the MELT event = nothing moved; the live
+    path posts nothing and so does the replay. The product row is NOT consulted:
+    it was re-weighed in the catalogue afterwards (8 g → 9.5 g) and reading it
+    would invent a 9.5 g → 8 g conversion that never happened."""
     await _base(db)
-    db.add(Product(id="p2", code="P-2", name_en="Bar", category="Bars", karat=Karat.K21,
-                   weight_grams=D("8.000"), margin_percent=D("0"), making_charge=D("0"),
-                   status=ProductStatus.MELTED, on_hand_qty=1))
-    db.add(GoldLot(id="lot-same", karat=Karat.K21, weight_grams=D("8.000"),
-                   weight_remaining_grams=D("8.000"), source=LotSource.MELT,
-                   source_ref_type="product", source_ref_id="p2",
-                   cost_basis_usd=D("0"), acquired_at=_at(5, 10)))
+    db.add(_melted_product(weight_grams=D("9.500")))            # edited after the melt
+    db.add(_melt_lot(Karat.K21, "8.000", "0"))
+    await db.flush()
+    await _melt_event(db, _at(5, 10), lot_id="lot-m", product_id="p2", karat="K21",
+                      grams="8.000", cost="0")
     await db.commit()
 
     report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
@@ -748,6 +775,151 @@ async def test_melt_that_changed_nothing_is_counted_but_not_posted(db):
     melt = report.kinds[gl_replay.KIND_MELT]
     assert (melt.documents, melt.posted, melt.nothing_to_post) == (1, 0, 1)
     assert await _chain(db) == []
+    assert report.master_data == []
+
+
+@pytest.mark.asyncio
+async def test_melt_takes_karat_and_grams_from_the_recorded_melt_event(db):
+    """Karat was overridden at the melt (K21 → K24), weight was not. The event
+    says the lot came out at 20 g, so 20 g went in — whatever the product row
+    says today (25 g). Only the pre-melt KARAT has no record, and the report
+    says the product's current value was used for it."""
+    await _base(db)
+    db.add(_melted_product(weight_grams=D("25.000")))           # edited after the melt
+    db.add(_melt_lot(Karat.K24, "20.000"))
+    await db.flush()
+    await _melt_event(db, _at(5, 12), lot_id="lot-m", product_id="p2", karat="K24",
+                      grams="20.000", cost="900", karat_override=True)
+    await db.commit()
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    (entry,) = await _chain(db)
+    assert (entry.source_type, entry.source_id) == ("MELT", "lot-m")
+    assert entry.entry_date == date(2026, 5, 12)                # the event's date
+    assert await _melt_lines(db) == {
+        ("melt consume", "K21", D("0.000"), D("20.000")),       # 20 g, not the row's 25 g
+        ("melt clearing A", "K21", D("20.000"), D("0.000")),
+        ("melt result", "K24", D("20.000"), D("0.000")),
+        ("melt clearing B", "K24", D("0.000"), D("20.000")),
+    }
+    assert len(report.master_data) == 1
+    assert "melt lot lot-m" in report.master_data[0] and "P-2" in report.master_data[0]
+
+
+@pytest.mark.asyncio
+async def test_melt_of_a_used_product_buyback_reads_the_buyback_document(db):
+    """A buyback row is a document (there is no endpoint that edits one), so its
+    karat / weight are historical — no master-data notice."""
+    await _base(db)
+    db.add(WalkinBuyback(
+        id="bb-used", occurred_at=_at(5, 1), seller_name="Seller", seller_phone="1",
+        cashier_id=CASHIER, kind=BuybackKind.USED_PRODUCT, weight_grams=D("12.000"),
+        karat=Karat.K18, buy_price_usd=D("400"), gold_rate_at_buy=D("60"),
+        price_mode=BuybackPriceMode.MANUAL, result_lot_id="lot-m"))
+    db.add(_melt_lot(Karat.K24, "8.500", "400", source="walkin_buyback", source_id="bb-used"))
+    await db.flush()
+    await _melt_event(db, _at(5, 12), lot_id="lot-m", buyback_id="bb-used", karat="K24",
+                      grams="8.500", cost="400", karat_override=True, weight_override=True)
+    await db.commit()
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    lines = await _melt_lines(db)
+    assert ("melt consume", "K18", D("0.000"), D("12.000")) in lines
+    assert ("melt result", "K24", D("8.500"), D("0.000")) in lines
+    assert report.master_data == []
+
+
+@pytest.mark.asyncio
+async def test_melt_without_a_ledger_event_falls_back_to_current_rows_and_says_so(db):
+    await _base(db)
+    db.add(_melted_product())
+    db.add(_melt_lot(Karat.K24, "17.000"))
+    await db.commit()
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert report.kinds[gl_replay.KIND_MELT].posted == 1
+    assert len(report.master_data) == 1 and "no MELT" in report.master_data[0]
+
+
+# ── values with no historical record ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execute", [False, True])
+async def test_purchase_that_reads_a_products_current_stone_cost_is_listed(db, execute):
+    """The purchase stores no stone cost; the mapper splits the cash cost using
+    the product's stone cost AS IT IS TODAY. That is not history — so it is not
+    used silently: the document is listed, in the dry run and in the real run."""
+    await _base(db)
+    db.add(Supplier(id="sup1", name="ACME"))
+    db.add(Product(id="p-stone", code="P-STONE", name_en="Diamond ring", category="Rings",
+                   karat=Karat.K18, weight_grams=D("4.000"), margin_percent=D("10"),
+                   making_charge=D("0"), on_hand_qty=1, cost_basis_usd=D("1000"),
+                   stone_cost_usd=D("180")))                    # set in the catalogue, later
+    purchase = SupplierPurchase(
+        id="pur-stone", supplier_id="sup1", payment_mode=SupplierPurchaseMode.CASH,
+        total_cash_due=D("1000"), total_grams_due_by_karat={}, cash_paid_at_creation=D("1000"),
+        grams_paid_at_creation_by_karat={}, created_by_user_id=ADMIN, occurred_at=_at(3, 5))
+    purchase.items = [SupplierPurchaseItem(item_kind=SupplierItemKind.PRODUCT, product_id="p-stone",
+                                           quantity=1, unit_cost_usd=D("1000"))]
+    db.add(purchase)
+    db.add(_sale("S1", _at(3, 10)))                             # a document with nothing to flag
+    await db.commit()
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=execute)
+
+    assert len(report.master_data) == 1
+    note = report.master_data[0]
+    assert note.startswith("supplier purchase pur-stone (2026-03-05)")
+    assert "P-STONE" in note and "180.00" in note and "stone" in note.lower()
+    text = gl_replay.format_report(report)
+    assert "CURRENT master data" in text and "supplier purchase pur-stone" in text
+    # A second run posts nothing, so it has nothing to flag either.
+    if execute:
+        assert (await gl_replay.run_replay(db, actor_user_id=ADMIN)).master_data == []
+
+
+@pytest.mark.asyncio
+async def test_sale_line_without_a_cost_snapshot_that_reads_the_products_cost_is_listed(db):
+    """Orders older than the cost snapshot: for a cost-tracked product the mapper
+    can only read Product.cost_basis_usd as it is today. Listed, not hidden.
+    (Lines priced off the stored gold rate need no notice — that IS history.)"""
+    await _base(db)
+    product, order = _product_sale(cost_now=D("300.00"))
+    order.items[0].cost_basis_usd = None                        # pre-snapshot order
+    db.add_all([product, order, _sale("S1", _at(3, 11))])
+    await db.commit()
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert len(report.master_data) == 1
+    assert report.master_data[0].startswith("order P1 (2026-03-10)")
+    assert "P-1" in report.master_data[0] and "cost" in report.master_data[0]
+
+
+@pytest.mark.asyncio
+async def test_line_refund_refuses_a_product_cost_that_drifted_from_the_sale_snapshot(db):
+    """The sale is already in the GL at the snapshotted 300.00. If the product's
+    cost has changed since, the refund must not reverse a different COGS."""
+    await _base(db)
+    product, order = _product_sale(cost_now=D("300.00"))
+    db.add_all([product, order])
+    await db.commit()
+    await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)       # sale posted
+    await _refund_line(db, order, _at(4, 2), qty=1)
+    product.cost_basis_usd = D("999.00")
+    await db.commit()
+    before = await _books(db)
+
+    with pytest.raises(gl_replay.ReplayError) as exc:
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    message = str(exc.value)
+    assert message.startswith("order P1 line refund") and "2026-04-02" in message
+    assert "300.00" in message and "999.00" in message
+    assert await _books(db) == before
 
 
 @pytest.mark.asyncio

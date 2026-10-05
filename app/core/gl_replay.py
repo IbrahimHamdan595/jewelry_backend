@@ -39,9 +39,10 @@ from app.core.audit_chain import GENESIS_HASH
 from app.core.coa_seed import describe_unusable_accounts, unusable_system_accounts
 from app.models import (
     AdjustmentTarget, ARInvoice, ARReceipt, GLJournalChainHead, GLJournalEntry,
-    GLJournalLine, GLPeriod, GoldLot, InventoryLedger, LotSource, ManualAdjustment, Order,
-    OrderStatus, PaymentMethod, Product, Settings, SupplierPayment, SupplierPurchase, User,
-    VendorBill, VendorPayment, WalkinBuyback,
+    GLJournalLine, GLPeriod, GoldLot, InventoryLedger, Karat, LotSource, ManualAdjustment,
+    Order, OrderItemKind, OrderStatus, PaymentMethod, Product, Settings, SupplierItemKind,
+    SupplierPayment, SupplierPurchase, SupplierPurchaseItem, User, VendorBill, VendorPayment,
+    WalkinBuyback,
 )
 
 ZERO = Decimal("0")
@@ -99,6 +100,9 @@ class ReplayReport:
     periods_reused: list[str] = field(default_factory=list)   # existed already, received entries
     not_replayed: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Documents posted by this run from a value that has NO historical record,
+    # so the mapper read today's master data (e.g. a product's stone cost).
+    master_data: list[str] = field(default_factory=list)
     trial_balance: dict = field(default_factory=dict)         # gl.compute_trial_balance, post-replay
     journal_entries: int = 0                                  # GL entries after the replay (chain verified)
 
@@ -112,6 +116,7 @@ class _Step:
     posted: Callable[[], Awaitable[bool]]            # is its GL entry already there?
     post: Callable[[], Awaitable[GLJournalEntry | None]]
     after: Callable[[GLJournalEntry, list[GLJournalLine]], Awaitable[None]] | None = None
+    master_data: str | None = None                   # set when a posted value is not historical
 
     @property
     def booked_on(self) -> date:
@@ -180,7 +185,30 @@ def _already(db: AsyncSession, source_type: str, source_id: str):
 
 # ── Sales, voids, refunds ─────────────────────────────────────────────────────
 
-def _sale_step(db: AsyncSession, order: Order, sold, actor_user_id: str) -> _Step:
+async def _tracked_costs(db: AsyncSession, order: Order) -> dict[str, tuple[str, Decimal]]:
+    """{order line id: (product code, the product's CURRENT cost_basis_usd)} for
+    the lines whose metal COGS the mapper takes from the Product row rather than
+    from the line itself (gl_postings._cogs_cost_for_item: a PRODUCT line whose
+    product carries a tracked cost). Every other line is costed from its own
+    stored gold_rate_at_sale × weight — history by construction."""
+    tracked: dict[str, tuple[str, Decimal]] = {}
+    for it in order.items:
+        if it.item_kind == OrderItemKind.PRODUCT and it.product_id:
+            row = (await db.execute(
+                select(Product.code, Product.cost_basis_usd).where(Product.id == it.product_id)
+            )).first()
+            if row is not None and row.cost_basis_usd is not None:
+                tracked[it.id] = (row.code, row.cost_basis_usd)
+    return tracked
+
+
+def _no_snapshot_notice(codes: list[str]) -> str:
+    return (f"metal COGS for {', '.join(sorted(set(codes)))} is the product's CURRENT cost — "
+            "the order line stored no cost snapshot.")
+
+
+def _sale_step(db: AsyncSession, order: Order, sold, actor_user_id: str,
+               tracked: dict[str, tuple[str, Decimal]]) -> _Step:
     async def after(entry: GLJournalEntry, lines: list[GLJournalLine]) -> None:
         # Historical COGS must be what the order stored at checkout
         # (OrderItem.cost_basis_usd), never a re-valuation. The mapper derives it
@@ -206,10 +234,13 @@ def _sale_step(db: AsyncSession, order: Order, sold, actor_user_id: str) -> _Ste
             for inv in invoices:
                 inv.gl_entry_id = entry.id
 
+    unrecorded = [tracked[it.id][0] for it in order.items
+                  if it.id in tracked and it.cost_basis_usd is None]
     return _Step(
         when=order.created_at, kind=KIND_SALE, ref=f"order {order.order_number}",
         posted=_already(db, gl_postings.SOURCE_ORDER, order.id),
         post=_mapped(gl_postings.post_sale, db, sold, actor_user_id), after=after,
+        master_data=_no_snapshot_notice(unrecorded) if unrecorded else None,
     )
 
 
@@ -247,7 +278,8 @@ def _reversal_step(db: AsyncSession, order: Order, actor_user_id: str,
 
 
 def _line_refund_steps(db: AsyncSession, order: Order, sold, item, events: list[InventoryLedger],
-                       actor_user_id: str, warnings: list[str]) -> list[_Step]:
+                       actor_user_id: str, warnings: list[str],
+                       tracked: dict[str, tuple[str, Decimal]]) -> list[_Step]:
     """One step per refund EVENT on the line, read back from the inventory
     ledger (ORDER_ITEM_REFUND), so each lands on its own date under the source
     id the live path uses ({item.id}:{cumulative refunded qty}) — a refund
@@ -290,11 +322,30 @@ def _line_refund_steps(db: AsyncSession, order: Order, sold, item, events: list[
                 refunded_item=item, refund_value=value, refund_qty=qty, refund_seq=seq,
                 entry_date=when.date())
 
+        async def after(entry: GLJournalEntry, lines: list[GLJournalLine]) -> None:
+            # The refund mapper re-reads the product's tracked cost. Where the
+            # sale stored its cost, the units refunded must reverse exactly
+            # their share of THAT — not whatever the product costs today.
+            stored = (item.cost_basis_usd * qty / item.quantity).quantize(_Q_MONEY)
+            cogs_id = await gl_postings.resolve_account_id(db, "METAL_COGS")
+            computed = sum((ln.base_credit for ln in lines if ln.account_id == cogs_id), ZERO)
+            if computed != stored:
+                raise ReplayError(
+                    f"the sale stored a metal cost of {stored} for the refunded unit(s) but "
+                    f"the product's cost now gives {computed}. Refusing to reverse a COGS "
+                    f"that differs from what the sale recorded."
+                )
+
+        reads_product = item.id in tracked
+        has_snapshot = item.cost_basis_usd is not None
         return _Step(
             when=when, kind=KIND_LINE_REFUND,
             ref=f"order {order.order_number} line refund ({qty} × {item.product_code})",
             posted=_already(db, gl_postings.SOURCE_ORDER_REFUND, f"{item.id}:{seq}"),
             post=post,
+            after=after if reads_product and has_snapshot else None,
+            master_data=(_no_snapshot_notice([tracked[item.id][0]])
+                         if reads_product and not has_snapshot else None),
         )
 
     return [step(*s) for s in slices]
@@ -317,12 +368,14 @@ async def _order_steps(db: AsyncSession, actor_user_id: str, warnings: list[str]
     for order in orders:
         refunded = [it for it in order.items if it.refunded_qty]
         sold = _as_sold(order) if refunded else order
-        steps.append(_sale_step(db, order, sold, actor_user_id))
+        tracked = await _tracked_costs(db, order)
+        steps.append(_sale_step(db, order, sold, actor_user_id, tracked))
         # The three outcomes are mutually exclusive (see orders.py guards): a
         # line-refunded order cannot be voided, a voided one cannot be refunded.
         for item in refunded:
             steps.extend(_line_refund_steps(
-                db, order, sold, item, refund_events.get(item.id, []), actor_user_id, warnings))
+                db, order, sold, item, refund_events.get(item.id, []), actor_user_id, warnings,
+                tracked))
         if not refunded and order.status in (OrderStatus.VOIDED, OrderStatus.REFUNDED):
             steps.append(_reversal_step(db, order, actor_user_id, warnings))
     return steps
@@ -339,7 +392,8 @@ async def _document_steps(db: AsyncSession, actor_user_id: str, warnings: list[s
         steps.append(_Step(
             when=p.occurred_at, kind=KIND_SUPPLIER_PURCHASE, ref=f"supplier purchase {p.id}",
             posted=_already(db, gl_postings.SOURCE_SUPPLIER_PURCHASE, p.id),
-            post=_mapped(gl_postings.post_supplier_purchase, db, p, actor_user_id)))
+            post=_mapped(gl_postings.post_supplier_purchase, db, p, actor_user_id),
+            master_data=await _stone_cost_notice(db, p)))
 
     for pay in (await db.execute(
         select(SupplierPayment).order_by(SupplierPayment.paid_at, SupplierPayment.id)
@@ -357,32 +411,33 @@ async def _document_steps(db: AsyncSession, actor_user_id: str, warnings: list[s
             posted=_already(db, gl_postings.SOURCE_BUYBACK, bb.id),
             post=_mapped(gl_postings.post_buyback, db, bb, actor_user_id)))
 
-    # Melts are not a table: each one left a MELT-sourced lot pointing back at the
-    # product / used-product buyback it consumed. Same view melts.py builds.
+    # Melts are not a table: each one left a MELT-sourced lot and a MELT event on
+    # the inventory ledger whose payload names that lot.
+    melt_events: dict[str, InventoryLedger] = {}
+    for ev in (await db.execute(
+        select(InventoryLedger).where(InventoryLedger.event_type == ledger.EVENT_MELT)
+        .order_by(InventoryLedger.occurred_at, InventoryLedger.id)
+    )).scalars().all():
+        lot_id = (ev.payload or {}).get("lot_id")
+        if lot_id:
+            melt_events.setdefault(lot_id, ev)
+
     for lot in (await db.execute(
         select(GoldLot).where(GoldLot.source == LotSource.MELT)
         .order_by(GoldLot.acquired_at, GoldLot.id)
     )).scalars().all():
-        model = {"product": Product, "walkin_buyback": WalkinBuyback}.get(lot.source_ref_type)
-        source = None
-        if model is not None:
-            source = (await db.execute(
-                select(model).where(model.id == lot.source_ref_id))).scalar_one_or_none()
-        if source is None or source.karat is None or source.weight_grams is None:
+        melt, notice = await _melt_as_recorded(db, lot, melt_events.get(lot.id))
+        if melt is None:
             warnings.append(
                 f"Melt lot {lot.id}: its source ({lot.source_ref_type} {lot.source_ref_id}) is "
                 f"missing, so the pre-melt karat/weight is unknown — NOT replayed."
             )
             continue
-        melt = SimpleNamespace(
-            id=lot.id, occurred_at=lot.acquired_at,
-            from_karat=source.karat, from_grams=source.weight_grams,
-            to_karat=lot.karat, to_grams=lot.weight_grams, cost_usd=lot.cost_basis_usd,
-        )
         steps.append(_Step(
-            when=lot.acquired_at, kind=KIND_MELT, ref=f"melt lot {lot.id}",
+            when=melt.occurred_at, kind=KIND_MELT, ref=f"melt lot {lot.id}",
             posted=_already(db, gl_postings.SOURCE_MELT, lot.id),
-            post=_mapped(gl_postings.post_melt, db, melt, actor_user_id)))
+            post=_mapped(gl_postings.post_melt, db, melt, actor_user_id),
+            master_data=notice))
 
     # Only a gold-lot LOSS posts (adjustments.py): gains and product / coin /
     # ounce stock adjustments have no mapper, live or replayed.
@@ -409,6 +464,81 @@ async def _document_steps(db: AsyncSession, actor_user_id: str, warnings: list[s
             post=_mapped(gl_postings.post_adjustment, db, loss, actor_user_id)))
 
     return steps
+
+
+async def _stone_cost_notice(db: AsyncSession, purchase: SupplierPurchase) -> str | None:
+    """post_supplier_purchase splits the cash cost between Product and Stone
+    Inventory by each product's stone cost — read from the Product row as it is
+    NOW. The purchase stored no stone cost, so there is no record to check that
+    against; say so for every purchase where the split is actually applied."""
+    if not purchase.total_cash_due or purchase.total_cash_due <= 0:
+        return None
+    rows = (await db.execute(
+        select(Product.code, Product.stone_cost_usd)
+        .join(SupplierPurchaseItem, SupplierPurchaseItem.product_id == Product.id)
+        .where(SupplierPurchaseItem.purchase_id == purchase.id,
+               SupplierPurchaseItem.item_kind == SupplierItemKind.PRODUCT)
+        .order_by(Product.code)
+    )).all()
+    stones = [f"{code} ({cost:,.2f})" for code, cost in rows if cost]
+    if not stones:
+        return None
+    return ("the stone / product split of its cash cost uses the CURRENT stone cost of "
+            f"{', '.join(stones)} — the purchase stored none.")
+
+
+async def _melt_as_recorded(db: AsyncSession, lot: GoldLot,
+                            ev: InventoryLedger | None) -> tuple[SimpleNamespace | None, str | None]:
+    """The melt view post_melt takes, built from what was RECORDED when it
+    happened: the MELT ledger event (melts.py) holds the resulting karat, weight
+    and cost, and says which of karat / weight the admin overrode. A dimension
+    that was not overridden went in exactly as it came out, so the event alone
+    settles it — the source row is not consulted.
+
+    Only an overridden dimension has no record of its pre-melt value. That one
+    is read from the source row: a buyback (a document nothing can edit) or a
+    product, which is catalogue data that may have been edited since — hence
+    the notice returned alongside. Returns (None, None) when that row is gone."""
+    if ev is None:
+        # No event at all (melts.py always writes one): the lot row is all there is.
+        to_karat, to_grams, cost, when = lot.karat, lot.weight_grams, lot.cost_basis_usd, lot.acquired_at
+        karat_changed = grams_changed = True
+    else:
+        try:
+            to_karat = Karat(ev.payload["karat"])
+            to_grams = Decimal(str(ev.payload["weight_grams"]))
+            cost = Decimal(str(ev.payload["cost_basis_usd"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise ReplayError(f"melt lot {lot.id}: unreadable MELT ledger event ({exc!r}).") from exc
+        when = ev.occurred_at
+        karat_changed = bool(ev.payload.get("karat_override"))
+        grams_changed = bool(ev.payload.get("weight_override"))
+
+    from_karat, from_grams, notice = to_karat, to_grams, None
+    if karat_changed or grams_changed:
+        model = {"product": Product, "walkin_buyback": WalkinBuyback}.get(lot.source_ref_type)
+        source = None
+        if model is not None:
+            source = (await db.execute(
+                select(model).where(model.id == lot.source_ref_id))).scalar_one_or_none()
+        if source is None or source.karat is None or source.weight_grams is None:
+            return None, None
+        if karat_changed:
+            from_karat = source.karat
+        if grams_changed:
+            from_grams = source.weight_grams
+        what = " and ".join(w for w, changed in (("karat", karat_changed), ("weight", grams_changed)) if changed)
+        if ev is None:
+            notice = ("no MELT ledger event was recorded; the melt is rebuilt from the lot and "
+                      f"the CURRENT {lot.source_ref_type} row.")
+        elif model is Product:
+            notice = (f"the pre-melt {what} is read from product {source.code}'s CURRENT record "
+                      "— the melt event stores only the result.")
+
+    return SimpleNamespace(
+        id=lot.id, occurred_at=when, from_karat=from_karat, from_grams=from_grams,
+        to_karat=to_karat, to_grams=to_grams, cost_usd=cost,
+    ), notice
 
 
 async def _not_replayed(db: AsyncSession) -> dict[str, int]:
@@ -582,6 +712,8 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
             # Whatever went wrong, the operator needs to know on WHICH document.
             raise step.failure(exc) from exc
         summary.posted += 1
+        if step.master_data:
+            report.master_data.append(f"{step.ref} ({step.booked_on}): {step.master_data}")
         summary.base_total += sum((ln.base_debit for ln in lines), ZERO)
         for ln in lines:
             if ln.metal_debit_grams:
@@ -680,6 +812,10 @@ def format_report(report: ReplayReport) -> str:
         out += [f"  {label}: {n}" for label, n in report.not_replayed.items()]
     if report.warnings:
         out += ["", "Warnings:"] + [f"  - {w}" for w in report.warnings]
+    if report.master_data:
+        out += ["", "Uses CURRENT master data — no historical record exists for these values, so "
+                    "they are as of today. Check each before sign-off:"]
+        out += [f"  - {m}" for m in report.master_data]
 
     tb = report.trial_balance
     out += ["", f"Trial balance after replay: debits {tb['total_base_debit']:,.2f} / credits "

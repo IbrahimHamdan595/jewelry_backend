@@ -68,14 +68,27 @@ not compute any debit or credit itself.
 | Supplier purchases | `post_supplier_purchase` | purchase date |
 | Supplier payments (cash / gold) | `post_supplier_payment` | payment date |
 | Walk-in buybacks | `post_buyback` | buyback date |
-| Melts | `post_melt` | date the melt lot was created |
+| Melts | `post_melt` (from the `MELT` ledger event) | melt date |
 | Gold-lot losses | `post_adjustment` | adjustment date |
 
 Things worth knowing:
 
 - **COGS is historical.** It comes from the gold rate / cost stored on the order
   line at checkout, never today's rate. If the cost the mapper computes differs
-  from the snapshot stored on the order, the replay stops instead of posting.
+  from the snapshot stored on the order — for the sale, or for the units of a
+  line refund — the replay stops instead of posting.
+- **Melts are read from the ledger, not the catalogue.** The `MELT` event holds
+  the karat, weight and cost the melt produced and says whether karat or weight
+  was overridden; whatever was not overridden went in as it came out. The
+  product row is only read for an overridden dimension.
+- **Nothing is taken from today's master data silently.** Where a value has no
+  historical record and the mapper can only read the current one, the document
+  is listed in the report under "Uses CURRENT master data" (dry run and real
+  run alike). Today that means: the stone / product split of a supplier
+  purchase (the product's stone cost), the pre-melt karat or weight of a melted
+  product when it was overridden, and the COGS of a cost-tracked product on an
+  order old enough to have no cost snapshot. Check each listed document with
+  the accountant before sign-off.
 - **Line-refunded orders** have had their header totals overwritten with what
   remains. The replay rebuilds the original sale from the lines (the way
   checkout computed it), posts that, then posts each refund.
@@ -147,6 +160,8 @@ so the report is exactly what `--execute` would post:
   are already in the GL, and the totals (USD debits, grams per karat);
 - **the accounting periods it would create**;
 - anything not replayed, and any warning (undated refunds, missing sources);
+- every document posted from **current master data** because no historical
+  value exists;
 - the trial balance and the account balances the books would end with.
 
 Give that report to the owner and the accountant. Nothing has changed yet.
@@ -169,7 +184,8 @@ Only after the owner signs off on the dry-run report.
    Accounting → Trial balance is balanced in money and in metal.
 
 If it stops with `REPLAY FAILED — nothing was written`, that is literally true.
-Fix what the message names (usually a CLOSED period in the way) and run again.
+The message names the document and its date. Fix what it names (usually a
+CLOSED period in the way) and run again.
 
 ## 3. The periods it opens
 
@@ -191,8 +207,9 @@ document — it will not post into the year, and it will not open a new month
 inside it. Documents that never produce an entry (a melt that changed nothing,
 a purchase settled in full on the day) do not count. There is no way to replay
 into a closed year: the accountant settles those documents with an adjusting
-entry in the current year, and until they are gone from the list the replay
-stays refused. So: **replay first, close the year afterwards.**
+entry in the current year. The documents themselves stay unposted, so the
+replay keeps refusing for that database — lifting that is an engineering
+decision, not an operator one. So: **replay first, close the year afterwards.**
 
 ## 4. Turning auto-posting on
 
