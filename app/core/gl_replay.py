@@ -34,8 +34,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core import gl, gl_postings, ledger
-from app.core.audit_chain import GENESIS_HASH, _GL_HEADER_FIELDS, _GL_LINE_FIELDS, verify_gl_chain
+from app.core import gl, gl_postings, ledger, period_close
+from app.core.audit_chain import GENESIS_HASH
 from app.core.coa_seed import describe_unusable_accounts, unusable_system_accounts
 from app.models import (
     AdjustmentTarget, ARInvoice, ARReceipt, GLJournalChainHead, GLJournalEntry,
@@ -100,7 +100,7 @@ class ReplayReport:
     not_replayed: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     trial_balance: dict = field(default_factory=dict)         # gl.compute_trial_balance, post-replay
-    chain: dict = field(default_factory=dict)                 # status / total_rows / head_matches
+    journal_entries: int = 0                                  # GL entries after the replay (chain verified)
 
 
 @dataclass
@@ -420,29 +420,27 @@ async def _not_replayed(db: AsyncSession) -> dict[str, int]:
 
 # ── Chain + periods ───────────────────────────────────────────────────────────
 
-async def _verify_chain(db: AsyncSession) -> dict:
-    """The walk GET /accounting/ledger/verify does, plus its head comparison."""
-    entries = (await db.execute(
-        select(GLJournalEntry).options(selectinload(GLJournalEntry.lines))
-        .order_by(GLJournalEntry.occurred_at, GLJournalEntry.id)
-    )).scalars().all()
-    result = verify_gl_chain(
-        {"id": e.id, "prev_hash": e.prev_hash, "entry_hash": e.entry_hash,
-         **{f: getattr(e, f) for f in _GL_HEADER_FIELDS},
-         "lines": [{f: getattr(ln, f) for f in _GL_LINE_FIELDS} for ln in e.lines]}
-        for e in entries
-    )
-    head = (await db.execute(
-        select(GLJournalChainHead).where(GLJournalChainHead.id == 1))).scalar_one()
-    computed = entries[-1].entry_hash if entries else GENESIS_HASH
-    return {
-        "status": result["status"], "total_rows": result["total_rows"],
-        "head_matches": head.latest_entry_hash == computed and head.row_count == len(entries),
-    }
+async def _journal_size(db: AsyncSession) -> int:
+    return (await db.execute(select(func.count()).select_from(GLJournalEntry))).scalar_one()
 
 
-def _chain_ok(chain: dict) -> bool:
-    return chain["status"] in ("intact", "empty") and chain["head_matches"]
+async def _chain_verifies(db: AsyncSession) -> bool:
+    """The GL hash chain walks clean AND its head row agrees with the journal.
+    The walk is period_close's — the one a period close already trusts — not a
+    copy. Only the head comparison is added: post_entry chains each new entry
+    onto the head row, so a head that disagrees with the journal would turn
+    every replayed entry into a break."""
+    if not await period_close._gl_chain_intact(db):
+        return False
+    latest = (await db.execute(
+        select(GLJournalEntry.entry_hash)
+        .order_by(GLJournalEntry.occurred_at.desc(), GLJournalEntry.id.desc()).limit(1)
+    )).scalar_one_or_none()
+    head_hash, head_count = (await db.execute(
+        select(GLJournalChainHead.latest_entry_hash, GLJournalChainHead.row_count)
+        .where(GLJournalChainHead.id == 1)
+    )).one()
+    return head_hash == (latest or GENESIS_HASH) and head_count == await _journal_size(db)
 
 
 async def _periods(db: AsyncSession) -> set[tuple[int, int]]:
@@ -466,7 +464,7 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
             "Seed it (POST /api/accounting/seed-coa) and reactivate what is inactive "
             "first — the replay never creates or changes accounts."
         )
-    if not _chain_ok(await _verify_chain(db)):
+    if not await _chain_verifies(db):
         raise ReplayError(
             "The GL hash chain does not verify (GET /api/accounting/ledger/verify). "
             "Refusing to append a backfill to a chain that is already broken."
@@ -523,9 +521,9 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
     report.trial_balance = await gl.compute_trial_balance(db, as_of=date.max)
     if not (report.trial_balance["balanced"] and report.trial_balance["metal_balanced"]):
         raise ReplayError("Trial balance does not balance after the replay — nothing kept.")
-    report.chain = await _verify_chain(db)
-    if not _chain_ok(report.chain):
+    if not await _chain_verifies(db):
         raise ReplayError("The GL hash chain does not verify after the replay — nothing kept.")
+    report.journal_entries = await _journal_size(db)
 
     if report.entries_posted:
         # One marker on the audit ledger, so entries whose entry_date is months
@@ -605,7 +603,7 @@ def format_report(report: ReplayReport) -> str:
     out += ["", f"Trial balance after replay: debits {tb['total_base_debit']:,.2f} / credits "
                 f"{tb['total_base_credit']:,.2f} — money {'balanced' if tb['balanced'] else 'UNBALANCED'}, "
                 f"metal {'balanced' if tb['metal_balanced'] else 'UNBALANCED'}",
-            f"Hash chain after replay: {report.chain['status']}, {report.chain['total_rows']} entries"]
+            f"Hash chain after replay: verified, {report.journal_entries} entries"]
     if tb["accounts"]:
         out += ["", "Balances after replay (net = debits − credits):"]
         for a in tb["accounts"]:

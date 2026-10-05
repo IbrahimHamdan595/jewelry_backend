@@ -22,7 +22,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import delete, event, func, select
+from sqlalchemy import delete, event, func, select, text
 
 from app.core import gl_postings, gl_replay
 from app.core.audit_chain import GENESIS_HASH, compute_ledger_entry_hash
@@ -800,6 +800,26 @@ async def test_replay_refuses_to_append_to_a_chain_that_does_not_verify(db):
         await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
 
     assert await _books(db) == before
+
+
+@pytest.mark.asyncio
+async def test_replay_refuses_to_append_after_a_journal_entry_was_tampered_with(db):
+    """The walk itself (not only the head row): an edited historical entry must
+    stop any further backfill, exactly as it would stop a period close."""
+    await _base(db)
+    db.add(_sale("S1", _at(3, 10)))
+    await db.commit()
+    await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+    db.add(_sale("S9", _at(3, 11)))          # new history still waiting to be posted
+    await db.execute(text("UPDATE gl_journal_entries SET memo = 'edited after the fact'"))
+    await db.commit()
+    db.expire_all()
+    before = await _books(db)
+
+    with pytest.raises(gl_replay.ReplayError, match="hash chain.*[Rr]efusing to append"):
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert await _books(db) == before and before["entries"] == 1
 
 
 @pytest.mark.asyncio
