@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# One live run per ref: a newer push cancels the run it supersedes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    # Pinned, not ubuntu-latest: the apt package names below are release-specific.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Dockerfile pins 3.11, runtime.txt pins 3.12 — cover both.
+        python-version: ["3.11", "3.12"]
+    env:
+      # app/config.py requires both at import time. Throwaway values only: the
+      # suite runs on in-memory SQLite fixtures (tests/conftest.py), so there is
+      # no database service here. Never reference a secret in this workflow —
+      # with none available, CI holds nothing it could reach a real database with.
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      JWT_SECRET: "ci-throwaway-not-a-secret"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # WeasyPrint's native text stack, so tests/test_exports.py renders real
+      # PDFs. Keep this list identical to the apt-get list in the Dockerfile.
+      - name: Install WeasyPrint system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            libharfbuzz0b \
+            libfribidi0 \
+            libgdk-pixbuf-2.0-0 \
+            libffi8 \
+            fontconfig \
+            fonts-noto-core
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # Fail loudly here rather than let the PDF tests be skipped or crash the
+      # interpreter if the libraries above ever stop loading.
+      - name: Check WeasyPrint loads its native libraries
+        run: python -c "import weasyprint; print('WeasyPrint', weasyprint.__version__)"
+
+      - name: Run test suite
+        run: python -m pytest -q
