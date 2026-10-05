@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class SettingsOut(BaseModel):
@@ -26,6 +26,9 @@ class SettingsOut(BaseModel):
     buyback_rate_drift_pct_max: Decimal
     nisab_grams: Decimal
     max_discount_percent: Decimal
+    # Master switch for real-time GL posting (NEX-52). Always a real boolean:
+    # the frontend treats a missing/null value as "not reported", never as off.
+    accounting_auto_post_enabled: bool
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -52,6 +55,9 @@ class SettingsUpdate(BaseModel):
     buyback_rate_drift_pct_max: Decimal | None = None
     nisab_grams: Decimal | None = Field(default=None, gt=0)
     max_discount_percent: Decimal | None = Field(default=None, ge=0, le=100)
+    # StrictBool: only a JSON true/false moves the switch — no "off"/1 coercion.
+    # Omitted (or null) means "leave unchanged"; see update_settings.
+    accounting_auto_post_enabled: StrictBool | None = None
 
 
 class StaffCreate(BaseModel):

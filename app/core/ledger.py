@@ -91,6 +91,10 @@ EVENT_GL_PERIOD_REOPENED = "GL_PERIOD_REOPENED"
 EVENT_GL_YEAR_CLOSED = "GL_YEAR_CLOSED"
 EVENT_GL_ACCOUNT_CREATED = "GL_ACCOUNT_CREATED"
 EVENT_GL_ACCOUNT_UPDATED = "GL_ACCOUNT_UPDATED"
+# Historical replay (NEX-52) — one marker per run of app/core/gl_replay.py that
+# posted anything, so journal entries dated months before they were written are
+# explainable from the audit trail.
+EVENT_GL_HISTORY_REPLAYED = "GL_HISTORY_REPLAYED"
 
 # Audit phase A3 — sensitive admin actions that previously wrote no ledger row.
 EVENT_SETTINGS_CHANGED = "SETTINGS_CHANGED"

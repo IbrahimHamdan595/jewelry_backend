@@ -484,6 +484,7 @@ jewelry_backend/
 |---|---|
 | **[`docs/AUDIT_CONTROLS.md`](docs/AUDIT_CONTROLS.md)** | You need the full picture of what audit controls exist, the invariants, the API surface, how to verify a chain, how to interpret a "broken" result. **Start here for anything audit-related.** |
 | [`AUDIT_READINESS.md`](AUDIT_READINESS.md) | You want the original assessment of audit gaps that led to A1 → B2, plus the role-split follow-up. |
+| [`docs/GL_HISTORY_REPLAY.md`](docs/GL_HISTORY_REPLAY.md) | You are about to switch accounting auto-posting on, or need to know why the general ledger starts empty and how the pre-existing history is replayed into it (dry run first; owner sign-off required). |
 | [`docs/superpowers/plans/2026-05-24-zakat-and-pure-gold.md`](docs/superpowers/plans/2026-05-24-zakat-and-pure-gold.md) | You're working on zakat logic and want the design rationale. |
 | [`docs/superpowers/plans/2026-05-25-b1-b2-reconcile-stock-take.md`](docs/superpowers/plans/2026-05-25-b1-b2-reconcile-stock-take.md) | You're working on stock reconcile or stock-take and want the design rationale, including the void-vs-refund analysis and the close-race fix. |
 | Module-level docstrings in `app/core/audit_chain.py`, `app/core/audit_maintenance.py`, `app/core/auth_audit.py`, `app/core/ledger.py`, `app/api/stock_takes.py` | You're touching that specific module and want to understand its invariants. |
