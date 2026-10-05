@@ -162,7 +162,9 @@ async def inventory_valuation(db: AsyncSession, *, rate_24k: Decimal | None) -> 
     """Total on-hand inventory value in USD at the live 24K rate (market method).
     Coins/ounces have no cost basis, so everything is valued at market; products
     use their cost_basis_usd when present, else the market proxy."""
-    r = Decimal(rate_24k) if rate_24k is not None else ZERO
+    # The rate arrives as a float (gold_api): read it through its exact text.
+    # Decimal(84.31) is 84.31000000000000227…, enough to tip a half-cent tie.
+    r = Decimal(str(rate_24k)) if rate_24k is not None else ZERO
     lots = (await db.execute(select(GoldLot).where(GoldLot.is_depleted.is_(False)))).scalars().all()
     pure = sum((l.weight_remaining_grams * KARAT_PURITY[l.karat] * r for l in lots), ZERO)
     coins = (await db.execute(select(CoinType).where(CoinType.is_active.is_(True)))).scalars().all()

@@ -270,3 +270,26 @@ async def test_cash_bank_balance_is_zero_without_accounts_or_lines(db):
     await seed_chart_of_accounts(db)
     await adopt_seeded_accounts(db)
     assert str(await dashboard.cash_bank_balance(db)) == "0.00"       # accounts, dormant GL
+
+
+# ── Phase D — the rate reaches the valuation as a float (NEX-54) ──────────────
+
+@pytest.mark.asyncio
+async def test_inventory_valuation_reads_a_float_rate_through_its_exact_text(db):
+    """get_current_gold_rate hands the 24K rate over as a float. 2 g of 18K at
+    84.31 is 126.465 exactly, but Decimal(84.31) is 84.31000000000000227…, which
+    lifts the product just above the half cent and used to give 126.47."""
+    db.add(Product(code="TIE", name_en="Tie", category="rings", karat=Karat.K18, weight_grams=D("2.000"),
+                   margin_percent=D("15"), making_charge=D("25"), on_hand_qty=1,
+                   status=ProductStatus.AVAILABLE))          # no cost basis: valued at market
+    db.add(GoldLot(karat=Karat.K18, weight_grams=D("2.000"), weight_remaining_grams=D("2.000"),
+                   source=LotSource.SEED, cost_basis_usd=D("0"), is_depleted=False))
+    await db.flush()
+
+    from_float = await dashboard.inventory_valuation(db, rate_24k=84.31)
+    from_decimal = await dashboard.inventory_valuation(db, rate_24k=D("84.31"))
+
+    assert from_float == from_decimal                        # the float adds nothing of its own
+    assert from_float["products_usd"] == D("126.46")         # the exact 126.465, not a nudged one
+    assert from_float["pure_gold_usd"] == D("126.46")
+    assert from_float["rate_24k"] == D("84.31")
