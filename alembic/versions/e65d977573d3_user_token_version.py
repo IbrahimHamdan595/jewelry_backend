@@ -1,7 +1,7 @@
 """users.token_version — session invalidation (NEX-54)
 
 Revision ID: e65d977573d3
-Revises: e2b3c4d5f6a7
+Revises: d48c4a87efe4
 Create Date: 2026-10-04
 
 Every JWT carries the token_version it was issued under; get_current_user
@@ -23,7 +23,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "e65d977573d3"
-down_revision = "e2b3c4d5f6a7"
+down_revision = "d48c4a87efe4"
 branch_labels = None
 depends_on = None
 
