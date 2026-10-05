@@ -280,13 +280,16 @@ async def post_entry(
     """Post a balanced journal entry inside the caller's transaction (no commit).
 
     Order (design §3.4): resolve OPEN period → resolve denominations from DB →
-    validate balance → lock chain head → refuse a duplicate reversal/auto-post →
-    allocate entry_no → compute hash → insert header+lines → advance head →
-    record GL_ENTRY_POSTED audit event.
+    validate balance → lock the inventory-ledger head, then the GL chain head →
+    refuse a duplicate reversal/auto-post → allocate entry_no → compute hash →
+    insert header+lines → advance head → record GL_ENTRY_POSTED audit event.
 
-    Lock ordering note: the GL chain head is locked BEFORE InventoryLedger's
-    head (inside ledger.record). Always acquire GL-head-then-inventory-head to
-    avoid deadlocks.
+    Lock ordering: InventoryLedger's head FIRST, then the GL chain head — on
+    every path. The sale / void / refund / buyback handlers write their
+    inventory event (ledger.record) before they post, so they arrive here
+    already holding the ledger head; a posting made on its own takes it here,
+    in the same order. Never lock the GL head without the ledger head: the two
+    orders deadlock against each other.
     """
     period = await _resolve_open_period(db, entry_date, allow_closed=allow_closed_period)
     await _resolve_denominations(db, lines)
@@ -300,6 +303,9 @@ async def post_entry(
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    # Ledger head before GL head (see the lock-ordering note above). This entry
+    # needs it anyway, for the GL_ENTRY_POSTED event at the end.
+    await ledger.lock_head(db)
     head = (
         await db.execute(
             select(GLJournalChainHead).where(GLJournalChainHead.id == 1).with_for_update()

@@ -151,6 +151,20 @@ def field_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[
     return out
 
 
+async def lock_head(db: AsyncSession) -> InventoryLedgerChainHead:
+    """Lock the chain-head row FOR UPDATE (held until the caller's transaction
+    ends) and return it. record() takes it for every append; gl.post_entry
+    takes it up front, so that the ledger head is always locked BEFORE the GL
+    chain head — one order for the two heads, on every path."""
+    return (
+        await db.execute(
+            select(InventoryLedgerChainHead)
+            .where(InventoryLedgerChainHead.id == 1)
+            .with_for_update()
+        )
+    ).scalar_one()
+
+
 async def record(
     db: AsyncSession,
     *,
@@ -171,13 +185,7 @@ async def record(
     # 1. Lock the head row. SELECT ... FOR UPDATE on a single-row table is
     #    the simplest serialization primitive that works on both PG and the
     #    SQLite test fixture (where it's a no-op but writes serialize anyway).
-    head = (
-        await db.execute(
-            select(InventoryLedgerChainHead)
-            .where(InventoryLedgerChainHead.id == 1)
-            .with_for_update()
-        )
-    ).scalar_one()
+    head = await lock_head(db)
 
     # 2. Set the timestamp now so it's part of the hash. Without this, the
     #    DB server_default would set it on INSERT, but at that point the
