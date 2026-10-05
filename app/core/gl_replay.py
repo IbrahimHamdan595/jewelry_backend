@@ -18,6 +18,17 @@ and no advanced hash chain behind.
 The auto-post flag is neither required nor touched: the mappers are handed a
 stand-in settings object whose gate is open (see _gate).
 
+Before anything is kept it refuses, naming what is wrong: a chart of accounts
+with a missing or inactive system account, a hash chain that does not verify,
+books that were started from an OPENING entry (replaying on top double counts),
+and any document dated in a fiscal year that has been year-closed. A step that
+fails is reported with its document and date.
+
+Historical values only: amounts come from the documents and from what the
+inventory ledger recorded at the time. Where no such record exists and a mapper
+can only read today's master data, the document is listed in the report
+(ReplayReport.master_data) rather than posted silently.
+
 Deliberately NOT wired to startup or to any endpoint. Operator tool:
 scripts/replay_gl_history.py. Decision record + runbook: docs/GL_HISTORY_REPLAY.md.
 """
