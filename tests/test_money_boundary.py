@@ -160,6 +160,16 @@ async def test_refresh_and_override_echo_the_rate_as_a_string(client, db, monkey
     assert r.status_code == 200, r.text
     assert r.json() == {"message": "Override set", "rate_24k": "85.50"}
 
+    # Half-cent ties round up, which is what Postgres does when it stores the
+    # NUMERIC(10,2): the echo and the stored rate cannot be a cent apart.
+    async def _fetch_tie():
+        return GoldRateResult(value=D("84.325"), source="goldapi")
+
+    monkeypatch.setattr(gold_price, "fetch_gold_rate", _fetch_tie)
+    assert (await client.post("/api/gold-price/refresh")).json()["rate"] == "84.33"
+    r = await client.post("/api/gold-price/override", json={"rate_24k": "85.505", "reason": "feed down"})
+    assert r.json()["rate_24k"] == "85.51"
+
 
 # ── price previews ────────────────────────────────────────────────────────────
 
@@ -220,6 +230,16 @@ async def test_order_list_totals_are_two_decimal_strings(client, db):
     assert re.fullmatch(r"\d+\.\d{2}", body["total_revenue"]), body["total_revenue"]
     assert re.fullmatch(r"\d+\.\d{2}", body["avg_order_value"]), body["avg_order_value"]
     assert [o["total_usd"] for o in body["items"]] == ["50.00", "0.10", "100.10"]
+
+
+def test_order_average_rounds_a_half_cent_up():
+    # On the schema, so it does not depend on the revenue query (NEX-48):
+    # 0.25 over two orders is 0.125.
+    from app.schemas.order import OrderListOut
+
+    out = OrderListOut(items=[], total=2, total_revenue=D("0.25"), avg_order_value=D("0.25") / 2)
+    assert json.loads(out.model_dump_json()) == {
+        "items": [], "total": 2, "total_revenue": "0.25", "avg_order_value": "0.13"}
 
 
 @pytest.mark.asyncio
