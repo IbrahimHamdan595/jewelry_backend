@@ -185,8 +185,8 @@ public key that can only verify (NEX-54).
 | `JWT_ACCEPT_HS256` | `true` | Keep accepting `JWT_SECRET`-signed tokens. Set `false` to end the migration window. |
 
 Both keys are PEM. Newlines may be real or written as the two characters `\n`.
-`JWT_ALGORITHM` is **not** how RS256 is selected — it only names the
-shared-secret algorithm; leave it alone on the backend.
+`JWT_ALGORITHM` is **not** how RS256 is selected, on either side — it only
+names the shared-secret (HMAC) algorithm. Leave it as it is.
 
 Merging this changes nothing until `JWT_PRIVATE_KEY` is set. The service
 refuses to start on a configuration that could not accept its own tokens, so
@@ -211,31 +211,63 @@ openssl rsa -in jwt_private.pem -pubout -out jwt_public.pem
 # One-line forms, for env-var fields that do not take multi-line values:
 awk 'NF {printf "%s\\n", $0}' jwt_private.pem; echo
 awk 'NF {printf "%s\\n", $0}' jwt_public.pem; echo
-
-# Once both are in Render / Vercel, do not keep them on disk or in git:
-rm jwt_private.pem jwt_public.pem
 ```
 
-**Cutover order** (do steps 2 and 3 back to back, outside shop hours):
+Keep the two files until step 2 below is done, then delete them (see the end
+of the cutover). They must never be committed.
 
-1. Generate the pair.
-2. **Render (backend):** set `JWT_PRIVATE_KEY` and `JWT_PUBLIC_KEY`. Leave
-   `JWT_ACCEPT_HS256`, `JWT_SECRET` and `JWT_ALGORITHM` as they are. Deploy.
-   New logins are RS256; sessions already open (HS256) keep working.
-3. **Vercel (frontend):** set `JWT_PUBLIC_KEY` to the same public key and
-   `JWT_ALGORITHM=RS256`. Redeploy. If the middleware checks one algorithm at
-   a time, a login made between steps 2 and 3 bounces back to `/login` until
-   this step lands, and anyone still on an HS256 cookie afterwards is asked
-   to log in once.
-4. **Wait `JWT_EXPIRES_MINUTES` (8 hours)** so every HS256 token has expired.
-5. **Render:** set `JWT_ACCEPT_HS256=false`. From here `JWT_SECRET` can
-   neither mint nor verify a session.
-6. **Vercel:** remove `JWT_SECRET`. On Render `JWT_SECRET` must stay defined
-   (the config requires it) — leave its value in place rather than blanking it.
+**Check the pair before it goes anywhere.** The backend refuses to start on
+a `JWT_PUBLIC_KEY` that does not belong to its `JWT_PRIVATE_KEY`, but nothing
+can check the copy on Vercel for you: a wrong key there verifies nothing, and
+once the backend signs RS256 nobody gets past the login page. Compare
+fingerprints — the SHA-256 of the public key in DER form — before step 2:
 
-Rollback before step 5: unset `JWT_PRIVATE_KEY` on Render (signing goes back to
-HS256; keep `JWT_PUBLIC_KEY` so RS256 sessions already issued stay valid) and
-restore `JWT_ALGORITHM=HS256` / remove `JWT_PUBLIC_KEY` on Vercel.
+```bash
+# The public half of the private key Render will sign with:
+openssl pkey -in jwt_private.pem -pubout -outform DER | openssl dgst -sha256
+
+# The public key file you generated:
+openssl pkey -pubin -in jwt_public.pem -outform DER | openssl dgst -sha256
+
+# The value actually saved in Vercel — paste it between the quotes
+# (%b turns a one-line value's \n back into newlines):
+printf '%b' '<JWT_PUBLIC_KEY as shown in Vercel>' > vercel_public.pem
+openssl pkey -pubin -in vercel_public.pem -outform DER | openssl dgst -sha256
+```
+
+All three digests must be identical. If the last one differs, fix the value
+in Vercel and redeploy the frontend before touching Render.
+
+**Cutover order.** The frontend middleware accepts both kinds of token during
+the window — RS256 against `JWT_PUBLIC_KEY`, HS256 for as long as it still
+has `JWT_SECRET` — so no step logs anyone out and none has to be timed
+against another:
+
+1. **Vercel (frontend):** add `JWT_PUBLIC_KEY`. Redeploy. Nothing changes
+   yet: every session is still HS256 and still verified with `JWT_SECRET`.
+   Leave `JWT_ALGORITHM` alone — it only names the HMAC variant.
+2. **Render (backend):** set `JWT_PRIVATE_KEY` and `JWT_PUBLIC_KEY` (after
+   the fingerprint check above). Leave `JWT_ACCEPT_HS256`, `JWT_SECRET` and
+   `JWT_ALGORITHM` as they are. Deploy. New logins are RS256; sessions that
+   are already open (HS256) keep working on both sides.
+3. **Wait out the token lifetime** — `JWT_EXPIRES_MINUTES`, 8 hours by
+   default — so that every HS256 token has expired.
+4. **Render:** set `JWT_ACCEPT_HS256=false`. From here `JWT_SECRET` can
+   neither mint nor verify a backend session. (Setting this without a
+   `JWT_PRIVATE_KEY` is refused at startup: it would sign sessions and then
+   reject them.)
+5. **Vercel:** remove `JWT_SECRET`, redeploy. The frontend now holds nothing
+   that can sign a token. On Render `JWT_SECRET` must stay defined (the
+   config requires it) — leave its value in place rather than blanking it.
+
+Once step 2 is live and a fresh login works, delete `jwt_private.pem`,
+`jwt_public.pem` and `vercel_public.pem` from your machine: the private key
+should exist in Render and nowhere else.
+
+Rollback, any time before step 4: unset `JWT_PRIVATE_KEY` on Render. Signing
+goes back to HS256; keep `JWT_PUBLIC_KEY` there so RS256 sessions already
+issued stay valid until they expire. The frontend needs no change, because it
+still accepts both.
 
 ## Database migrations
 

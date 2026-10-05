@@ -76,10 +76,10 @@ def verify_password(plain: str, hashed: str) -> bool:
 def _shared_secret_algorithm() -> str:
     """Algorithm of the shared-secret path: JWT_ALGORITHM, as it always was.
 
-    JWT_ALGORITHM never selects RS256 — JWT_PRIVATE_KEY does. The frontend
-    needs JWT_ALGORITHM=RS256 on its side, so the same value may well get
-    mirrored onto the backend; anything that is not an HMAC algorithm is
-    read as HS256 rather than being handed JWT_SECRET as an RSA key.
+    JWT_ALGORITHM never selects RS256 — JWT_PRIVATE_KEY does. Setting it to
+    RS256 is still the obvious thing to try during the cutover, so anything
+    that is not an HMAC algorithm is read as HS256 rather than being handed
+    JWT_SECRET as an RSA key.
     """
     return settings.jwt_algorithm if settings.jwt_algorithm in _HMAC_ALGORITHMS else "HS256"
 

@@ -179,9 +179,9 @@ def test_public_key_is_derived_when_only_the_private_key_is_set(monkeypatch, key
 
 
 def test_backend_jwt_algorithm_set_to_rs256_does_not_break_the_legacy_path(monkeypatch, keypair):
-    """Vercel needs JWT_ALGORITHM=RS256; an operator may mirror it onto Render.
-    RS256 is chosen by JWT_PRIVATE_KEY alone, and the shared-secret path can
-    only ever be an HMAC algorithm."""
+    """Setting JWT_ALGORITHM=RS256 is the obvious thing to try during the
+    cutover. RS256 is chosen by JWT_PRIVATE_KEY alone, and the shared-secret
+    path can only ever be an HMAC algorithm."""
     legacy = create_access_token(subject="u-owner")
     monkeypatch.setattr(settings, "jwt_algorithm", "RS256")
     assert _alg(create_access_token(subject="u-owner")) == "HS256"   # no keys yet
