@@ -19,7 +19,9 @@ replayed entry.
 import argparse
 import asyncio
 import sys
+import traceback
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 
@@ -67,6 +69,10 @@ async def main(argv: list[str] | None = None, *, session_factory=async_session_f
             report = await gl_replay.run_replay(db, actor_user_id=actor.id, execute=args.execute)
         except gl_replay.ReplayError as exc:
             print(f"REPLAY FAILED — nothing was written.\n{exc}", file=sys.stderr)
+            cause = exc.__cause__
+            if cause is not None and not isinstance(cause, (HTTPException, gl_replay.ReplayError)):
+                # Not one of the replay's own refusals: keep the trace for whoever debugs it.
+                traceback.print_exception(cause, file=sys.stderr)
             return 1
         except Exception:
             # run_replay has already rolled back; say so before the traceback.

@@ -113,6 +113,21 @@ class _Step:
     post: Callable[[], Awaitable[GLJournalEntry | None]]
     after: Callable[[GLJournalEntry, list[GLJournalLine]], Awaitable[None]] | None = None
 
+    @property
+    def booked_on(self) -> date:
+        """The entry date the mapper will use: the document timestamp's own date."""
+        return self.when.date()
+
+    def failure(self, exc: Exception) -> "ReplayError":
+        """Any error from this step, restated with the document it came from."""
+        if isinstance(exc, HTTPException):   # the mappers speak HTTP (422 CLOSED period, …)
+            reason = str(exc.detail)
+        elif isinstance(exc, ReplayError):
+            reason = str(exc)
+        else:
+            reason = f"{type(exc).__name__}: {exc}"
+        return ReplayError(f"{self.ref} ({self.booked_on}): {reason}")
+
 
 def _utc(dt: datetime) -> datetime:
     """Comparable timestamp. Postgres hands back tz-aware UTC, the SQLite test
@@ -178,9 +193,9 @@ def _sale_step(db: AsyncSession, order: Order, sold, actor_user_id: str) -> _Ste
             computed = sum((ln.base_debit for ln in lines if ln.account_id == cogs_id), ZERO)
             if computed != stored:
                 raise ReplayError(
-                    f"order {order.order_number}: the metal cost stored on the order is "
-                    f"{stored} but the posting mapper computes {computed}. Refusing to post "
-                    f"a COGS that differs from what the sale recorded."
+                    f"the metal cost stored on the order is {stored} but the posting mapper "
+                    f"computes {computed}. Refusing to post a COGS that differs from what "
+                    f"the sale recorded."
                 )
         # Credit sale: the live path stores the sale's entry on the AR invoice.
         if order.payment_method == PaymentMethod.CREDIT:
@@ -512,10 +527,9 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
             )).scalars().all())
             if step.after is not None:
                 await step.after(entry, lines)
-        except HTTPException as exc:
-            # The mappers speak HTTP (422 for a CLOSED period, an unseeded
-            # account…). Tell the operator which document hit it.
-            raise ReplayError(f"{step.ref} ({_utc(step.when).date()}): {exc.detail}") from exc
+        except Exception as exc:
+            # Whatever went wrong, the operator needs to know on WHICH document.
+            raise step.failure(exc) from exc
         summary.posted += 1
         summary.base_total += sum((ln.base_debit for ln in lines), ZERO)
         for ln in lines:

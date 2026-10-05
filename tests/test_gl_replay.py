@@ -470,9 +470,43 @@ async def test_an_unexpected_error_on_the_last_document_also_rolls_everything_ba
         return await real(db_, order, *args, **kwargs)
 
     monkeypatch.setattr(gl_postings, "post_order_refund", fail_on_s4)
-    with pytest.raises(RuntimeError, match="database went away"):
+    with pytest.raises(gl_replay.ReplayError) as exc:
         await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
 
+    # Not a bare RuntimeError: the operator is told which document it was.
+    message = str(exc.value)
+    assert "order S4" in message and "2026-06-01" in message
+    assert "RuntimeError" in message and "database went away" in message
+    assert isinstance(exc.value.__cause__, RuntimeError)
+    assert await _books(db) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mapper, document", [
+    ("post_sale", "order S1 (2026-03-10)"),
+    ("post_supplier_purchase", "supplier purchase pur1 (2026-03-05)"),
+    ("post_supplier_payment", "supplier payment pay-cash (2026-04-08)"),
+    ("post_buyback", "buyback bb1 (2026-03-20)"),
+    ("post_melt", "melt lot lot-melt (2026-05-10)"),
+    ("post_adjustment", "adjustment adj1 (2026-05-20)"),
+])
+async def test_any_error_from_any_step_names_its_document(db, monkeypatch, mapper, document):
+    """Whatever a step raises — a mapper bug, a driver error, anything that is
+    not the mappers' own HTTPException — comes back naming the document and
+    its date, so the operator knows what to look at."""
+    await _base(db)
+    await _history(db)
+    before = await _books(db)
+
+    async def broken(*args, **kwargs):
+        raise KeyError("karat")
+
+    monkeypatch.setattr(gl_postings, mapper, broken)
+    with pytest.raises(gl_replay.ReplayError) as exc:
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert str(exc.value).startswith(document), str(exc.value)
+    assert "KeyError" in str(exc.value)
     assert await _books(db) == before
 
 
@@ -948,6 +982,27 @@ async def test_cli_reports_a_failed_replay_and_exits_non_zero(db, capsys):
     err = capsys.readouterr().err
     assert code == 1
     assert "nothing was written" in err.lower() and "CLOSED" in err
+    assert (await _books(db))["entries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cli_names_the_document_and_keeps_the_trace_on_an_unexpected_error(db, capsys, monkeypatch):
+    from scripts import replay_gl_history as cli
+    await _base(db)
+    await _history(db)
+
+    async def broken(*args, **kwargs):
+        raise KeyError("karat")
+
+    monkeypatch.setattr(gl_postings, "post_buyback", broken)
+    code = await cli.main(["--actor-email", "owner@x.com", "--execute"],
+                          session_factory=_session_factory(db))
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "nothing was written" in err.lower()
+    assert "buyback bb1 (2026-03-20): KeyError" in err
+    assert "Traceback" in err and "broken" in err      # the engineer still gets the stack
     assert (await _books(db))["entries"] == 0
 
 
