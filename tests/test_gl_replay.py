@@ -1079,6 +1079,30 @@ async def test_replay_refuses_to_post_into_a_closed_fiscal_year(db, execute):
 
 
 @pytest.mark.asyncio
+async def test_replay_refuses_a_document_that_would_only_open_a_month_in_a_closed_year(db):
+    """A purchase settled in full on the day posts no entry — but its mapper
+    still calls ensure_period first. Dated in a month of the closed year that
+    has no period row, it would leave a brand-new OPEN April 2026 behind with
+    nothing in it. That alone is enough to refuse it."""
+    await _base(db)
+    await _close_year_2026(db)
+    db.add(Supplier(id="sup1", name="ACME"))
+    db.add(SupplierPurchase(
+        id="pur-april", supplier_id="sup1", payment_mode=SupplierPurchaseMode.GOLD,
+        total_cash_due=D("0"), total_grams_due_by_karat={"K21": "50.000"},
+        cash_paid_at_creation=D("0"), grams_paid_at_creation_by_karat={"K21": "50.000"},
+        created_by_user_id=ADMIN, occurred_at=_at(4, 5)))
+    await db.commit()
+    before = await _books(db)
+
+    with pytest.raises(gl_replay.ReplayError, match=r"supplier purchase pur-april \(2026-04-05\)"):
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert await _books(db) == before
+    assert (2026, 4, "OPEN") not in before["periods"]
+
+
+@pytest.mark.asyncio
 async def test_documents_that_post_nothing_do_not_block_the_replay_after_a_year_close(db):
     """A melt that changed nothing and a purchase settled in full on the day
     never get a GL entry, so they look "not yet posted" forever. They must not

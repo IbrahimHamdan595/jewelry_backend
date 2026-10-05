@@ -527,12 +527,13 @@ async def _melt_as_recorded(db: AsyncSession, lot: GoldLot,
             from_karat = source.karat
         if grams_changed:
             from_grams = source.weight_grams
-        what = " and ".join(w for w, changed in (("karat", karat_changed), ("weight", grams_changed)) if changed)
         if ev is None:
             notice = ("no MELT ledger event was recorded; the melt is rebuilt from the lot and "
                       f"the CURRENT {lot.source_ref_type} row.")
         elif model is Product:
-            notice = (f"the pre-melt {what} is read from product {source.code}'s CURRENT record "
+            what = ("karat and weight are" if karat_changed and grams_changed
+                    else "karat is" if karat_changed else "weight is")
+            notice = (f"the pre-melt {what} read from product {source.code}'s CURRENT record "
                       "— the melt event stores only the result.")
 
     return SimpleNamespace(
