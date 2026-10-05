@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth_audit import get_client_ip
 from app.core.ledger import EVENT_STAFF_CREATED, EVENT_STAFF_UPDATED, field_diff, record
+from app.core.login_lockout import record_unlock
 from app.core.permissions import require_admin
 from app.core.security import hash_password
 from app.deps import get_db
@@ -145,4 +147,40 @@ async def delete_staff(
             ref_id=user.id,
             payload={"diff": {"is_active": {"from": True, "to": False}}},
         )
+    await db.commit()
+
+
+@router.post("/{user_id}/unlock", status_code=204)
+async def unlock_staff(
+    user_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    """Lift a login lockout now instead of waiting it out (NEX-47).
+
+    Ten wrong passwords lock an email for fifteen minutes, and anyone who
+    knows the address can send them — so the lockout is also a way to keep a
+    cashier out of the till. This releases the account at once and clears
+    its failure count. It is not an exemption: ten more failures lock it
+    again. Harmless (still 204) when the account is not locked.
+
+    Unlike the rest of this router this is not limited to cashiers: the
+    owner's and the accountant's emails can be locked the same way.
+
+    AUDIT: ACCOUNT_UNLOCKED in the auth audit log, naming the admin. That
+    row is what releases the lock (see `app/core/login_lockout.py`), so it
+    is written in this request's transaction, not best-effort.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    await record_unlock(
+        db,
+        user=user,
+        actor=actor,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
     await db.commit()

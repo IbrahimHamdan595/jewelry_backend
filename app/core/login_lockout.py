@@ -11,14 +11,34 @@ There is no counter column and no lockout table. `auth_audit_log` already
 holds one LOGIN_FAILED row per wrong password, with the email that was
 claimed, so both questions are answered from it:
 
-  • locked?   an ACCOUNT_LOCKED row for this email newer than LOCKOUT_DURATION
+  • locked?   an ACCOUNT_LOCKED row for this email newer than LOCKOUT_DURATION,
+              with no ACCOUNT_UNLOCKED row after it
   • how many? LOGIN_FAILED rows for this email inside LOCKOUT_WINDOW that are
-              newer than its last LOGIN_SUCCESS / ACCOUNT_LOCKED row
+              newer than its last LOGIN_SUCCESS / ACCOUNT_LOCKED /
+              ACCOUNT_UNLOCKED row
 
 A successful login therefore resets the count, and so does the lock itself:
 when it expires the email starts again from zero. Requests refused while the
 lock holds write nothing, so hammering a locked account cannot extend the
 lock — it always ends LOCKOUT_DURATION after the attempt that triggered it.
+
+THE TRADE-OFF, AND THE ADMIN UNLOCK
+-----------------------------------
+A lock keyed on the email is also a way to lock someone ELSE out: ten
+requests against a known address and its owner cannot sign in for fifteen
+minutes, and whoever sent them can do it again the moment it expires. That
+is the price of refusing a distributed guess, and it is deliberate — the
+alternative is an attacker with as many attempts as they have addresses.
+
+What keeps it from being a lasting outage is `record_unlock`, behind the
+admin-only `POST /staff/{id}/unlock`: it appends an ACCOUNT_UNLOCKED row,
+which ends the lock at once and starts the count from zero. Like the lock,
+it is a row in the log rather than a flag somewhere, so releasing an account
+is itself audited. Two things it does not do: it is not an exemption (ten
+more failures lock the account again), and it needs an admin who is already
+signed in — a lock only refuses NEW logins, so a signed-in owner can still
+release anyone, themselves included, but an owner who is locked out with no
+session anywhere has to wait the fifteen minutes.
 
 NO ACCOUNT-EXISTENCE ORACLE
 ---------------------------
@@ -55,11 +75,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_audit import (
     EVENT_ACCOUNT_LOCKED,
+    EVENT_ACCOUNT_UNLOCKED,
     EVENT_LOGIN_FAILED,
     EVENT_LOGIN_SUCCESS,
     append_auth_event,
 )
-from app.models import AuthAuditLog
+from app.models import AuthAuditLog, User
 
 log = logging.getLogger(__name__)
 
@@ -87,14 +108,27 @@ def _claimed(email: str):
 
 
 async def is_locked(db: AsyncSession, email: str) -> bool:
-    """True while a lockout triggered in the last LOCKOUT_DURATION holds."""
+    """True while a lockout triggered in the last LOCKOUT_DURATION holds —
+    that is, unless an admin has unlocked the email since."""
+    cutoff = _now() - LOCKOUT_DURATION
+    last_unlock = (
+        select(func.max(AuthAuditLog.occurred_at))
+        .where(
+            _claimed(email),
+            AuthAuditLog.event_type == EVENT_ACCOUNT_UNLOCKED,
+            AuthAuditLog.occurred_at > cutoff,
+        )
+        .scalar_subquery()
+    )
     row = (
         await db.execute(
             select(AuthAuditLog.id)
             .where(
                 _claimed(email),
                 AuthAuditLog.event_type == EVENT_ACCOUNT_LOCKED,
-                AuthAuditLog.occurred_at > _now() - LOCKOUT_DURATION,
+                AuthAuditLog.occurred_at > cutoff,
+                # Only an unlock issued AFTER the lock releases it.
+                or_(last_unlock.is_(None), AuthAuditLog.occurred_at > last_unlock),
             )
             .limit(1)
         )
@@ -103,13 +137,15 @@ async def is_locked(db: AsyncSession, email: str) -> bool:
 
 
 async def _consecutive_failures(db: AsyncSession, email: str) -> int:
-    """Failed logins in the window since the email's last success or lock."""
+    """Failed logins in the window since the email's last success, lock or unlock."""
     window_start = _now() - LOCKOUT_WINDOW
     last_reset = (
         select(func.max(AuthAuditLog.occurred_at))
         .where(
             _claimed(email),
-            AuthAuditLog.event_type.in_((EVENT_LOGIN_SUCCESS, EVENT_ACCOUNT_LOCKED)),
+            AuthAuditLog.event_type.in_(
+                (EVENT_LOGIN_SUCCESS, EVENT_ACCOUNT_LOCKED, EVENT_ACCOUNT_UNLOCKED)
+            ),
             AuthAuditLog.occurred_at > window_start,
         )
         .scalar_subquery()
@@ -173,3 +209,30 @@ async def record_failed_login(
             await db.rollback()
         except Exception:
             log.exception("rollback after failed-login audit write failed")
+
+
+async def record_unlock(
+    db: AsyncSession,
+    *,
+    user: User,
+    actor: User,
+    client_ip: str | None,
+    user_agent: str | None,
+) -> None:
+    """Release `user`'s email from a lockout and clear its failure count.
+
+    Appends the ACCOUNT_UNLOCKED row that `is_locked` and the failure count
+    treat as a reset. Does NOT commit and does NOT swallow errors: unlike the
+    other auth-audit writes this row IS the action, so if it cannot be
+    written the caller must fail rather than report an unlock that did not
+    happen. Harmless on an email that is not locked.
+    """
+    await append_auth_event(
+        db,
+        event_type=EVENT_ACCOUNT_UNLOCKED,
+        user_id=user.id,
+        claimed_email=user.email,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        detail=f"unlocked by admin {actor.id}",
+    )

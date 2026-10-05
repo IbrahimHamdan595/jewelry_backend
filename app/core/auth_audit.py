@@ -71,8 +71,10 @@ EVENT_LOGIN_SUCCESS = "LOGIN_SUCCESS"
 EVENT_LOGIN_FAILED = "LOGIN_FAILED"
 EVENT_LOGOUT = "LOGOUT"
 EVENT_PASSWORD_CHANGED = "PASSWORD_CHANGED"
-# NEX-47: the failed login that tipped an email over the lockout threshold.
+# NEX-47: the failed login that tipped an email over the lockout threshold,
+# and an admin lifting that lock before it runs out.
 EVENT_ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
+EVENT_ACCOUNT_UNLOCKED = "ACCOUNT_UNLOCKED"
 
 
 def get_client_ip(request: Request) -> str | None:

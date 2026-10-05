@@ -18,9 +18,10 @@ from starlette.requests import Request
 
 from app.core import login_lockout
 from app.core.audit_chain import verify_auth_chain
-from app.core.auth_audit import EVENT_ACCOUNT_LOCKED, EVENT_LOGIN_FAILED
+from app.core.auth_audit import EVENT_ACCOUNT_LOCKED, EVENT_ACCOUNT_UNLOCKED, EVENT_LOGIN_FAILED
 from app.core.rate_limit import client_ip_key, limiter
 from app.models import AuthAuditChainHead, AuthAuditLog
+from tests.conftest import ACCOUNTANT_EMAIL as ACCOUNTANT
 from tests.conftest import AUTH_PASSWORD as PASSWORD
 from tests.conftest import CASHIER_EMAIL as CASHIER
 from tests.conftest import OWNER_EMAIL as OWNER
@@ -129,6 +130,25 @@ async def _seed_event(db, event_type: str, email: str, *, minutes_ago: float) ->
         retention_until_at=at + timedelta(days=540), prev_hash="seed", entry_hash=uuid4().hex,
     ))
     await db.commit()
+
+
+async def _chain(db) -> tuple[str, int, bool]:
+    """(status, rows, head matches) of the auth-audit chain as it now stands."""
+    rows = (await db.execute(select(AuthAuditLog).order_by(AuthAuditLog.occurred_at, AuthAuditLog.id))).scalars().all()
+    result = verify_auth_chain([
+        {
+            "id": r.id, "prev_hash": r.prev_hash, "entry_hash": r.entry_hash,
+            "event_type": r.event_type, "occurred_at": r.occurred_at, "user_id": r.user_id,
+            "claimed_email": r.claimed_email, "client_ip": r.client_ip,
+            "user_agent": r.user_agent, "detail": r.detail,
+        }
+        for r in rows
+    ])
+    assert result["first_break"] is None, result
+    head = (await db.execute(select(AuthAuditChainHead))).scalar_one()
+    await db.refresh(head)
+    head_matches = (head.row_count, head.latest_entry_hash) == (len(rows), rows[-1].entry_hash)
+    return result["status"], result["total_rows"], head_matches
 
 
 def _advance_clock(monkeypatch, *, minutes: float) -> None:
@@ -279,18 +299,133 @@ async def test_auth_chain_stays_intact_across_inline_and_background_writes(clien
     await _fail(client, CASHIER, 10)
     assert (await _login(client, CASHIER, PASSWORD, ip="203.0.113.78")).status_code == 429
 
-    rows = (await db.execute(select(AuthAuditLog).order_by(AuthAuditLog.occurred_at, AuthAuditLog.id))).scalars().all()
-    result = verify_auth_chain([
-        {
-            "id": r.id, "prev_hash": r.prev_hash, "entry_hash": r.entry_hash,
-            "event_type": r.event_type, "occurred_at": r.occurred_at, "user_id": r.user_id,
-            "claimed_email": r.claimed_email, "client_ip": r.client_ip,
-            "user_agent": r.user_agent, "detail": r.detail,
-        }
-        for r in rows
-    ])
-    assert result == {"status": "intact", "total_rows": 15, "first_break": None}
+    assert await _chain(db) == ("intact", 15, True)
 
-    head = (await db.execute(select(AuthAuditChainHead))).scalar_one()
-    await db.refresh(head)
-    assert (head.row_count, head.latest_entry_hash) == (15, rows[-1].entry_hash)
+
+# ── Admin unlock ──────────────────────────────────────────────────────────────
+#
+# The lockout is also a way to lock someone ELSE out: ten requests against a
+# known email and its owner cannot sign in for fifteen minutes, repeatably.
+# An admin can release an account at once.
+
+async def _signed_in(device, email: str):
+    """A device with a live session for `email`."""
+    client = device()
+    assert (await _login(client, email, PASSWORD, ip="203.0.113.200")).status_code == 200
+    return client
+
+
+@pytest.mark.asyncio
+async def test_admin_unlock_releases_the_lock_at_once(device, db):
+    admin, till = await _signed_in(device, OWNER), device()
+    await _fail(till, CASHIER, 10)
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 429
+
+    resp = await admin.post("/api/staff/u-cashier/unlock")
+    assert resp.status_code == 204
+
+    # No waiting out the fifteen minutes: the very next attempt gets in.
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 200
+
+    unlocked = await _events(db, EVENT_ACCOUNT_UNLOCKED)
+    assert [(r.user_id, r.claimed_email, r.detail) for r in unlocked] == [
+        ("u-cashier", CASHIER, "unlocked by admin u-owner"),
+    ]
+    assert (await _chain(db))[0::2] == ("intact", True)   # the unlock row is chained like the rest
+
+
+@pytest.mark.asyncio
+async def test_unlock_resets_the_count_but_is_not_an_exemption(device):
+    admin, till = await _signed_in(device, OWNER), device()
+    await _fail(till, CASHIER, 10)
+    assert (await admin.post("/api/staff/u-cashier/unlock")).status_code == 204
+
+    # A fresh budget: nine more wrong passwords are still short of a lock …
+    await _fail(till, CASHIER, 9, subnet="192.0.2")
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 200
+
+    # … and the account can be locked again like any other.
+    await _fail(till, CASHIER, 10, subnet="100.64.0")
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_a_non_admin_cannot_unlock(device, db):
+    cashier = await _signed_in(device, CASHIER)
+    accountant = await _signed_in(device, ACCOUNTANT)
+    till = device()
+    await _fail(till, OWNER, 10)
+
+    assert (await cashier.post("/api/staff/u-owner/unlock")).status_code == 403
+    assert (await accountant.post("/api/staff/u-owner/unlock")).status_code == 403
+    assert (await device().post("/api/staff/u-owner/unlock")).status_code == 401
+
+    assert await _events(db, EVENT_ACCOUNT_UNLOCKED) == []
+    assert (await _login(till, OWNER, PASSWORD, ip="203.0.113.77")).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_unlocking_an_account_that_is_not_locked_is_harmless(device, db):
+    admin, till = await _signed_in(device, OWNER), device()
+
+    # Nothing to release: still a 204, and the account works as before.
+    assert (await admin.post("/api/staff/u-cashier/unlock")).status_code == 204
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 200
+
+    # It does not switch the lockout off either.
+    await _fail(till, CASHIER, 10)
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 429
+    assert len(await _events(db, EVENT_ACCOUNT_LOCKED, CASHIER)) == 1
+
+
+@pytest.mark.asyncio
+async def test_unlock_before_the_threshold_clears_the_failures_so_far(device):
+    """Nine wrong passwords, a phone call to the owner, an unlock: the cashier
+    must not be one typo away from a lock."""
+    admin, till = await _signed_in(device, OWNER), device()
+    await _fail(till, CASHIER, 9)
+    assert (await admin.post("/api/staff/u-cashier/unlock")).status_code == 204
+
+    await _fail(till, CASHIER, 9, subnet="192.0.2")
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_unlock_releases_only_that_account(device):
+    admin, till = await _signed_in(device, OWNER), device()
+    await _fail(till, CASHIER, 10)
+    await _fail(till, ACCOUNTANT, 10, subnet="192.0.2")
+
+    assert (await admin.post("/api/staff/u-cashier/unlock")).status_code == 204
+
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 200
+    assert (await _login(till, ACCOUNTANT, PASSWORD, ip="203.0.113.78")).status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_a_signed_in_admin_can_release_their_own_account(device):
+    """The owner's email is the obvious target. A lock only refuses NEW
+    logins, so an owner who is already signed in can still lift it."""
+    admin, phone = await _signed_in(device, OWNER), device()
+    await _fail(phone, OWNER, 10)
+    assert (await _login(phone, OWNER, PASSWORD, ip="203.0.113.77")).status_code == 429
+
+    assert (await admin.post("/api/staff/u-owner/unlock")).status_code == 204
+    assert (await _login(phone, OWNER, PASSWORD, ip="203.0.113.77")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_unlock_of_an_unknown_user_is_404(device, db):
+    admin = await _signed_in(device, OWNER)
+    assert (await admin.post("/api/staff/no-such-user/unlock")).status_code == 404
+    assert await _events(db, EVENT_ACCOUNT_UNLOCKED) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unlock_older_than_the_lock_does_not_release_it(device, db):
+    """Only an unlock issued AFTER the lock counts — yesterday's must not
+    make an account unlockable for good."""
+    till = device()
+    await _seed_event(db, EVENT_ACCOUNT_UNLOCKED, CASHIER, minutes_ago=5)
+    await _fail(till, CASHIER, 10)
+    assert (await _login(till, CASHIER, PASSWORD, ip="203.0.113.77")).status_code == 429

@@ -37,7 +37,11 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
   login; bcrypt for password hashing. Login is throttled twice: SlowAPI
   rate-limit (5/min per client IP, taken from `X-Forwarded-For`) and a
   per-account lockout (10 consecutive failures in 15 min lock that email
-  for 15 min, derived from the auth audit log).
+  for 15 min, derived from the auth audit log). The lockout cuts both ways:
+  it stops a guess spread over many addresses, and it lets anyone who knows
+  an email keep its owner out for 15 minutes at a time. An admin lifts a
+  lock at once with `POST /api/staff/{id}/unlock` (audited as
+  `ACCOUNT_UNLOCKED`).
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
@@ -240,7 +244,7 @@ jewelry_backend/
 │   │   ├── products.py
 │   │   ├── reports.py          # dashboard aggregates
 │   │   ├── settings.py
-│   │   ├── staff.py            # cashier user management (audited)
+│   │   ├── staff.py            # cashier user management (audited) + lockout unlock
 │   │   ├── stock_takes.py      # physical-count workflow (audit B2)
 │   │   ├── suppliers.py        # suppliers + purchases + payments
 │   │   └── zakat.py            # live computation + snapshots
