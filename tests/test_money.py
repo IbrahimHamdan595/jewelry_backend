@@ -5,7 +5,7 @@ from decimal import Decimal as D
 import pytest
 from pydantic import BaseModel
 
-from app.core.money import Money, money
+from app.core.money import Money, money, round_money
 
 
 def test_money_is_an_exact_two_decimal_string():
@@ -20,22 +20,64 @@ def test_money_is_an_exact_two_decimal_string():
     assert json.dumps(float(D("1234567890123456.78"))) == "1234567890123456.8"
 
 
-def test_money_quantizes_like_the_rest_of_the_codebase():
-    # Decimal.quantize default (half-even), the same call as gl._q_money.
-    assert money(D("411.6200000000000000000000000")) == "411.62"
-    assert money(D("2.345")) == "2.34"
-    assert money(D("2.355")) == "2.36"
+# Half-cent ties, with the answer the pricing engine and Postgres NUMERIC give.
+_TIES = [("2.345", "2.35"), ("2.355", "2.36"), ("63.225", "63.23"), ("70.105", "70.11"),
+         ("0.005", "0.01"), ("126.465", "126.47"), ("-2.345", "-2.35"), ("-0.005", "-0.01"),
+         ("1.0049999", "1.00"), ("1.0050001", "1.01")]
+
+
+@pytest.mark.parametrize("amount, expected", _TIES)
+def test_money_rounds_half_up_like_pricing_and_postgres(amount, expected):
+    """One rounding rule for every endpoint: the same amount cannot be a cent
+    apart depending on which code path rendered it."""
+    from app.core.pricing import _round
+
+    assert money(D(amount)) == expected
+    assert round_money(D(amount)) == D(expected)
+    assert money(D(amount)) == str(_round(D(amount)))       # pricing._round is ROUND_HALF_UP
+
+
+def test_money_matches_the_price_the_pricing_engine_quotes():
+    # 84.30/g at 18K: 63.225. Half-even said 63.22 while the lookup said 63.23.
+    from app.core.pricing import KARAT_PURITY, calculate_price
+    from app.models import Karat
+
+    priced = calculate_price(rate_24k=D("84.30"), karat=Karat.K18, weight_grams=D("1"),
+                             margin_percent=D("0"), making_charge=D("0"))
+    assert money(D("84.30") * KARAT_PURITY[Karat.K18]) == str(priced["purity_rate"]) == "63.23"
 
 
 def test_money_follows_the_column_scale_when_told():
-    assert money(D("2"), D("0.0001")) == "2.0000"           # e.g. markup_per_gram NUMERIC(10,4)
-    assert money(D("89500"), D("0.000001")) == "89500.000000"
+    assert money(D("2"), quantum=D("0.0001")) == "2.0000"   # e.g. markup_per_gram NUMERIC(10,4)
+    assert money(D("89500"), quantum=D("0.000001")) == "89500.000000"
+    assert money(D("0.00005"), quantum=D("0.0001")) == "0.0001"
+
+
+def test_quantum_is_keyword_only_and_the_field_serializer_takes_one_argument():
+    """pydantic decides whether to hand a serializer its SerializationInfo by
+    counting positional parameters, and the count rule differs across 2.x. A
+    second positional parameter on the function it calls could receive that
+    object as the quantum; make it impossible."""
+    import inspect
+    import typing
+
+    from pydantic import PlainSerializer
+
+    assert inspect.signature(money).parameters["quantum"].kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        money(D("1"), D("0.0001"))
+
+    (serializer,) = [m for m in typing.get_args(Money)[1:] if isinstance(m, PlainSerializer)]
+    params = list(inspect.signature(serializer.func).parameters.values())
+    assert len(params) == 1 and serializer.func is not money
+    assert serializer.func(D("5")) == "5.00"
 
 
 def test_money_never_emits_exponents_or_negative_zero():
     assert money(D("1E+3")) == "1000.00"
     assert money(D("0E-7")) == "0.00"
     assert money(D("-0.001")) == "0.00"
+    assert money(D("-0.004")) == "0.00"
 
 
 def test_money_refuses_floats():
