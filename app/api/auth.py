@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -102,8 +104,12 @@ async def login(
     # ran for an unknown email: ~1 ms against a few hundred for a real one —
     # a stopwatch was enough to tell which emails have accounts. The dummy is
     # a real hash of the same cost, so both paths do one bcrypt verification.
-    password_ok = verify_password(
-        body.password, user.password_hash if user else DUMMY_PASSWORD_HASH
+    #
+    # In a worker thread: bcrypt is a few hundred milliseconds of CPU, and on
+    # the event loop that is a few hundred milliseconds in which no other
+    # request is served. A burst of logins must not stall the tills.
+    password_ok = await asyncio.to_thread(
+        verify_password, body.password, user.password_hash if user else DUMMY_PASSWORD_HASH
     )
     if not user or not password_ok:
         await record_failed_login(db, claimed_email=body.email, client_ip=client_ip, user_agent=ua)
@@ -181,9 +187,10 @@ async def change_password(
     issued in the same response (cookie + body, the login shape) and the
     person who changed their own password stays signed in on this device.
     """
-    if not verify_password(body.current_password, user.password_hash):
+    # bcrypt off the event loop, as in login.
+    if not await asyncio.to_thread(verify_password, body.current_password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
-    user.password_hash = hash_password(body.new_password)
+    user.password_hash = await asyncio.to_thread(hash_password, body.new_password)
     await revoke_sessions(db, user)
     await db.commit()
 

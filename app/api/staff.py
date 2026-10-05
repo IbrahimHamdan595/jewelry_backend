@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +47,8 @@ async def create_staff(
     user = User(
         email=body.email,
         name=body.name,
-        password_hash=hash_password(body.password),
+        # bcrypt in a worker thread, so hashing never holds the event loop.
+        password_hash=await asyncio.to_thread(hash_password, body.password),
         role=Role.CASHIER,
     )
     db.add(user)
@@ -87,8 +90,11 @@ async def update_staff(
 
     # Hash first: a password that cannot be stored is refused (422, see
     # hash_password) before anything on the user has been touched, so the
-    # rest of the request cannot be half-applied.
-    new_password_hash = hash_password(body.password) if body.password is not None else None
+    # rest of the request cannot be half-applied. In a worker thread, so
+    # bcrypt never holds the event loop.
+    new_password_hash = (
+        await asyncio.to_thread(hash_password, body.password) if body.password is not None else None
+    )
 
     # Snapshot the auditable fields before mutation. password_hash is
     # tracked but masked in the payload.

@@ -44,7 +44,9 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
   lock at once with `POST /api/staff/{id}/unlock` (audited as
   `ACCOUNT_UNLOCKED`). An unknown email costs the same single bcrypt
   verification as a real one (against a fixed dummy hash), so neither the
-  response nor its timing says which accounts exist.
+  response nor its timing says which accounts exist. bcrypt runs in a
+  worker thread, never on the event loop, so a burst of logins cannot stall
+  other requests. New passwords over bcrypt's 72 bytes are refused (422).
 - **Sessions can be ended server-side.** Every token carries the user's
   `token_version` and `get_current_user` re-checks it on each request.
   Changing a password (own, or an admin reset), deactivating a user and
