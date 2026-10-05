@@ -243,15 +243,15 @@ async def payables_aging(db: AsyncSession, *, as_of: date) -> dict:
 
 
 async def cash_bank_balance(db: AsyncSession) -> Decimal:
-    """USD-base balance across active bank accounts (GL-derived → 0 while dormant)."""
+    """USD-base balance across active bank accounts (GL-derived → 0 while dormant).
+    Summed in SQL: one round-trip, and the ledger lines stay in the database."""
     from app.models import BankAccount, GLJournalLine
-    accts = (await db.execute(select(BankAccount).where(BankAccount.is_active.is_(True)))).scalars().all()
-    total = ZERO
-    for ba in accts:
-        rows = (await db.execute(
-            select(GLJournalLine).where(GLJournalLine.account_id == ba.gl_account_id))).scalars().all()
-        total += sum((l.base_debit - l.base_credit for l in rows), ZERO)
-    return total.quantize(_Q_MONEY)
+    total = (await db.execute(
+        select(func.coalesce(func.sum(GLJournalLine.base_debit - GLJournalLine.base_credit), 0))
+        .join(BankAccount, BankAccount.gl_account_id == GLJournalLine.account_id)
+        .where(BankAccount.is_active.is_(True))
+    )).scalar_one()
+    return Decimal(total).quantize(_Q_MONEY)
 
 
 async def vat_position(db: AsyncSession, today: date) -> dict:
