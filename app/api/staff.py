@@ -85,6 +85,11 @@ async def update_staff(
     if not user:
         raise HTTPException(status_code=404, detail="Staff not found")
 
+    # Hash first: a password that cannot be stored is refused (422, see
+    # hash_password) before anything on the user has been touched, so the
+    # rest of the request cannot be half-applied.
+    new_password_hash = hash_password(body.password) if body.password is not None else None
+
     # Snapshot the auditable fields before mutation. password_hash is
     # tracked but masked in the payload.
     before = {
@@ -95,8 +100,8 @@ async def update_staff(
 
     if body.name is not None:
         user.name = body.name
-    if body.password is not None:
-        user.password_hash = hash_password(body.password)
+    if new_password_hash is not None:
+        user.password_hash = new_password_hash
         # NEX-54: a reset is a password change — whoever was signed in with
         # the old password is signed out.
         await revoke_sessions(db, user)

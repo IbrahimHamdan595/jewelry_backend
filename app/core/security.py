@@ -37,7 +37,30 @@ _HMAC_ALGORITHMS = ("HS256", "HS384", "HS512")
 DUMMY_PASSWORD_HASH = "$2b$12$F0XlrDdoK9SQYcDP6E319uxuH16F3iYnuCoaHIQjrMk/W1FVQsLE."
 
 
+# All bcrypt ever reads of a password.
+MAX_PASSWORD_BYTES = 72
+
+
+class PasswordTooLongError(ValueError):
+    """A NEW password that bcrypt could not store in full.
+
+    Raised by hash_password, the one place a password is ever set, so every
+    route that sets one — and the seed script — refuses it the same way.
+    app/main.py turns it into a 422 carrying this message.
+    """
+
+
 def hash_password(password: str) -> str:
+    # Refused, not truncated: a password quietly cut to 72 bytes is one whose
+    # tail protects nothing, and its owner would never find out. (bcrypt 5
+    # raises here too, but as a bare ValueError — a 500 on every route.)
+    # Bytes, not characters: 37 accented letters are already 74 bytes.
+    size = len(password.encode())
+    if size > MAX_PASSWORD_BYTES:
+        raise PasswordTooLongError(
+            f"Password is too long: it is {size} bytes and the limit is {MAX_PASSWORD_BYTES} bytes "
+            "(accented and non-Latin characters count as more than one)."
+        )
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
 
