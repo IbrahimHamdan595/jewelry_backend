@@ -23,24 +23,18 @@ import hmac
 import json
 import time
 
-import bcrypt
 import pytest
-import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from jose import JWTError, jwt
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings, settings
 from app.core import security
-from app.core.rate_limit import limiter
 from app.core.security import create_access_token, decode_token
 from app.deps import AUTH_COOKIE_NAME
-from app.models import Role, User
-
-PASSWORD = "correct-horse-battery"
-OWNER = "owner@example.com"
+from tests.conftest import AUTH_PASSWORD as PASSWORD
+from tests.conftest import OWNER_EMAIL as OWNER
 
 
 def _generate_keypair() -> tuple[str, str]:
@@ -303,27 +297,9 @@ def test_startup_check_refuses_a_public_key_in_the_private_slot(monkeypatch, key
 
 # ── End to end through the API ────────────────────────────────────────────────
 
-@pytest_asyncio.fixture
-async def client(db, monkeypatch):
-    from app.deps import get_db
-    from app.main import app
-
-    hashed = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
-    db.add(User(id="u-owner", email=OWNER, name="Owner", password_hash=hashed, role=Role.ADMIN, is_active=True))
-    await db.commit()
-
-    async def _get_db():
-        yield db
-
-    monkeypatch.setattr(
-        "app.core.auth_audit.async_session_factory",
-        async_sessionmaker(db.bind, expire_on_commit=False, class_=AsyncSession),
-    )
-    limiter.reset()
-    app.dependency_overrides[get_db] = _get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c
-    app.dependency_overrides.clear()
+@pytest.fixture
+def client(device):
+    return device()
 
 
 async def _me(client: AsyncClient, token: str) -> int:

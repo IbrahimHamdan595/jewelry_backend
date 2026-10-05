@@ -9,89 +9,29 @@ These tests go through the real routes with the real `get_current_user` —
 only the database is swapped — because the thing under test is the check in
 app/deps.py and the three places that bump the version.
 
-A "device" is an HTTP client with its own cookie jar: the shop till, a phone.
+A "device" is an HTTP client with its own cookie jar: the shop till, a phone
+(the `device` fixture in tests/conftest.py).
 """
-import asyncio
-
-import bcrypt
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.rate_limit import limiter
 from app.core.security import create_access_token, decode_token
 from app.deps import AUTH_COOKIE_NAME
-from app.models import AuthAuditLog, InventoryLedger, Role, User
+from app.models import AuthAuditLog, InventoryLedger, User
+from tests.conftest import ACCOUNTANT_EMAIL as ACCOUNTANT
+from tests.conftest import AUTH_PASSWORD as PASSWORD
+from tests.conftest import CASHIER_EMAIL as CASHIER
+from tests.conftest import OWNER_EMAIL as OWNER
+from tests.conftest import settle
 
-PASSWORD = "correct-horse-battery"
 NEW_PASSWORD = "an-entirely-new-password"
-OWNER = "owner@example.com"
-CASHIER = "cashier@example.com"
-ACCOUNTANT = "accountant@example.com"
-
-
-def _fast_hash(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=4)).decode()
-
-
-async def _settle() -> None:
-    """Let the fire-and-forget audit writes finish."""
-    pending = [
-        t for t in asyncio.all_tasks()
-        if t is not asyncio.current_task()
-        and getattr(t.get_coro(), "__name__", "") == "record_auth_event_safe"
-    ]
-    await asyncio.gather(*pending)
-
-
-@pytest_asyncio.fixture
-async def device(db, monkeypatch):
-    """Factory for logged-out devices, all talking to the same app and DB."""
-    from app.deps import get_db
-    from app.main import app
-
-    hashed = _fast_hash(PASSWORD)
-    db.add(User(id="u-owner", email=OWNER, name="Owner", password_hash=hashed, role=Role.ADMIN, is_active=True))
-    db.add(User(id="u-cashier", email=CASHIER, name="Cashier", password_hash=hashed, role=Role.CASHIER, is_active=True))
-    db.add(User(id="u-accountant", email=ACCOUNTANT, name="Accountant", password_hash=hashed, role=Role.ACCOUNTANT, is_active=True))
-    await db.commit()
-
-    async def _get_db():
-        yield db
-
-    monkeypatch.setattr(
-        "app.core.auth_audit.async_session_factory",
-        async_sessionmaker(db.bind, expire_on_commit=False, class_=AsyncSession),
-    )
-    limiter.reset()
-    app.dependency_overrides[get_db] = _get_db
-
-    opened: list[AsyncClient] = []
-
-    def _new() -> AsyncClient:
-        # Each device gets its own address so the per-IP login limit stays out of the way.
-        client = AsyncClient(
-            transport=ASGITransport(app=app),
-            base_url="http://test",
-            headers={"X-Forwarded-For": f"203.0.113.{len(opened) + 1}"},
-        )
-        opened.append(client)
-        return client
-
-    yield _new
-
-    for client in opened:
-        await client.aclose()
-    app.dependency_overrides.clear()
-    await _settle()
 
 
 async def _login(client: AsyncClient, email: str, password: str = PASSWORD) -> str:
     """Log the device in (its cookie jar keeps the session) and return the token."""
     resp = await client.post("/api/auth/login", json={"email": email, "password": password})
-    await _settle()
+    await settle()
     assert resp.status_code == 200, resp.text
     return resp.json()["access_token"]
 
@@ -215,7 +155,7 @@ async def test_logout_does_not_end_other_sessions(device, db):
     await _login(till_two, CASHIER)
 
     assert (await till_one.post("/api/auth/logout")).status_code == 204
-    await _settle()
+    await settle()
 
     assert await _version(db, "u-cashier") == 0
     assert await _me(till_one) == 401   # its cookie is gone
@@ -315,7 +255,7 @@ async def test_password_change_is_still_audited(device, db):
     till = device()
     await _login(till, CASHIER)
     await till.post("/api/auth/change-password", json={"current_password": PASSWORD, "new_password": NEW_PASSWORD})
-    await _settle()
+    await settle()
 
     rows = (await db.execute(
         select(AuthAuditLog).where(AuthAuditLog.event_type == "PASSWORD_CHANGED")

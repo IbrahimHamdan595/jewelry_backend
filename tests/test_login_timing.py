@@ -15,17 +15,14 @@ from unittest.mock import patch
 
 import bcrypt
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import select
 
 from app.core import security
-from app.core.rate_limit import limiter
 from app.core.security import DUMMY_PASSWORD_HASH, hash_password, verify_password
-from app.models import Role, User
+from app.models import User
+from tests.conftest import AUTH_PASSWORD as PASSWORD
+from tests.conftest import OWNER_EMAIL as OWNER
 
-PASSWORD = "correct-horse-battery"
-OWNER = "owner@example.com"
 GHOST = "nobody-here@example.com"
 
 
@@ -34,28 +31,9 @@ def _cost(hashed: str) -> int:
     return int(hashed.split("$")[2])
 
 
-@pytest_asyncio.fixture
-async def client(db, monkeypatch):
-    from app.deps import get_db
-    from app.main import app
-
-    owner_hash = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt(rounds=4)).decode()
-    db.add(User(id="u-owner", email=OWNER, name="Owner", password_hash=owner_hash, role=Role.ADMIN, is_active=True))
-    await db.commit()
-
-    async def _get_db():
-        yield db
-
-    monkeypatch.setattr(
-        "app.core.auth_audit.async_session_factory",
-        async_sessionmaker(db.bind, expire_on_commit=False, class_=AsyncSession),
-    )
-    limiter.reset()
-    app.dependency_overrides[get_db] = _get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        c.owner_hash = owner_hash
-        yield c
-    app.dependency_overrides.clear()
+@pytest.fixture
+def client(device):
+    return device()
 
 
 async def _attempt(client, email: str, password: str):
@@ -97,11 +75,12 @@ async def test_unknown_email_still_performs_one_bcrypt_verification(client):
 
 
 @pytest.mark.asyncio
-async def test_wrong_password_performs_one_bcrypt_verification(client):
+async def test_wrong_password_performs_one_bcrypt_verification(client, db):
+    owner_hash = (await db.execute(select(User.password_hash).where(User.email == OWNER))).scalar_one()
     resp, calls = await _attempt(client, OWNER, "some-password")
     assert resp.status_code == 401
     assert len(calls) == 1
-    assert calls[0].args == (b"some-password", client.owner_hash.encode())
+    assert calls[0].args == (b"some-password", owner_hash.encode())
 
 
 @pytest.mark.asyncio
