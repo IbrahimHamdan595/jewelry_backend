@@ -33,15 +33,28 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
 - **Alembic** for every schema change. Never `create_all` in production.
 - **APScheduler** for the gold-rate poller (runs every N minutes, alerts
   via Discord webhook after N consecutive failures).
-- **JWT auth** via `python-jose`, HttpOnly cookie set by the backend on
-  login; bcrypt for password hashing. Login is throttled twice: SlowAPI
+- **JWT auth** via `python-jose` (HS256, or RS256 once a key pair is
+  provisioned so the frontend only ever holds a public key), HttpOnly cookie
+  set by the backend on login; bcrypt for password hashing. Login is throttled twice: SlowAPI
   rate-limit (5/min per client IP, taken from `X-Forwarded-For`) and a
   per-account lockout (10 consecutive failures in 15 min lock that email
   for 15 min, derived from the auth audit log). The lockout cuts both ways:
   it stops a guess spread over many addresses, and it lets anyone who knows
   an email keep its owner out for 15 minutes at a time. An admin lifts a
   lock at once with `POST /api/staff/{id}/unlock` (audited as
-  `ACCOUNT_UNLOCKED`).
+  `ACCOUNT_UNLOCKED`). An unknown email costs the same single bcrypt
+  verification as a real one (against a fixed dummy hash), so neither the
+  response nor its timing says which accounts exist. bcrypt runs in a
+  worker thread, never on the event loop, so a burst of logins cannot stall
+  other requests. New passwords over bcrypt's 72 bytes are refused (422).
+- **Sessions can be ended server-side.** Every token carries the user's
+  `token_version` and `get_current_user` re-checks it on each request.
+  Changing a password (own, or an admin reset), deactivating a user and
+  `POST /api/staff/{id}/force-logout` bump it, which signs that user out
+  everywhere — and keeps them out: re-enabling a deactivated account does not
+  bring its old tokens back. The person changing their own password gets a
+  fresh cookie in the same response. Plain logout only drops the cookie on
+  that device, so shop tills sharing one account do not log each other out.
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
@@ -88,6 +101,11 @@ DATABASE_URL="postgresql+asyncpg://user:pass@host/dbname?ssl=require"
 JWT_SECRET="..."
 JWT_ALGORITHM="HS256"
 JWT_EXPIRES_MINUTES=480
+# RS256 signing — optional; see "JWT signing keys (RS256)" below. With none of
+# these set, tokens are HS256 signed with JWT_SECRET.
+# JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+# JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+# JWT_ACCEPT_HS256=true
 
 # CORS — comma-separated list of allowed frontend origins. Exact origins only:
 # there is deliberately no wildcard/regex (NEX-45). If you develop through a
@@ -153,6 +171,104 @@ written to the inventory ledger as `SALE_ON_STALE_RATE_ACK`
 **Raising `GOLD_REFRESH_MINUTES` also delays the point at which the till starts
 prompting.** They are the same knob.
 
+### JWT signing keys (RS256)
+
+The Next.js middleware verifies the session token itself. With HS256 that
+means the frontend host holds `JWT_SECRET` — the same key that **mints**
+tokens. With RS256 the backend keeps a private key and the frontend gets a
+public key that can only verify (NEX-54).
+
+| Setting | Default | Effect |
+|---|---|---|
+| `JWT_PRIVATE_KEY` | unset | When set, new tokens are signed **RS256** with it. Unset: HS256 with `JWT_SECRET`, as before. |
+| `JWT_PUBLIC_KEY` | unset | Verifies RS256 tokens. Derived from the private key if left unset. The frontend needs this value. |
+| `JWT_ACCEPT_HS256` | `true` | Keep accepting `JWT_SECRET`-signed tokens. Set `false` to end the migration window. |
+
+Both keys are PEM. Newlines may be real or written as the two characters `\n`.
+`JWT_ALGORITHM` is **not** how RS256 is selected, on either side — it only
+names the shared-secret (HMAC) algorithm. Leave it as it is.
+
+Merging this changes nothing until `JWT_PRIVATE_KEY` is set. The service
+refuses to start on a configuration that could not accept its own tokens, so
+a mistake fails the deploy (the previous release keeps serving) instead of
+breaking every login:
+
+- a key that is not PEM, or a public key pasted as the private one;
+- a `JWT_PUBLIC_KEY` that does not belong to `JWT_PRIVATE_KEY`;
+- `JWT_ACCEPT_HS256=false` without a `JWT_PRIVATE_KEY` — sessions would be
+  signed with `JWT_SECRET` and then refused;
+- an empty `JWT_SECRET` while it is still what signs.
+
+**Generate a pair:**
+
+```bash
+# Private key (PKCS#8). Stays on the backend host; never goes to Vercel.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt_private.pem
+
+# Public key (SPKI, "BEGIN PUBLIC KEY"). This is the half the frontend gets.
+openssl rsa -in jwt_private.pem -pubout -out jwt_public.pem
+
+# One-line forms, for env-var fields that do not take multi-line values:
+awk 'NF {printf "%s\\n", $0}' jwt_private.pem; echo
+awk 'NF {printf "%s\\n", $0}' jwt_public.pem; echo
+```
+
+Keep the two files until step 2 below is done, then delete them (see the end
+of the cutover). They must never be committed.
+
+**Check the pair before it goes anywhere.** The backend refuses to start on
+a `JWT_PUBLIC_KEY` that does not belong to its `JWT_PRIVATE_KEY`, but nothing
+can check the copy on Vercel for you: a wrong key there verifies nothing, and
+once the backend signs RS256 nobody gets past the login page. Compare
+fingerprints — the SHA-256 of the public key in DER form — before step 2:
+
+```bash
+# The public half of the private key Render will sign with:
+openssl pkey -in jwt_private.pem -pubout -outform DER | openssl dgst -sha256
+
+# The public key file you generated:
+openssl pkey -pubin -in jwt_public.pem -outform DER | openssl dgst -sha256
+
+# The value actually saved in Vercel — paste it between the quotes
+# (%b turns a one-line value's \n back into newlines):
+printf '%b' '<JWT_PUBLIC_KEY as shown in Vercel>' > vercel_public.pem
+openssl pkey -pubin -in vercel_public.pem -outform DER | openssl dgst -sha256
+```
+
+All three digests must be identical. If the last one differs, fix the value
+in Vercel and redeploy the frontend before touching Render.
+
+**Cutover order.** The frontend middleware accepts both kinds of token during
+the window — RS256 against `JWT_PUBLIC_KEY`, HS256 for as long as it still
+has `JWT_SECRET` — so no step logs anyone out and none has to be timed
+against another:
+
+1. **Vercel (frontend):** add `JWT_PUBLIC_KEY`. Redeploy. Nothing changes
+   yet: every session is still HS256 and still verified with `JWT_SECRET`.
+   Leave `JWT_ALGORITHM` alone — it only names the HMAC variant.
+2. **Render (backend):** set `JWT_PRIVATE_KEY` and `JWT_PUBLIC_KEY` (after
+   the fingerprint check above). Leave `JWT_ACCEPT_HS256`, `JWT_SECRET` and
+   `JWT_ALGORITHM` as they are. Deploy. New logins are RS256; sessions that
+   are already open (HS256) keep working on both sides.
+3. **Wait out the token lifetime** — `JWT_EXPIRES_MINUTES`, 8 hours by
+   default — so that every HS256 token has expired.
+4. **Render:** set `JWT_ACCEPT_HS256=false`. From here `JWT_SECRET` can
+   neither mint nor verify a backend session. (Setting this without a
+   `JWT_PRIVATE_KEY` is refused at startup: it would sign sessions and then
+   reject them.)
+5. **Vercel:** remove `JWT_SECRET`, redeploy. The frontend now holds nothing
+   that can sign a token. On Render `JWT_SECRET` must stay defined (the
+   config requires it) — leave its value in place rather than blanking it.
+
+Once step 2 is live and a fresh login works, delete `jwt_private.pem`,
+`jwt_public.pem` and `vercel_public.pem` from your machine: the private key
+should exist in Render and nowhere else.
+
+Rollback, any time before step 4: unset `JWT_PRIVATE_KEY` on Render. Signing
+goes back to HS256; keep `JWT_PUBLIC_KEY` there so RS256 sessions already
+issued stay valid until they expire. The frontend needs no change, because it
+still accepts both.
+
 ## Database migrations
 
 Every schema change is an Alembic migration in `alembic/versions/`. Run
@@ -162,6 +278,12 @@ migrations):
 ```bash
 alembic upgrade head
 ```
+
+The server checks this itself: started against a database that is behind
+its migrations it exits at once with the revision it found, the one it
+needs and this command. A database built without Alembic (`python -m
+app.seed` on an empty database uses `create_all`) has no revision to
+compare, so it only logs a warning.
 
 To seed the initial admin user from `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD`:
 
@@ -261,7 +383,7 @@ jewelry_backend/
 │   │   ├── products.py
 │   │   ├── reports.py          # dashboard aggregates
 │   │   ├── settings.py
-│   │   ├── staff.py            # cashier user management (audited) + lockout unlock
+│   │   ├── staff.py            # cashier user management (audited) + unlock, force-logout
 │   │   ├── stock_takes.py      # physical-count workflow (audit B2)
 │   │   ├── suppliers.py        # suppliers + purchases + payments
 │   │   └── zakat.py            # live computation + snapshots
@@ -278,7 +400,8 @@ jewelry_backend/
 │   │   ├── permissions.py      # require_admin
 │   │   ├── pricing.py          # KARAT_PURITY, calculate_price, etc.
 │   │   ├── rate_limit.py       # SlowAPI limiter (login), keyed on the client IP
-│   │   ├── security.py         # JWT + bcrypt
+│   │   ├── schema_guard.py     # refuse to start on a database behind the migrations
+│   │   ├── security.py         # JWT + bcrypt + revoke_sessions (token_version)
 │   │   ├── stock_take.py       # StockTakeRefType → AdjustmentTarget mapping
 │   │   └── zakat.py            # holdings aggregator + integrity hash
 │   │
@@ -321,6 +444,27 @@ jewelry_backend/
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
 - **Health check path:** `/health` (no auth, no database access).
+- **Migrations before code — checked at startup.** Migrations are applied by
+  hand and the service deploys from `main`, so a release can reach production
+  before its migration. On startup the service reads the database's
+  `alembic_version` and compares it with the head of the migration scripts it
+  was built with (`app/core/schema_guard.py`):
+  - **database behind the code** → the service refuses to start. The deploy
+    fails with a message naming both revisions, and the previous release keeps
+    serving — instead of the new one answering 500 on every query that touches
+    a column that is not there yet. To recover: run `alembic upgrade head`
+    against the production database, then trigger the deploy again (a failed
+    deploy is not retried by itself).
+  - **database ahead of the code** (after rolling the code back), **no
+    `alembic_version` table**, or **database unreachable** → a warning in the
+    log and a normal start. The guard only refuses when it is sure.
+
+  The comfortable order is still migration first: every migration here is
+  additive, so it is safe under the release that is already running. That
+  includes `e65d977573d3` (`users.token_version`, NEX-54), which the new code
+  selects on every authenticated request.
+- **JWT keys:** see [JWT signing keys (RS256)](#jwt-signing-keys-rs256) for
+  key generation and the cutover order with the frontend.
 - **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
   than `development` / `dev` / `local` / `test` keeps `/docs`, `/redoc` and
   `/openapi.json` at 404.

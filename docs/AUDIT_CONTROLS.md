@@ -71,7 +71,7 @@ the verify endpoints. Each is enforced at the layer noted.
 
 11. **Every gold-rate manual override carries a required justification.** `reason` is a Pydantic-required field (`min_length=3`) on `OverrideRequest`; empty submissions return 422. The reason is in the `GOLD_RATE_OVERRIDE_SET` ledger payload alongside the new and prior rates.
 
-12. **Settings changes emit per-field diffs.** `SETTINGS_CHANGED` payload contains `{diff: {field: {from, to}}}` for only the keys that actually changed. Same shape for `STAFF_UPDATED`. `password_hash` changes are recorded as `***` → `***` — the fact of change is auditable; the hash itself is never exposed.
+12. **Settings changes emit per-field diffs.** `SETTINGS_CHANGED` payload contains `{diff: {field: {from, to}}}` for only the keys that actually changed. Same shape for `STAFF_UPDATED`. `password_hash` changes are recorded as `***` → `***` — the fact of change is auditable; the hash itself is never exposed. An admin ending a user's sessions (`POST /api/staff/{id}/force-logout`, NEX-54) writes `STAFF_FORCE_LOGOUT` with the target's email and the `token_version` step, in the same transaction as the bump.
 
 ### Reconciliation visibility
 

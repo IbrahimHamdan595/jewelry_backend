@@ -37,4 +37,13 @@ async def get_current_user(
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    # NEX-54: a token is only good for the token_version it was issued under.
+    # A password change or an admin force-logout bumps the column, which ends
+    # every outstanding session on its very next request — the same way
+    # is_active takes effect immediately, because the user is re-read here.
+    # A token WITHOUT the claim was minted before the claim existed and counts
+    # as version 0, every user's starting value, so the sessions that are
+    # alive when this deploys keep working until their first bump.
+    if payload.get("ver", 0) != user.token_version:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
     return user
