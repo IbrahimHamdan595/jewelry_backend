@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core import gl, ledger, period_close
+from app.core import ar, bank, expenses, gl, gl_postings, ledger, period_close
 from app.core.audit_chain import verify_gl_chain
 from app.core.coa_seed import seed_chart_of_accounts, post_opening_balances
 from app.core.permissions import require_accounting, require_admin
@@ -21,6 +21,20 @@ from app.schemas.accounting import (
 )
 
 router = APIRouter(prefix="/accounting", tags=["accounting"])
+
+# Source types the system itself posts under. A manual entry may not claim one:
+# a hand-made (ORDER, <order id>) would be taken for the sale's entry and the
+# real posting skipped, a YEAR_CLOSE would mark the year closed, and a REVERSAL
+# carries no reverses_entry_id for the reversal guards to see.
+RESERVED_SOURCE_TYPES = frozenset({
+    gl.SOURCE_OPENING, gl.SOURCE_REVERSAL, period_close.YEAR_CLOSE,
+    gl_postings.SOURCE_ORDER, gl_postings.SOURCE_ORDER_REFUND,
+    gl_postings.SOURCE_SUPPLIER_PURCHASE, gl_postings.SOURCE_SUPPLIER_PAYMENT,
+    gl_postings.SOURCE_BUYBACK, gl_postings.SOURCE_MELT, gl_postings.SOURCE_ADJUSTMENT,
+    ar.SOURCE_AR_INVOICE, ar.SOURCE_AR_RECEIPT,
+    expenses.SOURCE_VENDOR_BILL, expenses.SOURCE_VENDOR_PAYMENT,
+    bank.SOURCE_TRANSFER,
+})
 
 
 async def _load_entry(db: AsyncSession, entry_id: str) -> GLJournalEntry:
@@ -229,6 +243,12 @@ async def create_entry(
     body: JournalEntryCreate, db: AsyncSession = Depends(get_db),
     user: User = Depends(require_accounting),
 ):
+    if body.source_type.strip().upper() in RESERVED_SOURCE_TYPES:
+        raise HTTPException(
+            422,
+            f"source_type {body.source_type.strip()!r} is reserved for entries the system "
+            f"posts itself. Post manual entries as {gl.SOURCE_MANUAL}.",
+        )
     lines = [
         gl.GLLine(
             account_id=ln.account_id, denomination="",  # resolved from DB in post_entry

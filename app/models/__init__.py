@@ -4,7 +4,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import (
-    JSON, Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String,
+    JSON, Boolean, Date, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -1018,6 +1018,38 @@ class GLPeriod(Base):
     )
 
 
+# Auto-post sources whose (source_type, source_id) identifies exactly ONE live
+# (non-reversal) entry: the ones gl_postings.find_live_entry guards, each posted
+# once for a freshly created row (per-item refunds use "<item_id>:<seq>"). Every
+# other source may legitimately repeat — a MANUAL entry's source_id is a free-text
+# reference, and AR/AP/OPENING/YEAR_CLOSE post with source_id NULL — so they are
+# deliberately NOT listed. A literal list because it feeds a partial-index
+# predicate: changing it needs a migration.
+GL_UNIQUE_LIVE_SOURCE_TYPES = (
+    "ORDER", "ORDER_REFUND", "SUPPLIER_PURCHASE", "SUPPLIER_PAYMENT",
+    "BUYBACK", "MELT", "ADJUSTMENT",
+)
+_GL_REVERSAL_WHERE = "reverses_entry_id IS NOT NULL"
+_GL_LIVE_SOURCE_WHERE = (
+    "reverses_entry_id IS NULL AND source_type IN ("
+    + ", ".join(f"'{s}'" for s in GL_UNIQUE_LIVE_SOURCE_TYPES) + ")"
+)
+
+# NEX-49 backstops behind gl.post_entry's duplicate checks (both partial, and
+# declared for SQLite too so the test schema enforces them). Named here so the
+# posting engine can recognise a violation without repeating the index names.
+# An entry is reversed at most once ...
+GL_UQ_REVERSAL_INDEX = Index(
+    "uq_gl_entries_reverses_entry_id", "reverses_entry_id", unique=True,
+    postgresql_where=text(_GL_REVERSAL_WHERE), sqlite_where=text(_GL_REVERSAL_WHERE),
+)
+# ... and an auto-post source has at most one live entry.
+GL_UQ_LIVE_SOURCE_INDEX = Index(
+    "uq_gl_entries_live_source", "source_type", "source_id", unique=True,
+    postgresql_where=text(_GL_LIVE_SOURCE_WHERE), sqlite_where=text(_GL_LIVE_SOURCE_WHERE),
+)
+
+
 class GLJournalEntry(Base):
     """Append-only, hash-chained journal-entry header (design §3.3)."""
     __tablename__ = "gl_journal_entries"
@@ -1044,6 +1076,8 @@ class GLJournalEntry(Base):
         Index("ix_gl_entries_entry_date", "entry_date"),
         Index("ix_gl_entries_period", "period_id"),
         Index("ix_gl_entries_source", "source_type", "source_id"),
+        GL_UQ_REVERSAL_INDEX,
+        GL_UQ_LIVE_SOURCE_INDEX,
     )
 
 

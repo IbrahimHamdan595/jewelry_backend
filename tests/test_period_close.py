@@ -193,6 +193,101 @@ async def test_close_year_idempotent_and_autoopens_next_year(db):
     assert "already closed" in str(ei.value).lower()
 
 
+async def _closed_2026(db):
+    """Revenue 1000, rent 300, every 2026 month closed, year closed."""
+    await _seed(db, months=(6,))
+    cash = await _acct(db, "CASH")
+    rev = await _acct(db, "SALES_REVENUE")
+    rent = await _acct(db, "RENT_EXPENSE")
+    await _post(db, date(2026, 6, 5), [_m(cash, debit=D("1000")), _m(rev, credit=D("1000"))])
+    await _post(db, date(2026, 6, 6), [_m(rent, debit=D("300")), _m(cash, credit=D("300"))])
+    await _close_all_2026_months(db)
+    return await period_close.close_year(db, year=2026, actor_user_id="admin")
+
+
+async def _set_december(db, status):
+    dec = (await db.execute(
+        select(GLPeriod).where(GLPeriod.year == 2026, GLPeriod.period_no == 12))).scalar_one()
+    dec.status = status
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_a_year_close_entry_cannot_be_reversed(db):
+    """NEX-49: reversing a closing entry does not reopen the year — booked today
+    it lands in a later year and leaves the old one closed, and either way the
+    reversal shows up in the income statement as revenue and expenses. Refused."""
+    from fastapi import HTTPException
+    from app.models import GLJournalChainHead, GLJournalEntry
+
+    close = await _closed_2026(db)
+    # December reopened, so nothing but the rule itself stands in the way.
+    await _set_december(db, PeriodStatus.OPEN)
+    head = (await db.execute(select(GLJournalChainHead).where(GLJournalChainHead.id == 1))).scalar_one()
+    before = (head.row_count, head.latest_entry_hash)
+
+    with pytest.raises(HTTPException) as ei:
+        await gl.reverse_entry(db, original_entry_id=close.id, actor_user_id="admin",
+                               entry_date=date(2026, 12, 31))
+    assert ei.value.status_code == 409
+    detail = ei.value.detail
+    assert close.entry_no in detail and "2026" in detail
+    assert "cannot be reopened by reversing its closing entry" in detail
+    assert "correcting manual entry in the current period" in detail
+
+    assert (head.row_count, head.latest_entry_hash) == before
+    reversals = (await db.execute(
+        select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id.is_not(None)))).scalars().all()
+    assert reversals == []
+    assert await period_close._year_already_closed(db, 2026) is True
+
+
+@pytest.mark.asyncio
+async def test_reversed_year_close_does_not_count_and_the_year_can_be_closed_again(db):
+    """A closing entry can no longer be reversed, but a ledger may already hold
+    such a reversal (posted before that rule). It cannot be undone — a reversal
+    is never reversed — so that YEAR_CLOSE must stop counting as "already
+    closed", or the year could never be closed again."""
+    from fastapi import HTTPException
+    from app.models import GLJournalLine
+
+    first = await _closed_2026(db)
+    assert await period_close._year_already_closed(db, 2026) is True
+
+    # The pre-existing reversal, written the way reverse_entry used to write it.
+    await _set_december(db, PeriodStatus.OPEN)
+    lines = (await db.execute(
+        select(GLJournalLine).where(GLJournalLine.entry_id == first.id)
+        .order_by(GLJournalLine.line_no))).scalars().all()
+    await gl.post_entry(
+        db, entry_date=date(2026, 12, 31), memo=f"Reversal of {first.entry_no}",
+        source_type=gl.SOURCE_REVERSAL, source_id=first.id, reverses_entry_id=first.id,
+        actor_user_id="admin",
+        lines=[_m(l.account_id, debit=l.base_credit, credit=l.base_debit) for l in lines])
+    await _set_december(db, PeriodStatus.CLOSED)
+
+    assert await period_close._year_already_closed(db, 2026) is False
+    pv = await period_close.year_close_preview(db, year=2026)
+    assert pv["already_closed"] is False and pv["net_income"] == D("700.00")
+
+    second = await period_close.close_year(db, year=2026, actor_user_id="admin")
+    assert second.id != first.id and second.source_type == "YEAR_CLOSE"
+
+    # Closed once, not twice: P&L back to zero, retained earnings holds 700.
+    tb = await compute_trial_balance(db, as_of=date(2026, 12, 31))
+    accts = {a["system_key"]: a for a in tb["accounts"] if a["system_key"]}
+    assert accts["SALES_REVENUE"]["net_base"] == D("0.00")
+    assert accts["RENT_EXPENSE"]["net_base"] == D("0.00")
+    assert accts["RETAINED_EARNINGS"]["base_credit"] - accts["RETAINED_EARNINGS"]["base_debit"] == D("700.00")
+    assert tb["balanced"] is True
+
+    # And the new close counts: a third attempt is refused like any second one.
+    assert await period_close._year_already_closed(db, 2026) is True
+    with pytest.raises(HTTPException) as ei:
+        await period_close.close_year(db, year=2026, actor_user_id="admin")
+    assert ei.value.status_code == 409
+
+
 @pytest.mark.asyncio
 async def test_close_year_blocked_when_month_open(db):
     await _seed(db, months=(6,))

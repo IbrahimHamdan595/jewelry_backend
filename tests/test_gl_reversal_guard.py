@@ -1,0 +1,453 @@
+"""NEX-49 — a journal entry is reversed at most once, and a reversal is never
+reversed. Three layers: gl.reverse_entry refuses with a 409 before the chain
+head moves; gl.post_entry looks again under the chain-head lock, which settles
+concurrent attempts (and auto-post double-posts) without a failed write; and
+partial unique indexes on gl_journal_entries are the last resort."""
+from datetime import date
+from decimal import Decimal
+from uuid import uuid4
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
+
+from app.core import gl
+from app.core import gl_postings as glp
+from app.models import (
+    AccountType, Denomination, GLAccount, GLEntrySequence, GLJournalChainHead,
+    GLJournalEntry, GLPeriod, NormalBalance, PeriodStatus,
+)
+
+D = Decimal
+
+
+async def _setup(db, months=(6,)):
+    for m in months:
+        db.add(GLPeriod(year=2026, period_no=m, status=PeriodStatus.OPEN))
+    cash = GLAccount(code="1000", name="Cash", type=AccountType.ASSET,
+                     denomination=Denomination.MONEY, normal_balance=NormalBalance.DEBIT,
+                     currency="USD", system_key="CASH")
+    rev = GLAccount(code="4000", name="Sales", type=AccountType.INCOME,
+                    denomination=Denomination.MONEY, normal_balance=NormalBalance.CREDIT,
+                    currency="USD", system_key="SALES_REVENUE")
+    inv = GLAccount(code="1200", name="Metal Inventory", type=AccountType.ASSET,
+                    denomination=Denomination.DUAL, normal_balance=NormalBalance.DEBIT,
+                    currency="USD", system_key="METAL_INVENTORY")
+    cogs = GLAccount(code="5000", name="Metal COGS", type=AccountType.EXPENSE,
+                     denomination=Denomination.DUAL, normal_balance=NormalBalance.DEBIT,
+                     currency="USD", system_key="METAL_COGS")
+    db.add_all([cash, rev, inv, cogs])
+    await db.flush()
+    return cash, rev, inv, cogs
+
+
+def _sale_lines(accts):
+    """A sale touching BOTH dimensions: 100 USD cash/revenue + 10g K21 out at cost 60."""
+    cash, rev, inv, cogs = accts
+    return [
+        gl.GLLine(account_id=cash.id, denomination="MONEY", base_debit=D("100"), money_debit=D("100")),
+        gl.GLLine(account_id=rev.id, denomination="MONEY", base_credit=D("100"), money_credit=D("100")),
+        gl.GLLine(account_id=cogs.id, denomination="DUAL", base_debit=D("60"),
+                  metal_debit_grams=D("10.000"), karat="K21"),
+        gl.GLLine(account_id=inv.id, denomination="DUAL", base_credit=D("60"),
+                  metal_credit_grams=D("10.000"), karat="K21"),
+    ]
+
+
+async def _post(db, accts, *, source_type=gl.SOURCE_MANUAL, source_id=None,
+                entry_date=date(2026, 6, 3), **kw):
+    return await gl.post_entry(
+        db, entry_date=entry_date, memo="sale", source_type=source_type, source_id=source_id,
+        actor_user_id="u1", lines=_sale_lines(accts), **kw,
+    )
+
+
+async def _chain_state(db):
+    """Everything a refused attempt must leave untouched: the head's row count
+    and latest hash, the number of entries, and the per-day entry_no counters
+    (a burned JE number would be a visible gap)."""
+    head = (await db.execute(select(GLJournalChainHead).where(GLJournalChainHead.id == 1))).scalar_one()
+    entries = (await db.execute(select(func.count()).select_from(GLJournalEntry))).scalar_one()
+    seqs = (await db.execute(select(func.coalesce(func.sum(GLEntrySequence.last_seq), 0)))).scalar_one()
+    return head.row_count, head.latest_entry_hash, entries, seqs
+
+
+# ── In-code guard (gl.reverse_entry) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_second_reversal_refused_409_and_chain_untouched(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    first = await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                                   entry_date=date(2026, 6, 4))
+    before = await _chain_state(db)
+    assert before[0] == 2 and before[1] == first.entry_hash
+
+    with pytest.raises(HTTPException) as exc:
+        await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                               entry_date=date(2026, 6, 4))
+    assert exc.value.status_code == 409
+    assert orig.entry_no in exc.value.detail and first.entry_no in exc.value.detail
+
+    # Refused BEFORE the head advanced: no gap in the hash chain, no burned JE number.
+    assert await _chain_state(db) == before
+
+
+@pytest.mark.asyncio
+async def test_reversing_a_reversal_refused_and_chain_untouched(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    rev = await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                                 entry_date=date(2026, 6, 4))
+    before = await _chain_state(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await gl.reverse_entry(db, original_entry_id=rev.id, actor_user_id="u1",
+                               entry_date=date(2026, 6, 4))
+    assert exc.value.status_code == 409
+    # The way out is a correcting manual entry, and the refusal says so.
+    assert rev.entry_no in exc.value.detail and "manual entry" in exc.value.detail
+    assert await _chain_state(db) == before
+
+
+@pytest.mark.asyncio
+async def test_single_reversal_nets_original_to_zero_in_both_dimensions(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    rev = await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                                 entry_date=date(2026, 6, 4))
+    assert rev.reverses_entry_id == orig.id and rev.source_type == gl.SOURCE_REVERSAL
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    assert tb["balanced"] is True and tb["metal_balanced"] is True
+    assert len(tb["accounts"]) == 4
+    for a in tb["accounts"]:
+        assert a["net_base"] == D("0.00"), a["code"]
+        for k, v in a["metal_by_karat"].items():
+            assert v["net_grams"] == D("0.000"), (a["code"], k)
+    # The metal dimension really was exercised (not vacuously zero).
+    by_key = {a["system_key"]: a for a in tb["accounts"]}
+    assert by_key["METAL_INVENTORY"]["metal_by_karat"]["K21"]["debit_grams"] == D("10.000")
+    assert by_key["METAL_INVENTORY"]["metal_by_karat"]["K21"]["credit_grams"] == D("10.000")
+
+
+@pytest.mark.asyncio
+async def test_reversal_may_land_in_a_later_period_and_still_counts(db):
+    """A reversal is booked when it happens, so it legitimately lands in a
+    different period from the original. The guard must not depend on period."""
+    accts = await _setup(db, months=(6, 7, 8))
+    orig = await _post(db, accts, entry_date=date(2026, 6, 3))
+    rev = await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                                 entry_date=date(2026, 7, 10))
+    assert rev.period_id != orig.period_id
+
+    with pytest.raises(HTTPException) as exc:
+        await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                               entry_date=date(2026, 8, 1))  # a third period
+    assert exc.value.status_code == 409
+
+
+# ── Index backstop: direct SQL ────────────────────────────────────────────────
+
+_RAW_INSERT = text(
+    "INSERT INTO gl_journal_entries "
+    "(id, entry_no, entry_date, period_id, memo, source_type, source_id, reverses_entry_id, "
+    " actor_user_id, occurred_at, prev_hash, entry_hash) "
+    "VALUES (:id, :entry_no, '2026-06-05', :period_id, 'raw', :source_type, :source_id, "
+    " :reverses_entry_id, 'u1', '2026-06-05 12:00:00', 'x', :entry_hash)"
+)
+
+
+def _raw_row(period_id, **over):
+    uid = uuid4().hex
+    return {"id": uid, "entry_no": f"JE-RAW-{uid[:8]}", "period_id": period_id,
+            "source_type": gl.SOURCE_MANUAL, "source_id": None, "reverses_entry_id": None,
+            "entry_hash": f"raw-{uid}", **over}
+
+
+@pytest.mark.asyncio
+async def test_index_rejects_duplicate_reversal_inserted_directly(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    other = await _post(db, accts)
+    await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 4))
+
+    # Control: the same raw INSERT against a not-yet-reversed entry is accepted,
+    # so the rejection below is the index and not a malformed statement.
+    await db.execute(_RAW_INSERT, _raw_row(orig.period_id, source_type=gl.SOURCE_REVERSAL,
+                                           source_id=other.id, reverses_entry_id=other.id))
+
+    with pytest.raises(IntegrityError):
+        await db.execute(_RAW_INSERT, _raw_row(orig.period_id, source_type=gl.SOURCE_REVERSAL,
+                                               source_id=orig.id, reverses_entry_id=orig.id))
+
+
+@pytest.mark.asyncio
+async def test_index_rejects_duplicate_live_auto_post_source_inserted_directly(db):
+    accts = await _setup(db)
+    sale = await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+
+    # Control: a different order is fine.
+    await db.execute(_RAW_INSERT, _raw_row(sale.period_id, source_type=glp.SOURCE_ORDER,
+                                           source_id="order-2"))
+
+    with pytest.raises(IntegrityError):
+        await db.execute(_RAW_INSERT, _raw_row(sale.period_id, source_type=glp.SOURCE_ORDER,
+                                               source_id="order-1"))
+
+
+# ── The lost race: re-checked under the chain-head lock ───────────────────────
+# reverse_entry and find_live_entry both look BEFORE the chain-head lock, so two
+# requests can both pass. post_entry looks again once it holds the lock: the
+# loser is refused before any insert, so nothing is flushed, nothing fails, and
+# the caller's transaction is left usable.
+
+@pytest.mark.asyncio
+async def test_lost_reversal_race_is_refused_under_the_lock_without_poisoning_the_transaction(db):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    await gl.reverse_entry(db, original_entry_id=orig.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 4))
+    before = await _chain_state(db)
+
+    # The loser's view: its own check already passed, so it reaches post_entry.
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=orig.id,
+                    reverses_entry_id=orig.id, entry_date=date(2026, 6, 4))
+    assert exc.value.status_code == 409
+
+    # No rollback needed: nothing was written, and the same transaction carries on.
+    assert await _chain_state(db) == before
+    await _post(db, accts)
+    assert (await _chain_state(db))[0] == before[0] + 1
+
+
+@pytest.mark.asyncio
+async def test_lost_auto_post_race_is_refused_under_the_lock_without_poisoning_the_transaction(db):
+    accts = await _setup(db)
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    before = await _chain_state(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    assert exc.value.status_code == 409
+
+    assert await _chain_state(db) == before
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-2")
+    assert (await _chain_state(db))[0] == before[0] + 1
+
+
+# ── Last resort: the index, when even the re-check cannot see the winner ──────
+
+async def _sees_nothing(*args, **kwargs):
+    """The re-check as it would behave under an isolation level that hides the
+    winner's committed row (or any future path that skips it)."""
+    return None
+
+
+@pytest.mark.asyncio
+async def test_index_violation_on_a_duplicate_reversal_is_a_409_not_a_500(db, monkeypatch):
+    accts = await _setup(db)
+    orig = await _post(db, accts)
+    orig_id = orig.id
+    await gl.reverse_entry(db, original_entry_id=orig_id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 4))
+    await db.commit()
+    before = await _chain_state(db)
+
+    monkeypatch.setattr(gl, "_refuse_duplicate_posting", _sees_nothing)
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=orig_id,
+                    reverses_entry_id=orig_id, entry_date=date(2026, 6, 4))
+    assert exc.value.status_code == 409
+
+    await db.rollback()  # the failed flush killed the transaction; closing the session does this
+    assert await _chain_state(db) == before
+
+
+@pytest.mark.asyncio
+async def test_index_violation_on_a_duplicate_auto_post_is_a_409_not_a_500(db, monkeypatch):
+    accts = await _setup(db)
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    await db.commit()
+    before = await _chain_state(db)
+
+    monkeypatch.setattr(gl, "_refuse_duplicate_posting", _sees_nothing)
+    with pytest.raises(HTTPException) as exc:
+        await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    assert exc.value.status_code == 409
+
+    await db.rollback()
+    assert await _chain_state(db) == before
+
+
+def test_integrity_markers_come_from_the_model_indexes():
+    """No second copy of the index names: the translation reads them (and the
+    SQLite column spelling) off the Index objects the schema is built from."""
+    from app.models import GL_UQ_LIVE_SOURCE_INDEX, GL_UQ_REVERSAL_INDEX, GLJournalEntry
+
+    assert {GL_UQ_REVERSAL_INDEX, GL_UQ_LIVE_SOURCE_INDEX} <= GLJournalEntry.__table__.indexes
+    assert gl._violation_markers(GL_UQ_REVERSAL_INDEX) == (
+        GL_UQ_REVERSAL_INDEX.name,
+        "UNIQUE constraint failed: gl_journal_entries.reverses_entry_id",
+    )
+    assert gl._violation_markers(GL_UQ_LIVE_SOURCE_INDEX) == (
+        GL_UQ_LIVE_SOURCE_INDEX.name,
+        "UNIQUE constraint failed: gl_journal_entries.source_type, gl_journal_entries.source_id",
+    )
+
+
+def test_only_the_two_duplicate_posting_indexes_become_a_409():
+    """The suite runs on SQLite; production is Postgres, whose driver names the
+    violated index instead of its columns. Pin both spellings, and that any
+    other integrity failure is left to surface as the bug it is."""
+    def _err(msg):
+        return IntegrityError("INSERT INTO gl_journal_entries ...", {}, Exception(msg))
+
+    pg = "<class 'asyncpg.exceptions.UniqueViolationError'>: duplicate key value violates unique constraint "
+    assert "reversed" in gl._duplicate_posting_detail(_err(pg + '"uq_gl_entries_reverses_entry_id"'))
+    assert "this source" in gl._duplicate_posting_detail(_err(pg + '"uq_gl_entries_live_source"'))
+    assert "reversed" in gl._duplicate_posting_detail(
+        _err("UNIQUE constraint failed: gl_journal_entries.reverses_entry_id"))
+    assert "this source" in gl._duplicate_posting_detail(
+        _err("UNIQUE constraint failed: gl_journal_entries.source_type, gl_journal_entries.source_id"))
+
+    assert gl._duplicate_posting_detail(_err(pg + '"gl_journal_entries_entry_no_key"')) is None
+    assert gl._duplicate_posting_detail(_err("UNIQUE constraint failed: gl_journal_entries.entry_hash")) is None
+    assert gl._duplicate_posting_detail(_err("FOREIGN KEY constraint failed")) is None
+
+
+# ── The indexes must never refuse a legitimate posting ────────────────────────
+
+@pytest.mark.asyncio
+async def test_sources_that_legitimately_repeat_are_not_blocked(db):
+    accts = await _setup(db)
+    # Manual entries: source_id is a free-text reference the accountant may reuse.
+    await _post(db, accts, source_type=gl.SOURCE_MANUAL, source_id="ref-1")
+    await _post(db, accts, source_type=gl.SOURCE_MANUAL, source_id="ref-1")
+    # AR / AP / opening post with source_id NULL — many live entries per type.
+    for st in ("AR_INVOICE", "AR_RECEIPT", "VENDOR_BILL", "VENDOR_PAYMENT", gl.SOURCE_OPENING):
+        await _post(db, accts, source_type=st, source_id=None)
+        await _post(db, accts, source_type=st, source_id=None)
+    # Per-item partial refunds of ONE order: a distinct "<item>:<seq>" per event.
+    await _post(db, accts, source_type=glp.SOURCE_ORDER, source_id="order-1")
+    await _post(db, accts, source_type=glp.SOURCE_ORDER_REFUND, source_id="item-1:1")
+    await _post(db, accts, source_type=glp.SOURCE_ORDER_REFUND, source_id="item-1:2")
+    await _post(db, accts, source_type=glp.SOURCE_ORDER_REFUND, source_id="item-2:1")
+    # The same id under different source types never collides.
+    await _post(db, accts, source_type=glp.SOURCE_BUYBACK, source_id="shared-id")
+    await _post(db, accts, source_type=glp.SOURCE_MELT, source_id="shared-id")
+
+    assert (await _chain_state(db))[0] == 18
+
+
+@pytest.mark.asyncio
+async def test_year_close_entries_are_not_blocked(db):
+    """YEAR_CLOSE posts with source_id NULL into a CLOSED December
+    (allow_closed_period). Neither index may get in the way — including where a
+    ledger already holds a reversed close and the year is closed again."""
+    accts = await _setup(db, months=(6,))
+    db.add(GLPeriod(year=2026, period_no=12, status=PeriodStatus.CLOSED))
+    await db.flush()
+
+    first = await _post(db, accts, source_type="YEAR_CLOSE", source_id=None,
+                        entry_date=date(2026, 12, 31), allow_closed_period=True)
+    # A reversal of the close from before reverse_entry refused them.
+    await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=first.id,
+                reverses_entry_id=first.id, entry_date=date(2026, 6, 30))
+    second = await _post(db, accts, source_type="YEAR_CLOSE", source_id=None,
+                         entry_date=date(2026, 12, 31), allow_closed_period=True)
+    assert second.id != first.id and second.source_type == "YEAR_CLOSE"
+
+
+def test_live_source_index_covers_exactly_the_auto_post_sources():
+    """The index predicate is a literal list (an index cannot call Python). Pin
+    it to gl_postings' SOURCE_* constants so a new auto-post source cannot be
+    added without deciding whether it belongs in the index (and a migration)."""
+    from app.models import GL_UNIQUE_LIVE_SOURCE_TYPES
+
+    auto_post_sources = {v for k, v in vars(glp).items() if k.startswith("SOURCE_")}
+    assert set(GL_UNIQUE_LIVE_SOURCE_TYPES) == auto_post_sources
+
+
+# ── Auto-post path: full void/refund of an order whose sale is already reversed ─
+
+async def _sold_order(db):
+    from app.core.coa_seed import seed_chart_of_accounts
+    from app.models import Karat, Order, OrderItem, OrderItemKind, PaymentMethod, Settings
+    from tests.conftest import BOOK_DATETIME
+
+    await seed_chart_of_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    order = Order(
+        order_number="ORD-1", cashier_id="u1", payment_method=PaymentMethod.CASH,
+        subtotal=D("100"), vat_percent=D("11"), vat_amount=D("11"),
+        discount_percent=D("0"), discount_amount=D("0"),
+        total_usd=D("111"), total_lbp=D("9934500"), lbp_exchange_rate=D("89500"),
+        created_at=BOOK_DATETIME,
+    )
+    order.items = [OrderItem(
+        item_kind=OrderItemKind.COIN, product_code="C1", product_name="Coin", karat=Karat.K21,
+        weight_grams=D("10.000"), gold_rate_at_sale=D("60.00"), margin_percent=D("0"),
+        making_charge=D("0"), final_price=D("100"), quantity=1,
+    )]
+    db.add(order)
+    await db.flush()
+    cfg = Settings(id="singleton", accounting_auto_post_enabled=True, vat_percent=D("11"),
+                   lbp_exchange_rate=D("89500"))
+    sale = await glp.post_sale(db, order, cfg, "u1")
+    return order, cfg, sale
+
+
+@pytest.mark.asyncio
+async def test_second_full_void_of_an_order_is_skipped_not_double_reversed(db):
+    order, cfg, _ = await _sold_order(db)
+    assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is not None
+    before = await _chain_state(db)
+
+    # Same skip semantics as every other mapper: already done → nothing to post.
+    assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is None
+    assert await _chain_state(db) == before
+
+
+@pytest.mark.asyncio
+async def test_void_after_the_sale_entry_was_reversed_by_hand_skips_the_posting(db):
+    """An accountant reversed the sale entry from the journal; the order is
+    voided afterwards. The void must go through (stock comes back) and the books
+    must not be reversed a second time."""
+    order, cfg, sale = await _sold_order(db)
+    await gl.reverse_entry(db, original_entry_id=sale.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 20), memo="reversed by hand")
+    before = await _chain_state(db)
+
+    assert await glp.post_order_refund(db, order, cfg, "u1", refunded_item=None) is None
+    assert await _chain_state(db) == before
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CASH"]["net_base"] == D("0.00")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")
+
+
+@pytest.mark.asyncio
+async def test_item_refund_after_the_sale_entry_was_reversed_by_hand_skips_the_posting(db):
+    """Same rule for a per-item refund: the sale's entry is already reversed in
+    full, so a partial refund entry on top would take the accounts past zero."""
+    order, cfg, sale = await _sold_order(db)
+    await gl.reverse_entry(db, original_entry_id=sale.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 20), memo="reversed by hand")
+    before = await _chain_state(db)
+
+    posted = await glp.post_order_refund(
+        db, order, cfg, "u1", refunded_item=order.items[0],
+        refund_value=D("100"), refund_qty=1, refund_seq=1)
+    assert posted is None
+    assert await _chain_state(db) == before
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CASH"]["net_base"] == D("0.00")
+    assert accts["SALES_REVENUE"]["net_base"] == D("0.00")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")
