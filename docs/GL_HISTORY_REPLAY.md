@@ -42,9 +42,16 @@ dimension, and because the mappers are already idempotent per source document,
 so replaying is safe to repeat. The cost: it opens past periods (below), and it
 can only post what has a document (see "What it does not cover").
 
-**Do not also call `POST /api/accounting/opening-balances` after a replay.**
-That endpoint snapshots today's stock and supplier balances — the same gold the
-replay has just moved through purchases and sales would be counted twice.
+**The two are alternatives, never both.** An opening entry
+(`POST /api/accounting/opening-balances`) snapshots the stock on hand and the
+supplier balances — the net result of the very purchases, sales and payments a
+replay posts one by one. Either order counts everything twice:
+
+- **Opening entry first, replay second:** the replay refuses. If any `OPENING`
+  entry exists it aborts before posting anything and says why. Books that
+  started from an opening snapshot go forward with auto-posting only.
+- **Replay first, opening entry second:** nothing in the code stops this.
+  **Do not post opening balances after a replay.**
 
 ## What the replay does
 
@@ -113,6 +120,9 @@ Settle these with the accountant; the dry run counts them under "NOT replayed".
    every system account that is missing or inactive.
 4. `GET /api/accounting/ledger/verify` returns `empty` or `intact` with
    `head_matches: true`. The replay refuses to append to a broken chain.
+5. No opening-balance entry has been posted (Accounting → Journal, source
+   `OPENING`). If one has, the replay is the wrong tool — see the decision
+   above.
 
 ## 1. Dry run (the default — writes nothing)
 

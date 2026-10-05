@@ -470,6 +470,21 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
             "Refusing to append a backfill to a chain that is already broken."
         )
 
+    opening = (await db.execute(
+        select(GLJournalEntry.entry_no, GLJournalEntry.entry_date)
+        .where(GLJournalEntry.source_type == gl.SOURCE_OPENING)
+        .order_by(GLJournalEntry.entry_date, GLJournalEntry.entry_no)
+    )).first()
+    if opening is not None:
+        raise ReplayError(
+            f"These books were started from an opening-balance entry ({opening.entry_no}, "
+            f"dated {opening.entry_date}). An opening entry is a snapshot of the stock on hand "
+            "and of what suppliers are owed — the net result of the same purchases, sales and "
+            "payments this replay would post. Replaying history on top of it would double count "
+            "stock and payables, so nothing was posted. Books that start from an opening "
+            "snapshot go forward with auto-posting only."
+        )
+
     report.auto_post_enabled = (await db.execute(
         select(Settings.accounting_auto_post_enabled).where(Settings.id == "singleton")
     )).scalar_one_or_none()

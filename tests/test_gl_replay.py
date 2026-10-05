@@ -787,6 +787,34 @@ async def test_replay_refuses_a_chart_with_a_missing_or_inactive_system_account(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("execute", [False, True])
+async def test_replay_refuses_to_run_on_top_of_opening_balances(db, execute):
+    """An OPENING entry is a snapshot of stock on hand and supplier balances —
+    the net result of the same purchases, sales and payments the replay would
+    post. Doing both counts everything twice, so the replay stops up front."""
+    from app.core.coa_seed import post_opening_balances
+
+    await _base(db)
+    await _history(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    await db.flush()
+    opening = await post_opening_balances(db, as_of=date(2026, 6, 30), actor_user_id=ADMIN)
+    opening_no = opening.entry_no                # read now: the rollback expires the instance
+    await db.commit()
+    before = await _books(db)
+    assert before["entries"] == 1
+
+    with pytest.raises(gl_replay.ReplayError) as exc:
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=execute)
+
+    message = str(exc.value)
+    assert opening_no in message and "opening" in message.lower()
+    assert "double count" in message.lower()
+    assert "stock" in message.lower() and "payables" in message.lower()
+    assert await _books(db) == before            # aborted before posting anything
+
+
+@pytest.mark.asyncio
 async def test_replay_refuses_to_append_to_a_chain_that_does_not_verify(db):
     await _base(db)
     await _history(db)
