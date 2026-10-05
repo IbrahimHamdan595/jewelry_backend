@@ -83,6 +83,7 @@ from sqlalchemy import event
 from app.core.audit_chain import GENESIS_HASH
 from app.models import GLJournalEntry, GLJournalLine
 from tests.conftest import BOOK_DATETIME
+from tests.gl_replay_oracle import compute_trial_balance_replay
 
 _RAW_SEQ = [0]
 
@@ -227,7 +228,7 @@ async def test_trial_balance_sql_matches_python_replay(db):
 
     for as_of in _CUTOFFS:
         sql = await gl.compute_trial_balance(db, as_of=as_of)
-        replay = await gl.compute_trial_balance_replay(db, as_of=as_of)
+        replay = await compute_trial_balance_replay(db, as_of=as_of)
         assert _canon(sql) == _canon(replay), f"as_of={as_of}"
         assert [x["code"] for x in sql["accounts"]] == [x["code"] for x in replay["accounts"]]
         assert sql["balanced"] is True and sql["metal_balanced"] is True
@@ -263,7 +264,7 @@ async def test_trial_balance_sql_matches_replay_on_unvalidated_lines(db):
                     karat="K21")
 
     sql = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
-    replay = await gl.compute_trial_balance_replay(db, as_of=date(2026, 6, 30))
+    replay = await compute_trial_balance_replay(db, as_of=date(2026, 6, 30))
     assert _canon(sql) == _canon(replay)
     by_key = {x["system_key"]: x for x in sql["accounts"]}
     assert by_key["METAL_INVENTORY"]["metal_by_karat"] == {
@@ -307,7 +308,7 @@ async def test_trial_balance_xlsx_export_is_unchanged_by_sql_aggregation(db):
     a = await _setup_wide(db)
     await _post_wide_ledger(db, a)
     sql = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
-    replay = await gl.compute_trial_balance_replay(db, as_of=date(2026, 6, 30))
+    replay = await compute_trial_balance_replay(db, as_of=date(2026, 6, 30))
 
     def rows(tb):   # the karat order inside the metal cell is the only free choice
         return [[*r[:4], sorted(r[4].split(", "))] for r in _tb_sheets(tb)[0].rows]
