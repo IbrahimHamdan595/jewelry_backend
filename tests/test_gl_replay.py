@@ -28,7 +28,7 @@ from app.core import gl_postings, gl_replay
 from app.core.audit_chain import GENESIS_HASH, compute_ledger_entry_hash
 from app.core.coa_seed import seed_chart_of_accounts
 from app.core.gl import compute_trial_balance
-from app.core.ledger import EVENT_ORDER_ITEM_REFUND
+from app.core.ledger import EVENT_MELT, EVENT_ORDER_ITEM_REFUND
 from app.models import (
     AdjustmentReason, AdjustmentTarget, ARInvoice, ARInvoiceStatus, ARReceipt, BuybackKind,
     BuybackPriceMode, CoinType, Customer, DebtUnit, GLAccount, GLEntrySequence,
@@ -106,6 +106,20 @@ async def _ledger_at(db, when: datetime, *, event_type: str, ref_type: str, ref_
     head.latest_entry_hash = entry_hash
     head.row_count = head.row_count + 1
     await db.flush()
+
+
+async def _melt_event(db, when: datetime, *, lot_id: str, karat: str, grams: str, cost: str,
+                      product_id: str | None = None, buyback_id: str | None = None,
+                      karat_override: bool = False, weight_override: bool = False) -> None:
+    """The MELT ledger row melts.py writes: the RESULT karat/weight/cost plus
+    which of karat / weight the admin overrode."""
+    await _ledger_at(
+        db, when, event_type=EVENT_MELT,
+        ref_type="product" if product_id else "walkin_buyback",
+        ref_id=product_id or buyback_id,
+        payload={"lot_id": lot_id, "karat": karat, "weight_grams": grams,
+                 "cost_basis_usd": cost, "weight_override": weight_override,
+                 "karat_override": karat_override})
 
 
 async def _refund_line(db, order: Order, when: datetime, *, qty: int, record_event: bool = True) -> None:
@@ -846,6 +860,86 @@ async def test_replay_refuses_to_run_on_top_of_opening_balances(db, execute):
     assert "double count" in message.lower()
     assert "stock" in message.lower() and "payables" in message.lower()
     assert await _books(db) == before            # aborted before posting anything
+
+
+async def _close_year_2026(db) -> None:
+    """Post S1, close its month, then run the real year-end close: 2026 now
+    carries a YEAR_CLOSE entry (and 2027's twelve periods are opened)."""
+    from app.core import period_close
+
+    db.add(_sale("S1", _at(3, 10)))
+    await db.commit()
+    await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+    for period in (await db.execute(select(GLPeriod).where(GLPeriod.year == 2026))).scalars():
+        period.status = PeriodStatus.CLOSED
+    await period_close.close_year(db, year=2026, actor_user_id=ADMIN)
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execute", [False, True])
+async def test_replay_refuses_to_post_into_a_closed_fiscal_year(db, execute):
+    """Once a year is year-closed its result is in retained earnings. A document
+    dated in it must not be posted — and above all must not get a brand-new OPEN
+    month created for it inside the closed year (April has no period row here).
+    The replay aborts before keeping anything and lists every such document."""
+    await _base(db)
+    await _close_year_2026(db)
+    db.add(_sale("S2", _at(4, 15)))                             # 2026-04: no period row at all
+    db.add(WalkinBuyback(                                       # 2026-03: period exists, CLOSED
+        id="bb2", occurred_at=_at(3, 20), seller_name="Seller", seller_phone="1",
+        cashier_id=CASHIER, kind=BuybackKind.PURE_GOLD, weight_grams=D("10.000"),
+        karat=Karat.K21, buy_price_usd=D("500"), gold_rate_at_buy=D("60"),
+        price_mode=BuybackPriceMode.MANUAL))
+    db.add(_sale("S3", datetime(2027, 1, 10, 12)))              # open year — would be fine
+    await db.commit()
+    before = await _books(db)
+
+    with pytest.raises(gl_replay.ReplayError) as exc:
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=execute)
+
+    message = str(exc.value)
+    assert "2026" in message and "closed" in message.lower()
+    assert "order S2 (2026-04-15)" in message and "buyback bb2 (2026-03-20)" in message
+    assert "S3" not in message and "S1" not in message          # only the offending documents
+    assert await _books(db) == before                           # nothing kept…
+    assert (2026, 4, "OPEN") not in before["periods"]           # …and no month opened in 2026
+
+
+@pytest.mark.asyncio
+async def test_documents_that_post_nothing_do_not_block_the_replay_after_a_year_close(db):
+    """A melt that changed nothing and a purchase settled in full on the day
+    never get a GL entry, so they look "not yet posted" forever. They must not
+    turn every later run into a closed-year refusal."""
+    await _base(db)
+    db.add(Supplier(id="sup1", name="ACME"))
+    db.add(SupplierPurchase(                                    # 50 g due, 50 g paid: nothing owed
+        id="pur-settled", supplier_id="sup1", payment_mode=SupplierPurchaseMode.GOLD,
+        total_cash_due=D("0"), total_grams_due_by_karat={"K21": "50.000"},
+        cash_paid_at_creation=D("0"), grams_paid_at_creation_by_karat={"K21": "50.000"},
+        created_by_user_id=ADMIN, occurred_at=_at(3, 5)))
+    db.add(Product(id="p2", code="P-2", name_en="Bar", category="Bars", karat=Karat.K21,
+                   weight_grams=D("8.000"), margin_percent=D("0"), making_charge=D("0"),
+                   status=ProductStatus.MELTED, on_hand_qty=1))
+    db.add(GoldLot(id="lot-same", karat=Karat.K21, weight_grams=D("8.000"),
+                   weight_remaining_grams=D("8.000"), source=LotSource.MELT,
+                   source_ref_type="product", source_ref_id="p2",
+                   cost_basis_usd=D("0"), acquired_at=_at(3, 12)))
+    await db.flush()
+    await _melt_event(db, _at(3, 12), lot_id="lot-same", product_id="p2", karat="K21",
+                      grams="8.000", cost="0")
+    await db.commit()
+    await _close_year_2026(db)
+    db.add(_sale("S3", datetime(2027, 1, 10, 12)))
+    await db.commit()
+    periods_before = (await _books(db))["periods"]
+
+    report = await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    assert report.kinds[gl_replay.KIND_SALE].posted == 1                    # S3
+    assert report.kinds[gl_replay.KIND_SUPPLIER_PURCHASE].nothing_to_post == 1
+    assert report.kinds[gl_replay.KIND_MELT].nothing_to_post == 1
+    assert (await _books(db))["periods"] == periods_before                  # 2026 untouched
 
 
 @pytest.mark.asyncio

@@ -184,6 +184,16 @@ that nobody has reviewed.
 - Close them only once the replay is complete: a later run that has to post
   into a CLOSED period is refused, and rolls back.
 
+**A closed fiscal year is never touched.** If a year has been year-closed
+(Accounting → Periods → close year) and a document dated in that year is not in
+the GL yet, the replay aborts before keeping anything and lists every such
+document — it will not post into the year, and it will not open a new month
+inside it. Documents that never produce an entry (a melt that changed nothing,
+a purchase settled in full on the day) do not count. There is no way to replay
+into a closed year: the accountant settles those documents with an adjusting
+entry in the current year, and until they are gone from the list the replay
+stays refused. So: **replay first, close the year afterwards.**
+
 ## 4. Turning auto-posting on
 
 Settings → Accounting → "Post sales to the books automatically". Admin only;

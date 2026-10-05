@@ -462,6 +462,52 @@ async def _periods(db: AsyncSession) -> set[tuple[int, int]]:
     return {(y, m) for y, m in (await db.execute(select(GLPeriod.year, GLPeriod.period_no))).all()}
 
 
+async def _refuse_closed_years(db: AsyncSession, steps: list[_Step]) -> set[int]:
+    """Precheck: no document may land in a fiscal year that has been year-closed
+    (period_close.close_year — its result is already in retained earnings).
+    ensure_period would happily create a brand-new OPEN month inside such a
+    year, so this runs before anything is kept and lists EVERY offender.
+
+    A date alone is not enough: a melt that changed nothing, or a purchase
+    settled in full on the day, never gets an entry and would look "not yet
+    posted" on every run after the close. So each closed-year document the GL
+    does not hold is put through its mapper here: it offends if that posts an
+    entry, opens a period, or is refused (CLOSED period). When any does, the
+    caller's rollback discards whatever this probe wrote. Returns the closed
+    years among the documents' dates."""
+    closed: set[int] = set()
+    for year in sorted({step.booked_on.year for step in steps}):
+        if await period_close._year_already_closed(db, year):
+            closed.add(year)
+
+    offenders: list[str] = []
+    for step in steps:
+        if step.booked_on.year not in closed:
+            continue
+        try:
+            if await step.posted():
+                continue
+            periods = await _periods(db)
+            touched = await step.post() is not None or await _periods(db) != periods
+        except HTTPException:
+            touched = True  # refused by the CLOSED period — it did try to post
+        except Exception as exc:
+            raise step.failure(exc) from exc
+        if touched:
+            offenders.append(f"{step.ref} ({step.booked_on})")
+
+    if offenders:
+        years = ", ".join(str(y) for y in sorted(closed))
+        raise ReplayError(
+            f"{len(offenders)} document(s) not yet in the GL are dated in a fiscal year that "
+            f"has already been closed ({years}). Posting them would change a closed year, so "
+            "nothing was posted:\n  - " + "\n  - ".join(offenders) + "\n"
+            "The replay never posts into a closed year. Settle these with the accountant "
+            "(for example an adjusting entry in the current year)."
+        )
+    return closed
+
+
 # ── Entry points ──────────────────────────────────────────────────────────────
 
 async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayReport:
@@ -509,6 +555,7 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
     steps += await _document_steps(db, actor_user_id, report.warnings)
     # Original chronological order, so entry dates rise along the hash chain.
     steps.sort(key=lambda s: (_utc(s.when), _RANK[s.kind]))
+    closed_years = await _refuse_closed_years(db, steps)
 
     entry_dates: list[date] = []
     for step in steps:
@@ -527,6 +574,10 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
             )).scalars().all())
             if step.after is not None:
                 await step.after(entry, lines)
+            if entry.entry_date.year in closed_years:
+                # Cannot happen after the precheck unless a step only became
+                # postable during this run; either way a closed year stays closed.
+                raise ReplayError(f"its entry would be dated in closed fiscal year {entry.entry_date.year}.")
         except Exception as exc:
             # Whatever went wrong, the operator needs to know on WHICH document.
             raise step.failure(exc) from exc
@@ -542,6 +593,8 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
     if entry_dates:
         report.first_entry_date, report.last_entry_date = min(entry_dates), max(entry_dates)
     created = await _periods(db) - periods_before
+    if any(year in closed_years for year, _ in created):
+        raise ReplayError("A period was opened inside a closed fiscal year — nothing kept.")
     report.periods_created = sorted(f"{y}-{m:02d}" for y, m in created)
     report.periods_reused = sorted({_month(d) for d in entry_dates} - set(report.periods_created))
     report.not_replayed = await _not_replayed(db)
