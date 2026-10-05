@@ -2,8 +2,17 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# The only ENVIRONMENT values that count as "not production". Everything else —
+# unset, "production", a typo like "prod" — is production (NEX-47).
+_LOCAL_ENVIRONMENTS = {"development", "dev", "local", "test"}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # Deliberately defaults to production: a deploy that forgets the variable
+    # gets the locked-down behaviour. Set ENVIRONMENT=development locally.
+    environment: str = "production"
 
     database_url: str
     jwt_secret: str
@@ -27,6 +36,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.cors_origins_raw.split(",") if o.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() not in _LOCAL_ENVIRONMENTS
     gold_api_key: str = ""
     gold_api_url: str = "https://www.goldapi.io/api/XAU/USD"
     gold_refresh_minutes: int = 15

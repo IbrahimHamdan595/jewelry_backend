@@ -30,10 +30,17 @@ async def lifespan(app: FastAPI):
 
 
 origins = settings.cors_origins
+# NEX-47: /docs, /redoc and /openapi.json publish the whole API surface to
+# anyone, logged in or not, so they are only mounted outside production.
+# ENVIRONMENT defaults to production — see app/config.py.
+docs_enabled = not settings.is_production
 app = FastAPI(
     title="Fawaz El Namel API",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if docs_enabled else None,
+    redoc_url="/redoc" if docs_enabled else None,
+    openapi_url="/openapi.json" if docs_enabled else None,
 )
 
 app.state.limiter = limiter
@@ -46,6 +53,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    """Liveness probe for the container HEALTHCHECK / the platform.
+
+    Deliberately shallow: no database, no upstream call. A probe that waits
+    on the database turns one slow query into "unhealthy", a restart, and
+    the same slow query again. This only says the process is serving HTTP.
+    """
+    return {"status": "ok"}
+
 
 for r in (
     auth.router,

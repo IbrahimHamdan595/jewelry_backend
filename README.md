@@ -34,8 +34,14 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
 - **APScheduler** for the gold-rate poller (runs every N minutes, alerts
   via Discord webhook after N consecutive failures).
 - **JWT auth** via `python-jose`, HttpOnly cookie set by the backend on
-  login; bcrypt for password hashing; SlowAPI rate-limit on login
-  (5/min/IP).
+  login; bcrypt for password hashing. Login is throttled twice: SlowAPI
+  rate-limit (5/min per client IP, taken from `X-Forwarded-For`) and a
+  per-account lockout (10 consecutive failures in 15 min lock that email
+  for 15 min, derived from the auth audit log). The lockout cuts both ways:
+  it stops a guess spread over many addresses, and it lets anyone who knows
+  an email keep its owner out for 15 minutes at a time. An admin lifts a
+  lock at once with `POST /api/staff/{id}/unlock` (audited as
+  `ACCOUNT_UNLOCKED`).
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
@@ -70,6 +76,11 @@ Create a `.env` file in `jewelry_backend/`. The full schema lives in
 [`app/config.py`](app/config.py); the practical minimum is:
 
 ```ini
+# Environment — unset means "production", which is what hides /docs, /redoc
+# and /openapi.json (NEX-47). Set development on your own machine to get the
+# interactive docs back. Never set this on Render.
+ENVIRONMENT=development
+
 # Database
 DATABASE_URL="postgresql+asyncpg://user:pass@host/dbname?ssl=require"
 
@@ -165,7 +176,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 - API: http://localhost:8000
-- Interactive docs: http://localhost:8000/docs
+- Interactive docs: http://localhost:8000/docs — only with
+  `ENVIRONMENT=development` in your `.env`. In production (the default) `/docs`,
+  `/redoc` and `/openapi.json` return 404.
 
 ## Run with Docker
 
@@ -173,6 +186,11 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 docker build -t fawaz-el-namel-backend .
 docker run --rm -p 8000:8000 --env-file .env fawaz-el-namel-backend
 ```
+
+The image runs as an unprivileged user and listens on `$PORT` (8000 when
+unset). Its `HEALTHCHECK` polls `GET /health`, which only reports that the
+process is serving — it never touches the database, so a slow query cannot
+restart the container.
 
 ---
 
@@ -243,7 +261,7 @@ jewelry_backend/
 │   │   ├── products.py
 │   │   ├── reports.py          # dashboard aggregates
 │   │   ├── settings.py
-│   │   ├── staff.py            # cashier user management (audited)
+│   │   ├── staff.py            # cashier user management (audited) + lockout unlock
 │   │   ├── stock_takes.py      # physical-count workflow (audit B2)
 │   │   ├── suppliers.py        # suppliers + purchases + payments
 │   │   └── zakat.py            # live computation + snapshots
@@ -255,10 +273,11 @@ jewelry_backend/
 │   │   ├── cloudflare.py       # R2 image upload
 │   │   ├── gold_api.py         # rate fetcher + override/history reader
 │   │   ├── ledger.py           # record() + field_diff() + event types
+│   │   ├── login_lockout.py    # per-account lockout, derived from auth_audit_log
 │   │   ├── notify.py           # Discord webhook
 │   │   ├── permissions.py      # require_admin
 │   │   ├── pricing.py          # KARAT_PURITY, calculate_price, etc.
-│   │   ├── rate_limit.py       # SlowAPI limiter (login)
+│   │   ├── rate_limit.py       # SlowAPI limiter (login), keyed on the client IP
 │   │   ├── security.py         # JWT + bcrypt
 │   │   ├── stock_take.py       # StockTakeRefType → AdjustmentTarget mapping
 │   │   └── zakat.py            # holdings aggregator + integrity hash
@@ -301,6 +320,10 @@ jewelry_backend/
 - **Start command:** `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
   (Render injects `$PORT` — do not hardcode.)
 - **Python:** pinned via `runtime.txt`.
+- **Health check path:** `/health` (no auth, no database access).
+- **API docs:** leave `ENVIRONMENT` unset (or `production`). Any value other
+  than `development` / `dev` / `local` / `test` keeps `/docs`, `/redoc` and
+  `/openapi.json` at 404.
 - **CORS:** set `CORS_ORIGINS` to the exact frontend Render URL.
 - **Cookies:** in production, set `COOKIE_SECURE=true` and
   `COOKIE_SAMESITE=none` since the frontend is on a different subdomain.
