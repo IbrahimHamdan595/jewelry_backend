@@ -5,6 +5,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from app.core.money import Money
+
 
 class UnitTypeCreate(BaseModel):
     # Optional: when omitted, the router auto-generates FN-COIN/OZ-{karat}-NNNN.
@@ -63,7 +65,7 @@ class UnitTypeListOut(BaseModel):
 class UnitPriceOut(BaseModel):
     type_id: str
     code: str
-    gold_rate_24k: float
+    gold_rate_24k: Money
     effective_rate: Decimal
     metal_value: Decimal
     margin_amount: Decimal

@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
+from app.core.money import Money
 from app.schemas.gold_rate import StaleRateAck
 
 
@@ -120,5 +121,5 @@ class ItemRefundRequest(BaseModel):
 class OrderListOut(BaseModel):
     items: list[OrderSummaryOut]
     total: int
-    total_revenue: Decimal
-    avg_order_value: Decimal
+    total_revenue: Money
+    avg_order_value: Money

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
 from app.core.daterange import BEIRUT_TZ, day_range
+from app.core.money import money
 from app.models import Order, OrderItem, OrderStatus
 
 ZERO = Decimal("0")
@@ -161,7 +162,9 @@ async def inventory_valuation(db: AsyncSession, *, rate_24k: Decimal | None) -> 
     """Total on-hand inventory value in USD at the live 24K rate (market method).
     Coins/ounces have no cost basis, so everything is valued at market; products
     use their cost_basis_usd when present, else the market proxy."""
-    r = Decimal(rate_24k) if rate_24k is not None else ZERO
+    # The rate arrives as a float (gold_api): read it through its exact text.
+    # Decimal(84.31) is 84.31000000000000227…, enough to tip a half-cent tie.
+    r = Decimal(str(rate_24k)) if rate_24k is not None else ZERO
     lots = (await db.execute(select(GoldLot).where(GoldLot.is_depleted.is_(False)))).scalars().all()
     pure = sum((l.weight_remaining_grams * KARAT_PURITY[l.karat] * r for l in lots), ZERO)
     coins = (await db.execute(select(CoinType).where(CoinType.is_active.is_(True)))).scalars().all()
@@ -247,15 +250,16 @@ async def gl_has_entries(db: AsyncSession) -> bool:
 async def receivables(db: AsyncSession, *, as_of: date) -> dict:
     a = await ar_core.compute_aging(db, as_of=as_of)
     t = a["totals"]
-    return {"total": float(a["grand_total"]), "b0_30": float(t["0_30"]), "b31_60": float(t["31_60"]),
-            "b61_90": float(t["61_90"]), "b90_plus": float(t["90_plus"])}
+    return {"total": money(a["grand_total"]), "b0_30": money(t["0_30"]), "b31_60": money(t["31_60"]),
+            "b61_90": money(t["61_90"]), "b90_plus": money(t["90_plus"])}
 
 
 async def payables_aging(db: AsyncSession, *, as_of: date) -> dict:
     a = await ap_core.compute_ap_aging(db, as_of=as_of)
     c = a["cash_buckets"]
-    return {"cash_total": float(a["cash_total"]), "b0_30": float(c["0_30"]), "b31_60": float(c["31_60"]),
-            "b61_90": float(c["61_90"]), "b90_plus": float(c["90_plus"]),
+    return {"cash_total": money(a["cash_total"]), "b0_30": money(c["0_30"]), "b31_60": money(c["31_60"]),
+            "b61_90": money(c["61_90"]), "b90_plus": money(c["90_plus"]),
+            # grams, not money: stays a number
             "metal_owed_by_karat": {k: float(v) for k, v in a["metal_owed_by_karat"].items()}}
 
 
@@ -276,7 +280,7 @@ async def vat_position(db: AsyncSession, today: date) -> dict:
     from app.core import tax as tax_core
     q = (today.month - 1) // 3 + 1
     vr = await tax_core.compute_vat_return(db, year=today.year, quarter=q)
-    return {"net_payable": float(vr["net_payable"]), "direction": vr["direction"],
+    return {"net_payable": money(vr["net_payable"]), "direction": vr["direction"],
             "period_label": f"Q{q} {today.year}"}
 
 

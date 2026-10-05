@@ -20,6 +20,7 @@ from app.core.ledger import (
     EVENT_SALE_PRODUCT,
     record,
 )
+from app.core.money import money
 from app.core.permissions import require_admin
 from app.core.daterange import parse_calendar_filter
 from app.core.pricing import calculate_price, calculate_unit_price, generate_order_number
@@ -466,10 +467,10 @@ async def export_orders(
                 o.created_at.isoformat(),
                 o.cashier.name,
                 len(o.items),
-                float(o.subtotal),
-                float(o.vat_amount),
-                float(o.total_usd),
-                float(o.total_lbp),
+                money(o.subtotal),
+                money(o.vat_amount),
+                money(o.total_usd),
+                money(o.total_lbp),
                 o.payment_method.value,
                 o.status.value,
             ])

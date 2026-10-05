@@ -124,6 +124,11 @@ async def get_current_gold_rate(db: AsyncSession) -> dict:
     closed_threshold = max(stale_threshold * 2, (settings.gold_alert_failure_threshold or 3) * refresh_min * 60)
     return {
         "rate": float(latest.rate_24k),
+        # The karats as stored with this rate (None on rows from before per-karat
+        # storage). Absent for an override, which has none.
+        "rate_22k": latest.rate_22k,
+        "rate_21k": latest.rate_21k,
+        "rate_18k": latest.rate_18k,
         "source": "live",
         "fetched_at": latest.fetched_at,
         "is_stale": age_seconds > stale_threshold,
