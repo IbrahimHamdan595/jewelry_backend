@@ -1,13 +1,17 @@
 name: CI
 
 on:
+  # Pushes to main only: a branch with an open pull request would otherwise run
+  # the matrix twice per push (once per event).
   push:
+    branches: [main]
   pull_request:
 
-# One live run per ref: a newer push cancels the run it supersedes.
+# One live run per ref. A newer push to a pull request cancels the run it
+# supersedes; runs on main are never cancelled, so every merge keeps its result.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
