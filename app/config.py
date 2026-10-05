@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = ""
     r2_public_url: str = ""
+    # Dashboard fan-out (NEX-53): DB sessions one load may hold at once, and all
+    # loads in the process together. Keep the second well under the pool size.
+    dashboard_max_concurrency: int = Field(default=4, ge=1)
+    dashboard_max_sessions: int = Field(default=6, ge=1)
     discord_webhook_url: str = ""
     discord_alert_user_id: str = ""
     gold_alert_failure_threshold: int = 3

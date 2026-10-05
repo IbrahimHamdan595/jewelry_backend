@@ -6,7 +6,6 @@ each unit is independently testable. Windows are Beirut-local calendar days
 (see app/core/daterange).
 """
 import asyncio
-import os
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -15,6 +14,7 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import settings
 from app.core.daterange import BEIRUT_TZ, day_range
 from app.models import Order, OrderItem, OrderStatus
 
@@ -31,18 +31,27 @@ def week_window(today: date) -> tuple[datetime, datetime]:
 
 
 # ── Concurrent fan-out (NEX-53) ───────────────────────────────────────────────
+# Two limits, both in Settings:
+#   dashboard_max_concurrency — lanes (sessions) ONE load runs at a time;
+#   dashboard_max_sessions    — lane sessions ALL loads in this process hold
+#                               together. Simultaneous loads queue for lanes
+#                               here instead of draining the connection pool
+#                               (5 + 10 overflow) from under the till.
 
-def _max_concurrency() -> int:
-    """Most DB sessions (= pooled connections) one dashboard load holds at once.
-
-    Default 4: with the request's own auth session that is the engine's default
-    pool_size of 5, so a load stays out of overflow connections — raise
-    pool_size before raising this. Set DASHBOARD_MAX_CONCURRENCY in the process
-    environment (not .env: Settings rejects keys it does not declare)."""
-    return max(1, int(os.environ.get("DASHBOARD_MAX_CONCURRENCY", "4")))
+_lane_gate: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 
 
-MAX_CONCURRENCY = _max_concurrency()
+def lane_gate() -> asyncio.Semaphore:
+    """The process-wide cap on dashboard lane sessions, shared by every load.
+
+    Created on first use and kept per event loop, because an asyncio.Semaphore
+    belongs to the loop it first waits on; the app runs one loop, so in practice
+    this is a single gate for the life of the process."""
+    global _lane_gate
+    loop = asyncio.get_running_loop()
+    if _lane_gate is None or _lane_gate[0] is not loop:
+        _lane_gate = (loop, asyncio.Semaphore(settings.dashboard_max_sessions))
+    return _lane_gate[1]
 
 
 @dataclass(frozen=True)
@@ -72,7 +81,7 @@ def windows(now: datetime) -> Windows:
 
 
 async def run_sections(session_factory: async_sessionmaker[AsyncSession], sections, w: Windows,
-                       *, max_concurrency: int) -> list:
+                       *, max_concurrency: int, gate: asyncio.Semaphore) -> list:
     """Run every `section(db, w)` and return the results in `sections` order.
 
     At most `max_concurrency` lanes run at once. Each lane opens ONE session and
@@ -80,16 +89,24 @@ async def run_sections(session_factory: async_sessionmaker[AsyncSession], sectio
     shared between concurrent tasks and a load checks out no more connections
     than it has lanes. Read-only — a lane never commits.
 
+    A lane takes a slot from `gate` before it opens its session and holds it
+    until the session is closed, so every load sharing that gate is bounded
+    together; a lane that had to queue for its slot opens nothing if the work
+    is already done.
+
     The first section to raise fails the whole call (no partial results); the
     other lanes are cancelled and awaited so no query outlives the request."""
     results: list = [None] * len(sections)
     pending = deque(enumerate(sections))
 
     async def lane() -> None:
-        async with session_factory() as db:
-            while pending:
-                i, section = pending.popleft()
-                results[i] = await section(db, w)
+        async with gate:
+            if not pending:
+                return
+            async with session_factory() as db:
+                while pending:
+                    i, section = pending.popleft()
+                    results[i] = await section(db, w)
 
     lanes = [asyncio.ensure_future(lane()) for _ in range(min(max_concurrency, len(sections)))]
     try:

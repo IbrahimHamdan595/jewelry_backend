@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -6,11 +7,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.core import dashboard as dash
 from app.core.daterange import day_range
 from app.core.gold_api import get_current_gold_rate
 from app.core.permissions import require_admin
-from app.deps import get_current_user, get_session_factory
+from app.deps import get_current_user, get_db, get_session_factory
 from app.models import (
     CoinType,
     DebtUnit,
@@ -356,14 +358,22 @@ _PAYLOAD_KEYS = (
 
 async def build_dashboard(
     session_factory: async_sessionmaker[AsyncSession], *, now: datetime,
-    max_concurrency: int = dash.MAX_CONCURRENCY,
+    max_concurrency: int | None = None, gate: asyncio.Semaphore | None = None,
 ) -> dict:
     """Assemble the dashboard payload as of `now`, running the sections
     concurrently on their own sessions. `now` is the load's only clock read:
-    every window is derived from it once and shared by all sections."""
+    every window is derived from it once and shared by all sections.
+
+    `max_concurrency` (default settings.dashboard_max_concurrency) bounds this
+    load; `gate` (default the process-wide dash.lane_gate()) bounds all loads."""
     w = dash.windows(now)
     parts: dict = {}
-    for part in await dash.run_sections(session_factory, _SECTIONS, w, max_concurrency=max_concurrency):
+    if max_concurrency is None:
+        max_concurrency = settings.dashboard_max_concurrency
+    if gate is None:
+        gate = dash.lane_gate()
+    for part in await dash.run_sections(session_factory, _SECTIONS, w,
+                                        max_concurrency=max_concurrency, gate=gate):
         parts.update(part)
     return {key: parts[key] for key in _PAYLOAD_KEYS}
 
@@ -375,8 +385,13 @@ def utc_now() -> datetime:
 
 @router.get("/dashboard")
 async def dashboard(
+    db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
     now: datetime = Depends(utc_now),
 ):
+    # The request session has done its job (auth) but would keep its connection
+    # until the response is sent. Hand it back first: a load, including one
+    # queued for lanes, then holds lane connections only, and those are capped.
+    await db.close()
     return await build_dashboard(session_factory, now=now)

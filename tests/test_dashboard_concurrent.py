@@ -353,15 +353,15 @@ async def _seed_shop(db):
     await post(date(2026, 6, 14), [_dr(bank, D("300.00")), _cr(cash, D("300.00"))])
 
 
-async def _engine_with_schema(path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path}", echo=False)
+async def _engine_with_schema(path, **engine_kwargs):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path}", echo=False, **engine_kwargs)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     return engine
 
 
-async def _make_shop(path, seed):
-    engine = await _engine_with_schema(path)
+async def _make_shop(path, seed, **engine_kwargs):
+    engine = await _engine_with_schema(path, **engine_kwargs)
     tracker = _Tracker()
     sessions = _tracked_sessions(engine, tracker)
     async with sessions() as db:
@@ -547,19 +547,133 @@ async def test_fan_out_is_bounded_and_never_shares_a_session(shop, limit):
 
 @pytest.mark.asyncio
 async def test_fan_out_never_opens_more_sessions_than_sections(shop):
-    await reports.build_dashboard(shop.sessions, now=NOW, max_concurrency=1000)
+    await reports.build_dashboard(shop.sessions, now=NOW, max_concurrency=1000,
+                                  gate=asyncio.Semaphore(1000))
     assert shop.tracker.peak == shop.tracker.opened == len(reports._SECTIONS)
 
 
-def test_concurrency_limit_is_configurable_and_defaults_inside_the_pool(monkeypatch):
-    # 4 fan-out sessions + the request's own auth session = SQLAlchemy's default
-    # pool_size of 5, so a dashboard load never spills into overflow connections.
-    monkeypatch.delenv("DASHBOARD_MAX_CONCURRENCY", raising=False)
-    assert dash._max_concurrency() == 4
-    monkeypatch.setenv("DASHBOARD_MAX_CONCURRENCY", "2")
-    assert dash._max_concurrency() == 2
-    monkeypatch.setenv("DASHBOARD_MAX_CONCURRENCY", "0")     # never below one lane
-    assert dash._max_concurrency() == 1
+def test_both_limits_are_settings_with_pool_safe_defaults():
+    from app.config import Settings, settings
+
+    # Per load: 4 lanes. Across all loads in the process: 6 sessions, well inside
+    # the engine's 5 + 10 overflow, so the till always finds a free connection.
+    assert (settings.dashboard_max_concurrency, settings.dashboard_max_sessions) == (4, 6)
+
+    tuned = Settings(_env_file=None, database_url="sqlite+aiosqlite:///:memory:", jwt_secret="x",
+                     dashboard_max_concurrency=2, dashboard_max_sessions=3)
+    assert (tuned.dashboard_max_concurrency, tuned.dashboard_max_sessions) == (2, 3)
+    for bad in ({"dashboard_max_concurrency": 0}, {"dashboard_max_sessions": 0}):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, database_url="sqlite+aiosqlite:///:memory:", jwt_secret="x", **bad)
+
+
+def test_settings_accept_the_knobs_from_a_dotenv_file(tmp_path):
+    """Declared fields, so a .env that sets them no longer breaks startup."""
+    from app.config import Settings
+
+    env = tmp_path / ".env"
+    env.write_text("DATABASE_URL=sqlite+aiosqlite:///:memory:\nJWT_SECRET=x\n"
+                   "DASHBOARD_MAX_CONCURRENCY=3\nDASHBOARD_MAX_SESSIONS=5\n")
+    loaded = Settings(_env_file=str(env))
+    assert (loaded.dashboard_max_concurrency, loaded.dashboard_max_sessions) == (3, 5)
+
+
+@pytest.mark.asyncio
+async def test_default_load_uses_the_configured_lane_count(shop, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "dashboard_max_concurrency", 2)
+    await reports.build_dashboard(shop.sessions, now=NOW)
+    assert shop.tracker.peak == shop.tracker.opened == 2
+
+
+# ── process-wide cap: simultaneous loads queue for lanes ──────────────────────
+
+@pytest.mark.asyncio
+async def test_process_gate_is_shared_and_sized_from_settings(monkeypatch):
+    from app.config import settings
+
+    gate = dash.lane_gate()
+    assert dash.lane_gate() is gate                       # one gate for every load on this loop
+    for _ in range(settings.dashboard_max_sessions):      # exactly dashboard_max_sessions slots
+        assert not gate.locked()
+        await gate.acquire()
+    assert gate.locked()
+    for _ in range(settings.dashboard_max_sessions):
+        gate.release()
+
+    monkeypatch.setattr(dash, "_lane_gate", None)         # as in a fresh process
+    monkeypatch.setattr(settings, "dashboard_max_sessions", 1)
+    fresh = dash.lane_gate()
+    await fresh.acquire()
+    assert fresh.locked()
+    fresh.release()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_loads_never_hold_more_than_the_cap(tmp_path):
+    """Five loads at once, four lanes each, capped at three sessions between
+    them — on a pool with exactly one connection to spare. The spare one is the
+    till's: a non-dashboard request must get it at any moment."""
+    cap, loads = 3, 5
+    env = await _make_shop(tmp_path / "busy.db", _seed_shop,
+                           pool_size=cap + 1, max_overflow=0, pool_timeout=3)
+    try:
+        expected = _body(await _oracle(env))
+        env.tracker.reset()
+        gate = asyncio.Semaphore(cap)
+        elsewhere = async_sessionmaker(env.engine, expire_on_commit=False)
+        finished = asyncio.Event()
+        lanes_open, connections_out = [], []
+
+        async def checkout_at_the_till():
+            while not finished.is_set():
+                async with elsewhere() as db:              # raises if the pool is drained
+                    await db.execute(select(User.id).limit(1))
+                    lanes_open.append(env.tracker.open)
+                    connections_out.append(env.engine.pool.checkedout())
+                await asyncio.sleep(0)
+
+        till = asyncio.ensure_future(checkout_at_the_till())
+        payloads = await asyncio.wait_for(asyncio.gather(*(
+            reports.build_dashboard(env.sessions, now=NOW, max_concurrency=4, gate=gate)
+            for _ in range(loads))), timeout=60)
+        finished.set()
+        await till
+
+        assert [_body(p) for p in payloads] == [expected] * loads
+        assert env.tracker.peak == cap                     # saturated, never exceeded
+        assert env.tracker.overlaps == 0 and env.tracker.open == 0
+        assert cap in lanes_open                           # the till got through at full load
+        assert max(connections_out) <= cap + 1             # lanes + the till's own connection
+        assert not gate.locked()                           # every slot handed back
+    finally:
+        await env.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_lane_that_queued_past_the_work_opens_no_session(shop):
+    # One slot: the first lane does everything; the others find nothing left.
+    await reports.build_dashboard(shop.sessions, now=NOW, max_concurrency=4, gate=asyncio.Semaphore(1))
+    assert shop.tracker.opened == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_load_returns_its_slots(shop, monkeypatch):
+    gate = asyncio.Semaphore(2)
+    real = dash.loss_prevention
+
+    async def boom(db, start, end):
+        raise RuntimeError("ledger unavailable")
+
+    monkeypatch.setattr(dash, "loss_prevention", boom)
+    with pytest.raises(RuntimeError):
+        await reports.build_dashboard(shop.sessions, now=NOW, max_concurrency=4, gate=gate)
+    assert not gate.locked() and shop.tracker.open == 0
+
+    monkeypatch.setattr(dash, "loss_prevention", real)
+    await asyncio.wait_for(                                # would hang on a leaked slot
+        reports.build_dashboard(shop.sessions, now=NOW, max_concurrency=4, gate=gate), timeout=30)
 
 
 @pytest.mark.asyncio
@@ -706,8 +820,58 @@ async def test_endpoint_serves_the_concurrent_payload(client, shop):
 
     assert r.status_code == 200
     assert r.content == expected
-    assert shop.tracker.opened == dash.MAX_CONCURRENCY      # fanned out, not sequential
-    assert shop.tracker.peak == dash.MAX_CONCURRENCY
+    assert shop.tracker.opened == 4                         # fanned out, not sequential
+    assert shop.tracker.peak == 4
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_requests_share_the_process_cap(client, shop):
+    expected = _body(await _oracle(shop))
+    shop.tracker.reset()
+
+    responses = await asyncio.wait_for(
+        asyncio.gather(*(client.get("/api/reports/dashboard") for _ in range(4))), timeout=60)
+
+    assert [r.status_code for r in responses] == [200] * 4
+    assert all(r.content == expected for r in responses)
+    assert shop.tracker.peak == 6                          # 4 loads × 4 lanes, held to the cap
+    assert shop.tracker.open == 0
+
+
+@pytest.mark.asyncio
+async def test_endpoint_hands_back_the_request_connection_before_fanning_out(client, shop, monkeypatch):
+    """Auth runs on the request's own session, which then holds a connection
+    until the response is sent. The dashboard has no further use for it, so it
+    must not sit idle behind the lanes (or behind a load queued for lanes)."""
+    from fastapi import Depends
+
+    from app.deps import get_current_user, get_db
+    from app.main import app
+
+    plain = async_sessionmaker(shop.engine, expire_on_commit=False)
+
+    async def _request_session():
+        async with plain() as db:
+            yield db
+
+    async def _authenticate(db: AsyncSession = Depends(get_db)):     # as deps.get_current_user does
+        return (await db.execute(select(User).where(User.id == "u1"))).scalar_one()
+
+    out = []
+    real = dash.loss_prevention
+
+    async def spy(db, start, end):
+        out.append(shop.engine.pool.checkedout())
+        return await real(db, start, end)
+
+    app.dependency_overrides[get_db] = _request_session
+    app.dependency_overrides[get_current_user] = _authenticate
+    monkeypatch.setattr(dash, "loss_prevention", spy)
+    r = await client.get("/api/reports/dashboard")
+
+    assert r.status_code == 200
+    assert r.content == _body(await _oracle(shop))
+    assert out and max(out) <= 4                           # lanes only: no fifth, idle connection
 
 
 @pytest.mark.asyncio

@@ -113,6 +113,13 @@ DISCORD_ALERT_USER_ID="..."
 
 # Auth audit (default 540 days = 18 months)
 AUTH_AUDIT_RETENTION_DAYS=540
+
+# Dashboard (GET /api/reports/dashboard) — DB sessions it may hold at once.
+# One load runs up to MAX_CONCURRENCY queries in parallel; all loads in the
+# process share MAX_SESSIONS and queue for them, so the dashboard can never
+# drain the connection pool (5 + 10 overflow). Defaults shown.
+DASHBOARD_MAX_CONCURRENCY=4
+DASHBOARD_MAX_SESSIONS=6
 ```
 
 **Never commit `.env`.** It's gitignored. In production (Render), inject
