@@ -101,6 +101,12 @@ async def update_staff(
         # the old password is signed out.
         await revoke_sessions(db, user)
     if body.is_active is not None:
+        if user.is_active and not body.is_active:
+            # NEX-54: deactivating ends the user's sessions for good. The
+            # is_active check in get_current_user already refuses them while
+            # the account is off, but without the bump their old tokens would
+            # start working again the moment the account is switched back on.
+            await revoke_sessions(db, user)
         user.is_active = body.is_active
 
     after = {
@@ -140,6 +146,9 @@ async def delete_staff(
     AUDIT: records STAFF_UPDATED (not a separate "deleted" event) because
     this IS just an update to is_active — the row stays. Idempotent on
     already-disabled users (no ledger row if nothing changed).
+
+    Also ends every session the user has, permanently: re-enabling the
+    account later does not bring old tokens back (NEX-54).
     """
     user = (await db.execute(select(User).where(User.id == user_id, User.role == Role.CASHIER))).scalar_one_or_none()
     if not user:
@@ -147,6 +156,9 @@ async def delete_staff(
 
     if user.is_active:
         user.is_active = False
+        # NEX-54: and their sessions stay dead if they are ever re-enabled
+        # (see update_staff).
+        await revoke_sessions(db, user)
         await db.flush()
         await record(
             db,

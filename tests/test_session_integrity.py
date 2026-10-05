@@ -248,6 +248,67 @@ async def test_staff_update_without_a_password_keeps_sessions(device, db):
     assert await _me(till) == 200
 
 
+# ── Deactivation ──────────────────────────────────────────────────────────────
+#
+# get_current_user has always refused an inactive user, so deactivating
+# someone ends their sessions on the spot. What it did not do is make that
+# permanent: the tokens were merely dormant, and switching the account back on
+# switched them back on too.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deactivate", ["delete", "patch"])
+async def test_reactivating_a_user_does_not_revive_their_old_tokens(device, deactivate):
+    """A cashier leaves on Friday and their phone is stolen over the weekend.
+    They are deactivated, then re-enabled on Monday: the token on the stolen
+    phone must stay dead."""
+    admin, stolen_phone = device(), device()
+    await _login(admin, OWNER)
+    stolen_token = await _login(stolen_phone, CASHIER)
+
+    if deactivate == "delete":
+        assert (await admin.delete("/api/staff/u-cashier")).status_code == 204
+    else:
+        assert (await admin.patch("/api/staff/u-cashier", json={"is_active": False})).status_code == 200
+    assert await _me(stolen_phone) == 401
+
+    assert (await admin.patch("/api/staff/u-cashier", json={"is_active": True})).status_code == 200
+
+    # Active again — and the old session, by cookie or by bearer token, is not.
+    assert await _me(stolen_phone) == 401
+    assert await _me(device(), stolen_token) == 401
+    # The person themselves simply signs in again.
+    await _login(device(), CASHIER)
+
+
+@pytest.mark.asyncio
+async def test_deactivating_an_already_inactive_user_does_not_bump_again(device, db):
+    """Only the transition ends sessions; repeating it is a no-op, as it
+    already was for the audit row."""
+    admin = device()
+    await _login(admin, OWNER)
+
+    assert (await admin.delete("/api/staff/u-cashier")).status_code == 204
+    assert (await admin.delete("/api/staff/u-cashier")).status_code == 204
+    assert (await admin.patch("/api/staff/u-cashier", json={"is_active": False})).status_code == 200
+    assert await _version(db, "u-cashier") == 1
+
+
+@pytest.mark.asyncio
+async def test_reactivating_does_not_itself_end_sessions(device, db):
+    """Switching an account ON is not a revocation: nothing to bump."""
+    admin = device()
+    await _login(admin, OWNER)
+    assert (await admin.delete("/api/staff/u-cashier")).status_code == 204
+    assert (await admin.patch("/api/staff/u-cashier", json={"is_active": True})).status_code == 200
+    assert await _version(db, "u-cashier") == 1
+
+    till = device()
+    await _login(till, CASHIER)
+    assert (await admin.patch("/api/staff/u-cashier", json={"is_active": True})).status_code == 200
+    assert await _version(db, "u-cashier") == 1
+    assert await _me(till) == 200
+
+
 # ── Audit ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

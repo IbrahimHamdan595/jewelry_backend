@@ -47,11 +47,12 @@ Paired with [`jewelry_frontend`](https://github.com/IbrahimHamdan595/jewelry_fro
   response nor its timing says which accounts exist.
 - **Sessions can be ended server-side.** Every token carries the user's
   `token_version` and `get_current_user` re-checks it on each request.
-  Changing a password (own, or an admin reset) and
+  Changing a password (own, or an admin reset), deactivating a user and
   `POST /api/staff/{id}/force-logout` bump it, which signs that user out
-  everywhere; the person changing their own password gets a fresh cookie in
-  the same response. Plain logout only drops the cookie on that device, so
-  shop tills sharing one account do not log each other out.
+  everywhere — and keeps them out: re-enabling a deactivated account does not
+  bring its old tokens back. The person changing their own password gets a
+  fresh cookie in the same response. Plain logout only drops the cookie on
+  that device, so shop tills sharing one account do not log each other out.
 - **Cloudflare R2** for product image uploads.
 - **Two hash chains** for audit integrity: one for inventory events, one
   for auth events. Each row contains
