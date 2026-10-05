@@ -83,13 +83,23 @@ def _rsa_keys() -> tuple[Key | None, Key | None]:
 
 
 def check_jwt_keys() -> None:
-    """Refuse to start with RSA keys that cannot work.
+    """Refuse to start with a JWT configuration that cannot work.
 
-    Called at import, so a bad key fails the deploy (the previous release
-    keeps serving) instead of surfacing as "nobody can log in": an unparsable
-    PEM, a public key pasted where the private one belongs, or a public key
-    that does not belong to the private key — which would make the backend
-    reject every token it issues. A no-op while no key is configured.
+    Called at import, so a bad configuration fails the deploy (the previous
+    release keeps serving) instead of surfacing as "nobody can log in". What
+    it guarantees is one property: a configuration that gets past here
+    accepts the tokens it issues. The ways to break that, each with its own
+    message:
+
+      • a key that is not a readable RSA PEM, or a public key pasted where
+        the private one belongs;
+      • a JWT_PUBLIC_KEY that does not belong to JWT_PRIVATE_KEY — the
+        backend would reject every token it signs;
+      • JWT_ACCEPT_HS256=false with no JWT_PRIVATE_KEY — with nothing to
+        sign RS256 the service falls back to JWT_SECRET, then refuses every
+        token it has just issued. That flag is the LAST step of the cutover;
+      • an empty JWT_SECRET while it is still what signs — an empty secret
+        verifies nothing (see decode_token).
 
     The messages name the variable and never include key material.
     """
@@ -100,6 +110,17 @@ def check_jwt_keys() -> None:
             "JWT_PRIVATE_KEY / JWT_PUBLIC_KEY is set but is not a readable RSA key in PEM format"
         ) from None
     if private is None:
+        # No RSA signing key: sessions are signed with JWT_SECRET.
+        if not settings.jwt_accept_hs256:
+            raise RuntimeError(
+                "JWT_ACCEPT_HS256 is false but JWT_PRIVATE_KEY is not set: sessions would be "
+                "signed with JWT_SECRET and then refused. Set JWT_PRIVATE_KEY, or leave "
+                "JWT_ACCEPT_HS256 true until it is."
+            )
+        if not settings.jwt_secret:
+            raise RuntimeError(
+                "JWT_SECRET is empty and JWT_PRIVATE_KEY is not set: there is nothing to sign sessions with"
+            )
         return
     try:
         probe = jwt.encode({"sub": "startup-self-check"}, private, algorithm=_RSA_ALGORITHM)

@@ -186,10 +186,16 @@ Both keys are PEM. Newlines may be real or written as the two characters `\n`.
 `JWT_ALGORITHM` is **not** how RS256 is selected — it only names the
 shared-secret algorithm; leave it alone on the backend.
 
-Merging this changes nothing until `JWT_PRIVATE_KEY` is set. If the keys are
-unusable (not PEM, public pasted as private, a public key that does not belong
-to the private one) the service refuses to start, so a bad key fails the deploy
-instead of breaking every login.
+Merging this changes nothing until `JWT_PRIVATE_KEY` is set. The service
+refuses to start on a configuration that could not accept its own tokens, so
+a mistake fails the deploy (the previous release keeps serving) instead of
+breaking every login:
+
+- a key that is not PEM, or a public key pasted as the private one;
+- a `JWT_PUBLIC_KEY` that does not belong to `JWT_PRIVATE_KEY`;
+- `JWT_ACCEPT_HS256=false` without a `JWT_PRIVATE_KEY` — sessions would be
+  signed with `JWT_SECRET` and then refused;
+- an empty `JWT_SECRET` while it is still what signs.
 
 **Generate a pair:**
 

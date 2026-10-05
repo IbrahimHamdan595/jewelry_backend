@@ -295,6 +295,63 @@ def test_startup_check_refuses_a_public_key_in_the_private_slot(monkeypatch, key
         security.check_jwt_keys()
 
 
+def test_startup_check_refuses_hs256_switched_off_with_no_private_key(monkeypatch):
+    """JWT_ACCEPT_HS256=false is the LAST step of the cutover. Set without a
+    private key, the service would sign every session with JWT_SECRET and
+    then refuse every one of them: logins "work" and nothing else does."""
+    monkeypatch.setattr(settings, "jwt_accept_hs256", False)
+    with pytest.raises(RuntimeError, match="JWT_ACCEPT_HS256") as excinfo:
+        security.check_jwt_keys()
+    assert "JWT_PRIVATE_KEY" in str(excinfo.value)
+
+    # That is not a hypothetical: this is what the configuration would do.
+    assert _rejected(create_access_token(subject="u-owner"))
+
+
+def test_startup_check_refuses_hs256_off_with_only_a_public_key(monkeypatch, keypair):
+    """A public key cannot sign, so this is the same dead end."""
+    monkeypatch.setattr(settings, "jwt_public_key", keypair[1])
+    monkeypatch.setattr(settings, "jwt_accept_hs256", False)
+    with pytest.raises(RuntimeError, match="JWT_ACCEPT_HS256"):
+        security.check_jwt_keys()
+
+
+def test_startup_check_accepts_hs256_off_once_a_private_key_signs(monkeypatch, rs256):
+    """The configuration the cutover ends on."""
+    monkeypatch.setattr(settings, "jwt_accept_hs256", False)
+    security.check_jwt_keys()
+    assert decode_token(create_access_token(subject="u-owner"))["sub"] == "u-owner"
+
+
+def test_startup_check_refuses_an_empty_secret_with_no_private_key(monkeypatch):
+    """An empty JWT_SECRET verifies nothing (see the forgery tests), so
+    signing with it is another way to issue tokens nobody accepts."""
+    monkeypatch.setattr(settings, "jwt_secret", "")
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        security.check_jwt_keys()
+
+
+def test_startup_check_allows_an_empty_secret_once_rs256_is_all_there_is(monkeypatch, rs256):
+    monkeypatch.setattr(settings, "jwt_secret", "")
+    monkeypatch.setattr(settings, "jwt_accept_hs256", False)
+    security.check_jwt_keys()
+
+
+@pytest.mark.parametrize("accept_hs256", [True, False])
+def test_whatever_the_startup_check_passes_can_use_its_own_tokens(monkeypatch, keypair, accept_hs256):
+    """The property the check exists for, stated once: a configuration it
+    lets through accepts the tokens it issues."""
+    for private, public in (("", ""), (keypair[0], ""), (keypair[0], keypair[1]), ("", keypair[1])):
+        monkeypatch.setattr(settings, "jwt_private_key", private)
+        monkeypatch.setattr(settings, "jwt_public_key", public)
+        monkeypatch.setattr(settings, "jwt_accept_hs256", accept_hs256)
+        try:
+            security.check_jwt_keys()
+        except RuntimeError:
+            continue
+        assert decode_token(create_access_token(subject="u-owner"))["sub"] == "u-owner"
+
+
 # ── End to end through the API ────────────────────────────────────────────────
 
 @pytest.fixture
