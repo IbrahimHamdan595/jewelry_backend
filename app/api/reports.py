@@ -300,16 +300,16 @@ async def _loss_prevention(db: AsyncSession, w: dash.Windows) -> dict:
     return {"loss_prevention": await dash.loss_prevention(db, w.week_start, w.week_end)}
 
 
-# Heaviest first: lanes pull sections in this order, so the long ones (AP aging
-# costs three round-trips per supplier) start immediately rather than queue.
+# Heaviest first (by round-trips): lanes pull sections in this order, so the
+# long ones start immediately and the short ones fill in behind them.
 _SECTIONS = (
-    _payables,
-    _revenue_chart,
     _inventory_pulse,
-    _money_pulse,
+    _revenue_chart,
     _gold_rate_and_valuation,
+    _money_pulse,
     _headline_kpis,
     _sales_totals,
+    _payables,
     _loss_prevention,
     _sales_activity,
     _inventory_health,

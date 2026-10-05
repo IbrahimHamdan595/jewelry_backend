@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -71,25 +71,44 @@ def _bucket(days: int) -> str:
 
 
 async def compute_ap_aging(db: AsyncSession, *, as_of: date) -> dict:
+    """FIFO-reconstructed cash aging plus metal owed, per supplier and overall.
+
+    Four queries whatever the number of suppliers: purchases, cash payments and
+    gold balances are each fetched once for everyone and grouped here, instead
+    of three round-trips per supplier."""
     suppliers = (await db.execute(select(Supplier))).scalars().all()
+    # Oldest first across all suppliers, so each supplier's own list is FIFO.
+    purchases_by_supplier: dict[str, list] = {}
+    for p in (await db.execute(
+        select(SupplierPurchase.supplier_id, SupplierPurchase.occurred_at,
+               SupplierPurchase.total_cash_due, SupplierPurchase.cash_paid_at_creation)
+        .order_by(SupplierPurchase.occurred_at)
+    )).all():
+        purchases_by_supplier.setdefault(p.supplier_id, []).append(p)
+    paid_by_supplier = dict((await db.execute(
+        select(SupplierPayment.supplier_id, func.sum(SupplierPayment.amount))
+        .where(SupplierPayment.unit == DebtUnit.CASH)
+        .group_by(SupplierPayment.supplier_id)
+    )).all())
+    gold_by_supplier: dict[str, list] = {}
+    for r in (await db.execute(
+        select(SupplierBalance).where(SupplierBalance.unit == DebtUnit.GOLD)
+        .order_by(SupplierBalance.karat)
+    )).scalars():
+        gold_by_supplier.setdefault(r.supplier_id, []).append(r)
+
     cash_buckets = {"0_30": ZERO, "31_60": ZERO, "61_90": ZERO, "90_plus": ZERO}
     metal_owed: dict[str, Decimal] = {}
     by_supplier: dict[str, dict] = {}
 
     for sup in suppliers:
-        purchases = (await db.execute(
-            select(SupplierPurchase).where(SupplierPurchase.supplier_id == sup.id)
-            .order_by(SupplierPurchase.occurred_at)
-        )).scalars().all()
+        purchases = purchases_by_supplier.get(sup.id, [])
         outstanding = [
             {"date": (p.occurred_at.date() if p.occurred_at else as_of),
              "amt": (p.total_cash_due or ZERO) - (p.cash_paid_at_creation or ZERO)}
             for p in purchases if (p.total_cash_due or ZERO) - (p.cash_paid_at_creation or ZERO) > 0
         ]
-        paid = sum((p.amount for p in (await db.execute(
-            select(SupplierPayment).where(SupplierPayment.supplier_id == sup.id,
-                                          SupplierPayment.unit == DebtUnit.CASH)
-        )).scalars().all()), ZERO)
+        paid = paid_by_supplier.get(sup.id, ZERO)
         for o in outstanding:
             if paid <= 0:
                 break
@@ -103,10 +122,7 @@ async def compute_ap_aging(db: AsyncSession, *, as_of: date) -> dict:
             b = _bucket((as_of - o["date"]).days)
             sup_buckets[b] += o["amt"]
             cash_buckets[b] += o["amt"]
-        gold_rows = (await db.execute(
-            select(SupplierBalance).where(SupplierBalance.supplier_id == sup.id,
-                                          SupplierBalance.unit == DebtUnit.GOLD)
-        )).scalars().all()
+        gold_rows = gold_by_supplier.get(sup.id, [])
         sup_metal = {}
         for r in gold_rows:
             if r.balance != 0:
