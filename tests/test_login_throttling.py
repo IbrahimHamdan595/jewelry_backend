@@ -8,70 +8,29 @@ the load balancer's address, and nothing limited attempts per account at all.
 ("<client>, <proxy hop>"); the socket peer is the same for every request, as it
 is in production.
 """
-import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import uuid4
 
-import bcrypt
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.requests import Request
 
 from app.core import login_lockout
 from app.core.audit_chain import verify_auth_chain
 from app.core.auth_audit import EVENT_ACCOUNT_LOCKED, EVENT_LOGIN_FAILED
 from app.core.rate_limit import client_ip_key, limiter
-from app.models import AuthAuditChainHead, AuthAuditLog, Role, User
-
-PASSWORD = "correct-horse-battery"
-OWNER = "owner@example.com"
-CASHIER = "cashier@example.com"
-
-
-def _fast_hash(password: str) -> str:
-    """bcrypt at the minimum cost: the tests log in dozens of times."""
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=4)).decode()
+from app.models import AuthAuditChainHead, AuthAuditLog
+from tests.conftest import AUTH_PASSWORD as PASSWORD
+from tests.conftest import CASHIER_EMAIL as CASHIER
+from tests.conftest import OWNER_EMAIL as OWNER
+from tests.conftest import settle
 
 
-async def _settle() -> None:
-    """Let the fire-and-forget audit writes finish before the next request."""
-    pending = [
-        t for t in asyncio.all_tasks()
-        if t is not asyncio.current_task()
-        and getattr(t.get_coro(), "__name__", "") == "record_auth_event_safe"
-    ]
-    await asyncio.gather(*pending)
-
-
-@pytest_asyncio.fixture
-async def client(db, monkeypatch):
-    from app.deps import get_db
-    from app.main import app
-
-    hashed = _fast_hash(PASSWORD)
-    db.add(User(id="u-owner", email=OWNER, name="Owner", password_hash=hashed, role=Role.ADMIN, is_active=True))
-    db.add(User(id="u-cashier", email=CASHIER, name="Cashier", password_hash=hashed, role=Role.CASHIER, is_active=True))
-    await db.commit()
-
-    async def _get_db():
-        yield db
-
-    # The background recorder opens its own session on the app's engine; point
-    # it at this test's database so audit rows land where the test can see them.
-    monkeypatch.setattr(
-        "app.core.auth_audit.async_session_factory",
-        async_sessionmaker(db.bind, expire_on_commit=False, class_=AsyncSession),
-    )
-    limiter.reset()  # the limiter's memory storage outlives a single test
-    app.dependency_overrides[get_db] = _get_db
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c
-    app.dependency_overrides.clear()
-    await _settle()
+@pytest.fixture
+def client(device):
+    """One device is enough here: every request names its own address."""
+    return device()
 
 
 async def _login(client, email: str, password: str, *, ip: str):
@@ -80,7 +39,7 @@ async def _login(client, email: str, password: str, *, ip: str):
         json={"email": email, "password": password},
         headers={"X-Forwarded-For": f"{ip}, 10.0.0.1"},
     )
-    await _settle()
+    await settle()
     return resp
 
 
