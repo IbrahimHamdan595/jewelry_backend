@@ -13,19 +13,26 @@ from app.core.ledger import (
     EVENT_GOLD_RATE_REFRESH_TRIGGERED,
     record,
 )
-from app.core.money import money
+from app.core.money import money, round_money
 from app.core.permissions import require_admin
+from app.core.pricing import KARAT_PURITY
 from app.deps import get_db
-from app.models import GoldRateHistory, GoldRateOverride, User
+from app.models import GoldRateHistory, GoldRateOverride, Karat, User
 from app.schemas.gold_rate import GoldRateHistoryPoint, GoldRateOut, OverrideRequest
 
 router = APIRouter(prefix="/gold-price", tags=["gold-price"])
 
 
-def _karat_rate(rate_24k: Decimal, purity: str) -> Decimal:
-    """Per-karat rate derived from 24K, in Decimal and rounded to cents exactly
-    as the poller rounds the per-karat values it stores (build_rate_history_row)."""
-    return (rate_24k * Decimal(purity)).quantize(Decimal("0.01"))
+def _karat_rate(rate_24k: Decimal, karat: Karat, stored: Decimal | None) -> Decimal:
+    """The per-karat rate stored with the 24K rate when there is one, so the live
+    card and the chart can never show different figures for the same row.
+
+    Derived only where nothing is stored — an admin override, or a row from
+    before per-karat storage — using the pricing engine's purity table and its
+    half-up rounding, so the result is the purity rate a sale would be priced at."""
+    if stored is not None:
+        return stored
+    return round_money(rate_24k * KARAT_PURITY[karat])
 
 
 @router.get("", response_model=GoldRateOut)
@@ -34,9 +41,9 @@ async def current_rate(db: AsyncSession = Depends(get_db)):
     r = Decimal(str(info["rate"]))
     return GoldRateOut(
         rate_24k=r,
-        rate_22k=_karat_rate(r, "0.917"),
-        rate_21k=_karat_rate(r, "0.875"),
-        rate_18k=_karat_rate(r, "0.750"),
+        rate_22k=_karat_rate(r, Karat.K22, info.get("rate_22k")),
+        rate_21k=_karat_rate(r, Karat.K21, info.get("rate_21k")),
+        rate_18k=_karat_rate(r, Karat.K18, info.get("rate_18k")),
         source=info["source"],
         fetched_at=info["fetched_at"],
         is_stale=info["is_stale"],
@@ -50,9 +57,9 @@ def _history_point(r: GoldRateHistory) -> GoldRateHistoryPoint:
     base = r.rate_24k
     return GoldRateHistoryPoint(
         rate_24k=base,
-        rate_22k=r.rate_22k if r.rate_22k is not None else _karat_rate(base, "0.917"),
-        rate_21k=r.rate_21k if r.rate_21k is not None else _karat_rate(base, "0.875"),
-        rate_18k=r.rate_18k if r.rate_18k is not None else _karat_rate(base, "0.750"),
+        rate_22k=_karat_rate(base, Karat.K22, r.rate_22k),
+        rate_21k=_karat_rate(base, Karat.K21, r.rate_21k),
+        rate_18k=_karat_rate(base, Karat.K18, r.rate_18k),
         per_karat_backfilled=bool(r.per_karat_backfilled),
         fetched_at=r.fetched_at,
     )

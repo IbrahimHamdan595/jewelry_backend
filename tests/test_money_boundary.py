@@ -53,7 +53,7 @@ async def _rate(db, value: str, **cols):
 
 @pytest.mark.asyncio
 async def test_current_gold_rate_is_strings_for_every_karat(client, db):
-    await _rate(db, "84.31")
+    await _rate(db, "84.31")                # no per-karat values on the row: derived
     body = (await client.get("/api/gold-price")).json()
     assert body["rate_24k"] == "84.31"
     assert body["rate_22k"] == "77.31"      # 84.31 × 0.917 = 77.31227
@@ -61,20 +61,60 @@ async def test_current_gold_rate_is_strings_for_every_karat(client, db):
     assert body["rate_18k"] == "63.23"      # 84.31 × 0.750 = 63.2325
     assert body["is_stale"] is False and body["source"] == "live"
 
+    await _rate(db, "80.10", fetched_at=datetime.now(timezone.utc) + timedelta(seconds=1))
+    assert (await client.get("/api/gold-price")).json()["rate_24k"] == "80.10"   # trailing zero kept
+
 
 @pytest.mark.asyncio
-async def test_current_gold_rate_keeps_trailing_zeros_and_matches_the_stored_series(client, db):
-    # 80.12 × 0.875 = 70.105 exactly: derived in Decimal it rounds the way the
-    # poller rounds the per-karat values it stores, where float math said 70.11.
-    await _rate(db, "80.10")
-    assert (await client.get("/api/gold-price")).json()["rate_24k"] == "80.10"
+async def test_live_gold_rate_returns_the_per_karat_values_stored_on_the_row(client, db):
+    """The poller derives the karats from the unrounded feed price, so what it
+    stores need not equal 24K × purity. The card must show what is stored — the
+    same figures as the latest point on the chart — not a second derivation."""
+    polled = build_rate_history_row(D("84.3149"), "goldapi")
+    assert (polled.rate_22k, polled.rate_21k, polled.rate_18k) == (D("77.32"), D("73.78"), D("63.24"))
+    # The row as the database holds it: NUMERIC(10,2) keeps 84.31 of the 24K price.
+    db.add(GoldRateHistory(rate_24k=D("84.31"), rate_22k=polled.rate_22k, rate_21k=polled.rate_21k,
+                           rate_18k=polled.rate_18k, source="goldapi",
+                           fetched_at=datetime.now(timezone.utc) - timedelta(seconds=5)))
+    await db.flush()
 
-    await _rate(db, "80.12", fetched_at=datetime.now(timezone.utc) + timedelta(seconds=1))
-    body = (await client.get("/api/gold-price")).json()
-    stored = build_rate_history_row(D("80.12"), "goldapi")
-    assert (body["rate_22k"], body["rate_21k"], body["rate_18k"]) == (
-        str(stored.rate_22k), str(stored.rate_21k), str(stored.rate_18k))
-    assert body["rate_21k"] == "70.10"
+    card = (await client.get("/api/gold-price")).json()
+    latest_point = (await client.get("/api/gold-price/history?range=24h")).json()[-1]
+
+    assert card["rate_24k"] == latest_point["rate_24k"] == "84.31"
+    # Derived from the stored 84.31 these would be 77.31 / 73.77 / 63.23.
+    assert (card["rate_22k"], card["rate_21k"], card["rate_18k"]) == ("77.32", "73.78", "63.24")
+    assert all(card[k] == latest_point[k] for k in ("rate_22k", "rate_21k", "rate_18k"))
+
+
+@pytest.mark.asyncio
+async def test_derived_karats_use_the_pricing_engines_purity_and_rounding(client, db):
+    """An override has no stored karats. Deriving them must give what the
+    pricing engine quotes: 84.30 × 0.750 = 63.225 is 63.23, not 63.22."""
+    await _rate(db, "80.00")
+    db.add(GoldRateOverride(rate_24k=D("84.30"), set_by="u-admin", is_active=True))
+    db.add(Product(code="RNG-18", name_en="Ring", category="rings", karat=Karat.K18,
+                   weight_grams=D("5"), margin_percent=D("15"), making_charge=D("20"),
+                   on_hand_qty=1, is_active=True, status=ProductStatus.AVAILABLE))
+    await db.flush()
+
+    card = (await client.get("/api/gold-price")).json()
+    assert card["source"] == "override"
+    assert (card["rate_24k"], card["rate_22k"], card["rate_21k"], card["rate_18k"]) == (
+        "84.30", "77.30", "73.76", "63.23")
+    lookup = (await client.get("/api/products/lookup/RNG-18")).json()
+    assert lookup["purity_rate"] == card["rate_18k"] == "63.23"
+
+
+@pytest.mark.asyncio
+async def test_derived_karats_read_the_shared_purity_table(client, db, monkeypatch):
+    from app.core import pricing
+
+    await _rate(db, "100.00")
+    monkeypatch.setitem(pricing.KARAT_PURITY, Karat.K22, D("0.500"))     # no private copy to miss this
+    assert (await client.get("/api/gold-price")).json()["rate_22k"] == "50.00"
+    history = (await client.get("/api/gold-price/history?range=24h")).json()
+    assert history[-1]["rate_22k"] == "50.00"
 
 
 @pytest.mark.asyncio
