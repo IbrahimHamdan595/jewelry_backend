@@ -22,7 +22,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import delete, event, func, select
 
 from app.core import gl_postings, gl_replay
 from app.core.audit_chain import GENESIS_HASH, compute_ledger_entry_hash
@@ -761,6 +761,29 @@ async def test_replay_refuses_to_run_without_a_chart_of_accounts(db):
 
     assert await _books(db) == before
     assert (await db.execute(select(func.count()).select_from(GLAccount))).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_refuses_a_chart_with_a_missing_or_inactive_system_account(db):
+    """Same readiness check as the settings switch (coa_seed.unusable_system_accounts):
+    a chart that is only partly there is refused up front, naming each account —
+    not discovered halfway through, on whichever document needs it first."""
+    await _base(db)
+    await _history(db)
+    await db.execute(delete(GLAccount).where(GLAccount.system_key == "ADJUSTMENT_EXPENSE"))
+    clearing = (await db.execute(
+        select(GLAccount).where(GLAccount.system_key == "METAL_CLEARING"))).scalar_one()
+    clearing.is_active = False
+    await db.commit()
+    before = await _books(db)
+
+    with pytest.raises(gl_replay.ReplayError) as exc:
+        await gl_replay.run_replay(db, actor_user_id=ADMIN, execute=True)
+
+    message = str(exc.value)
+    assert "1 missing (ADJUSTMENT_EXPENSE)" in message and "1 inactive (METAL_CLEARING)" in message
+    assert "adjustment adj1" not in message      # stopped before any document was touched
+    assert await _books(db) == before
 
 
 @pytest.mark.asyncio

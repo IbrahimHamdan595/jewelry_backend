@@ -36,8 +36,9 @@ from sqlalchemy.orm import selectinload
 
 from app.core import gl, gl_postings, ledger
 from app.core.audit_chain import GENESIS_HASH, _GL_HEADER_FIELDS, _GL_LINE_FIELDS, verify_gl_chain
+from app.core.coa_seed import describe_unusable_accounts, unusable_system_accounts
 from app.models import (
-    AdjustmentTarget, ARInvoice, ARReceipt, GLAccount, GLJournalChainHead, GLJournalEntry,
+    AdjustmentTarget, ARInvoice, ARReceipt, GLJournalChainHead, GLJournalEntry,
     GLJournalLine, GLPeriod, GoldLot, InventoryLedger, LotSource, ManualAdjustment, Order,
     OrderStatus, PaymentMethod, Product, Settings, SupplierPayment, SupplierPurchase, User,
     VendorBill, VendorPayment, WalkinBuyback,
@@ -458,12 +459,12 @@ async def replay_history(db: AsyncSession, *, actor_user_id: str) -> ReplayRepor
 
     if (await db.execute(select(User.id).where(User.id == actor_user_id))).first() is None:
         raise ReplayError(f"Unknown actor user id {actor_user_id!r}: every entry needs an actor.")
-    if not (await db.execute(
-        select(func.count()).select_from(GLAccount).where(GLAccount.system_key.is_not(None))
-    )).scalar_one():
+    problems = await unusable_system_accounts(db)
+    if problems:
         raise ReplayError(
-            "Chart of accounts is not seeded. Seed it first (POST /api/accounting/seed-coa) "
-            "— the replay never creates accounts."
+            f"The chart of accounts is not ready: {describe_unusable_accounts(problems)}. "
+            "Seed it (POST /api/accounting/seed-coa) and reactivate what is inactive "
+            "first — the replay never creates or changes accounts."
         )
     if not _chain_ok(await _verify_chain(db)):
         raise ReplayError(

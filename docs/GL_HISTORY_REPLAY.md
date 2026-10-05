@@ -107,9 +107,10 @@ Settle these with the accountant; the dry run counts them under "NOT replayed".
 1. **Owner sign-off** for the dry run on production, recorded on the ticket.
 2. **Outside shop hours.** The replay holds the ledger chain locks for its whole
    run — a dry run too. Tills wait until it finishes.
-3. Chart of accounts seeded: Accounting → Chart of accounts, or
-   `POST /api/accounting/seed-coa` (admin, idempotent). The replay never
-   creates accounts and refuses to run without them.
+3. Chart of accounts seeded, with no system account deactivated: Accounting →
+   Chart of accounts, or `POST /api/accounting/seed-coa` (admin, idempotent).
+   The replay never creates or changes accounts; it refuses to run and names
+   every system account that is missing or inactive.
 4. `GET /api/accounting/ledger/verify` returns `empty` or `intact` with
    `head_matches: true`. The replay refuses to append to a broken chain.
 
@@ -177,8 +178,9 @@ that nobody has reviewed.
 
 Settings → Accounting → "Post sales to the books automatically". Admin only;
 the change is written to the audit ledger (`SETTINGS_CHANGED`). The switch
-refuses to turn on (409) until the chart of accounts is seeded — with the flag
-on and a system account missing, every sale would be rejected.
+refuses to turn on (409, with the reason) while the next sale could not post:
+a system account is missing or inactive, or the current month's period is
+CLOSED. Switching it off is never blocked.
 
 - **Run the replay first.** Switching the flag on by itself starts the books on
   an arbitrary day with no past: revenue from that day, inventory credited for

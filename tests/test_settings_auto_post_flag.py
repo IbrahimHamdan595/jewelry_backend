@@ -11,6 +11,7 @@ contract the merged frontend (NEX-58) already codes against:
   • a PATCH that does not carry the field (another settings tab saving) can
     never move it.
 """
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -19,11 +20,11 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
 
-from app.core.coa_seed import seed_chart_of_accounts
+from app.core.coa_seed import SYSTEM_ACCOUNTS, seed_chart_of_accounts, unusable_system_accounts
 from app.core.ledger import EVENT_SETTINGS_CHANGED
 from app.models import (
-    CoinType, GLAccount, GLJournalEntry, GLJournalLine, GoldRateHistory, InventoryLedger,
-    Karat, MarginMode, Role, Settings, User,
+    CoinType, GLAccount, GLJournalEntry, GLJournalLine, GLPeriod, GoldRateHistory,
+    InventoryLedger, Karat, MarginMode, PeriodStatus, Role, Settings, User,
 )
 
 D = Decimal
@@ -126,7 +127,9 @@ async def test_flag_cannot_be_turned_on_before_the_chart_of_accounts_is_seeded(a
     r = await api.client.patch("/api/settings", json={FLAG: True, "receipt_footer": "x"})
 
     assert r.status_code == 409, r.text
-    assert "chart of accounts" in r.json()["detail"].lower()
+    detail = r.json()["detail"]
+    assert "chart of accounts" in detail.lower()
+    assert f"{len(SYSTEM_ACCOUNTS)} missing" in detail and "CASH" in detail
     assert await _stored_flag(db) is False
     assert (await api.client.get("/api/settings")).json()["receipt_footer"] is None  # all or nothing
 
@@ -135,6 +138,70 @@ async def test_flag_cannot_be_turned_on_before_the_chart_of_accounts_is_seeded(a
     await db.flush()
     assert (await api.client.patch("/api/settings", json={FLAG: True})).status_code == 200
     await db.execute(delete(GLAccount))
+    await db.flush()
+    assert (await api.client.patch("/api/settings", json={FLAG: False})).status_code == 200
+    assert await _stored_flag(db) is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_helper_reports_missing_and_inactive_system_accounts(db):
+    """The one check both the settings guard and the replay precheck use."""
+    assert set(await unusable_system_accounts(db)) == {row[-1] for row in SYSTEM_ACCOUNTS}
+
+    await seed_chart_of_accounts(db)
+    assert await unusable_system_accounts(db) == {}
+
+    cash = (await db.execute(select(GLAccount).where(GLAccount.system_key == "CASH"))).scalar_one()
+    cash.is_active = False
+    await db.execute(delete(GLAccount).where(GLAccount.system_key == "SALES_REVENUE"))
+    await db.flush()
+    assert await unusable_system_accounts(db) == {"CASH": "INACTIVE", "SALES_REVENUE": "MISSING"}
+
+
+@pytest.mark.asyncio
+async def test_flag_cannot_be_turned_on_while_one_system_account_is_missing_or_inactive(api, db):
+    """A chart that is 'mostly there' is not enough: one missing or deactivated
+    account is one posting path that fails. The message names each of them."""
+    cash = (await db.execute(select(GLAccount).where(GLAccount.system_key == "CASH"))).scalar_one()
+    cash.is_active = False
+    await db.execute(delete(GLAccount).where(GLAccount.system_key == "SALES_REVENUE"))
+    await db.flush()
+
+    r = await api.client.patch("/api/settings", json={FLAG: True})
+
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert "1 missing (SALES_REVENUE)" in detail and "1 inactive (CASH)" in detail
+    assert await _stored_flag(db) is False
+
+    cash.is_active = True
+    await seed_chart_of_accounts(db)
+    await db.flush()
+    assert (await api.client.patch("/api/settings", json={FLAG: True})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_flag_cannot_be_turned_on_while_the_current_period_is_closed(api, db):
+    """The next sale would be booked in this month; if its period is CLOSED the
+    posting — and with it the sale — is refused. A missing period is fine (the
+    first sale opens it), and so is an OPEN one."""
+    today = datetime.now(timezone.utc).date()   # the day a sale is stamped with
+    period = GLPeriod(year=today.year, period_no=today.month, status=PeriodStatus.CLOSED)
+    db.add(period)
+    await db.flush()
+
+    r = await api.client.patch("/api/settings", json={FLAG: True})
+
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert f"{today.year}-{today.month:02d}" in detail and "CLOSED" in detail
+    assert await _stored_flag(db) is False
+
+    period.status = PeriodStatus.OPEN
+    await db.flush()
+    assert (await api.client.patch("/api/settings", json={FLAG: True})).status_code == 200
+    # Closing the month later does not stop anyone switching the flag OFF.
+    period.status = PeriodStatus.CLOSED
     await db.flush()
     assert (await api.client.patch("/api/settings", json={FLAG: False})).status_code == 200
     assert await _stored_flag(db) is False

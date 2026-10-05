@@ -1,12 +1,14 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.coa_seed import SYSTEM_ACCOUNTS
+from app.core.coa_seed import describe_unusable_accounts, unusable_system_accounts
 from app.core.ledger import EVENT_SETTINGS_CHANGED, field_diff, record
 from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db
-from app.models import GLAccount, Settings, User
+from app.models import GLPeriod, PeriodStatus, Settings, User
 from app.schemas.settings import SettingsOut, SettingsUpdate
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -18,6 +20,39 @@ async def get_settings(db: AsyncSession = Depends(get_db), _: User = Depends(get
     if not s:
         raise HTTPException(status_code=404, detail="Settings not found")
     return SettingsOut.model_validate(s)
+
+
+async def _assert_ready_for_auto_post(db: AsyncSession) -> None:
+    """Once the switch is ON every sale posts inside its own transaction, so a
+    posting that cannot succeed is a sale that cannot be rung up. Refuse to
+    switch on while the very next sale would fail, and say why (409)."""
+    problems = await unusable_system_accounts(db)
+    if problems:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The chart of accounts is not ready: {describe_unusable_accounts(problems)}. "
+                "Seed or reactivate them under Accounting › Chart of accounts before "
+                "turning auto-posting on."
+            ),
+        )
+    # A sale is booked on the UTC date of Order.created_at. A missing period is
+    # fine (the first posting opens it); a CLOSED one refuses the posting.
+    today = datetime.now(timezone.utc).date()
+    period = (
+        await db.execute(
+            select(GLPeriod).where(GLPeriod.year == today.year, GLPeriod.period_no == today.month)
+        )
+    ).scalar_one_or_none()
+    if period is not None and period.status != PeriodStatus.OPEN:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The accounting period {today.year}-{today.month:02d} is CLOSED, so the next "
+                "sale could not be posted. Reopen it under Accounting › Periods before "
+                "turning auto-posting on."
+            ),
+        )
 
 
 @router.patch("", response_model=SettingsOut)
@@ -45,22 +80,10 @@ async def update_settings(
     # reset the switch nor write NULL into its NOT NULL column.
     if incoming.get("accounting_auto_post_enabled", False) is None:
         del incoming["accounting_auto_post_enabled"]
-    # Switching it ON makes every sale resolve the GL system accounts and 422
-    # when one is missing (gl_postings.resolve_account_id) — one click could
-    # stop the till. Refuse until the chart of accounts is seeded, before
+    # Switching it ON is refused while the next sale could not post — before
     # anything in this PATCH is applied. Switching it OFF is never blocked.
     if incoming.get("accounting_auto_post_enabled") and not s.accounting_auto_post_enabled:
-        seeded = {k for (k,) in (await db.execute(select(GLAccount.system_key))).all() if k}
-        missing = sorted({row[-1] for row in SYSTEM_ACCOUNTS} - seeded)
-        if missing:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"The chart of accounts is missing {len(missing)} system account(s) "
-                    f"({', '.join(missing[:5])}{', …' if len(missing) > 5 else ''}). Seed it under "
-                    "Accounting › Chart of accounts before turning auto-posting on."
-                ),
-            )
+        await _assert_ready_for_auto_post(db)
     # Snapshot only the fields the caller is trying to change so the diff
     # stays focused. SettingsOut.model_dump() would include 20+ fields most
     # of which the caller never touched.
