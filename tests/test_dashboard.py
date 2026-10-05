@@ -129,10 +129,10 @@ async def test_gl_has_entries_false_when_dormant(db):
 async def test_receivables_payables_shape(db):
     r = await dashboard.receivables(db, as_of=date(2026, 6, 5))
     assert set(r) == {"total", "b0_30", "b31_60", "b61_90", "b90_plus"}
-    assert r["total"] == 0.0
+    assert r["total"] == "0.00"
     p = await dashboard.payables_aging(db, as_of=date(2026, 6, 5))
     assert set(p) == {"cash_total", "b0_30", "b31_60", "b61_90", "b90_plus", "metal_owed_by_karat"}
-    assert p["cash_total"] == 0.0
+    assert p["cash_total"] == "0.00"
 
 
 # ── Phase E ───────────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ from app.config import settings
 from app.core import dashboard as dash
 from app.core.daterange import day_range
 from app.core.gold_api import get_current_gold_rate
+from app.core.money import money
 from app.core.permissions import require_admin
 from app.deps import get_current_user, get_db, get_session_factory
 from app.models import (
@@ -31,15 +32,15 @@ from app.models import (
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
-def _inv_value_floats(v: dict) -> dict:
-    """Convert the inventory_valuation Decimal fields to floats for the payload."""
+def _inv_value_money(v: dict) -> dict:
+    """Convert the inventory_valuation Decimal fields to money strings for the payload."""
     return {
-        "total_usd": float(v["total_usd"]),
-        "pure_gold_usd": float(v["pure_gold_usd"]),
-        "coins_usd": float(v["coins_usd"]),
-        "ounces_usd": float(v["ounces_usd"]),
-        "products_usd": float(v["products_usd"]),
-        "rate_24k": float(v["rate_24k"]) if v["rate_24k"] is not None else None,
+        "total_usd": money(v["total_usd"]),
+        "pure_gold_usd": money(v["pure_gold_usd"]),
+        "coins_usd": money(v["coins_usd"]),
+        "ounces_usd": money(v["ounces_usd"]),
+        "products_usd": money(v["products_usd"]),
+        "rate_24k": money(v["rate_24k"]) if v["rate_24k"] is not None else None,
         "method": v["method"],
     }
 
@@ -83,10 +84,10 @@ async def _sales_totals(db: AsyncSession, w: dash.Windows) -> dict:
 
     return {
         "today_orders": today_orders,
-        "today_revenue": float(today_revenue),
-        "week_revenue": float(week_revenue),
-        "prev_week_revenue": float(prev_week_revenue),
-        "avg_invoice_value_today": float(dash.avg_invoice(today_revenue, today_orders)),
+        "today_revenue": money(today_revenue),
+        "week_revenue": money(week_revenue),
+        "prev_week_revenue": money(prev_week_revenue),
+        "avg_invoice_value_today": money(dash.avg_invoice(today_revenue, today_orders)),
     }
 
 
@@ -102,7 +103,7 @@ async def _revenue_chart(db: AsyncSession, w: dash.Windows) -> dict:
                 Order.status == OrderStatus.COMPLETED,
             )
         )).scalar_one()
-        chart_data.append({"date": d.isoformat(), "revenue": float(rev), "is_today": i == 0})
+        chart_data.append({"date": d.isoformat(), "revenue": money(rev), "is_today": i == 0})
     return {"chart_data": chart_data}
 
 
@@ -113,11 +114,11 @@ async def _gold_rate_and_valuation(db: AsyncSession, w: dash.Windows) -> dict:
     )).scalar_one_or_none()
     rate_info = await get_current_gold_rate(db)
     return {
-        "gold_rate_24k": float(latest_rate) if latest_rate else None,
+        "gold_rate_24k": money(latest_rate) if latest_rate else None,
         "gold_rate_is_stale": bool(rate_info["is_stale"]),
         "gold_rate_fetched_at": rate_info["fetched_at"].isoformat() if rate_info.get("fetched_at") else None,
         # Phase D — market valuation, priced at the rate resolved just above
-        "inventory_value": _inv_value_floats(
+        "inventory_value": _inv_value_money(
             await dash.inventory_valuation(db, rate_24k=rate_info.get("rate"))),
     }
 
@@ -149,7 +150,7 @@ async def _sales_activity(db: AsyncSession, w: dash.Windows) -> dict:
 
     return {
         "top_sellers": [
-            {"code": r.product_code, "name": r.product_name, "karat": r.karat, "units": r.units, "revenue": float(r.revenue)}
+            {"code": r.product_code, "name": r.product_name, "karat": r.karat, "units": r.units, "revenue": money(r.revenue)}
             for r in top_sellers_rows
         ],
         "recent_orders": [
@@ -157,7 +158,7 @@ async def _sales_activity(db: AsyncSession, w: dash.Windows) -> dict:
                 "id": o.id,
                 "order_number": o.order_number,
                 "status": o.status.value,
-                "total_usd": float(o.total_usd),
+                "total_usd": money(o.total_usd),
                 "cashier": o.cashier.name,
                 "created_at": o.created_at.isoformat(),
             }
@@ -176,9 +177,9 @@ async def _headline_kpis(db: AsyncSession, w: dash.Windows) -> dict:
     # Phase C — profitability (None until cost-captured orders exist; go-forward)
     _prof = await dash.profitability(db, w.week_start, w.week_end)
     profitability = None if _prof is None else {
-        "gross_profit": float(_prof["gross_profit"]),
+        "gross_profit": money(_prof["gross_profit"]),
         "gross_margin_pct": float(_prof["gross_margin_pct"]) if _prof["gross_margin_pct"] is not None else None,
-        "profit_per_gram": float(_prof["profit_per_gram"]) if _prof["profit_per_gram"] is not None else None,
+        "profit_per_gram": money(_prof["profit_per_gram"]) if _prof["profit_per_gram"] is not None else None,
         "since": _prof["since"],
     }
 
@@ -189,8 +190,8 @@ async def _headline_kpis(db: AsyncSession, w: dash.Windows) -> dict:
         "gold_weight_sold_week_by_karat": [
             {"karat": r["karat"], "grams": float(r["grams"])} for r in weight_week
         ],
-        "making_charges_today": float(making_today),
-        "making_charges_week": float(making_week),
+        "making_charges_today": money(making_today),
+        "making_charges_week": money(making_week),
         "profitability": profitability,
     }
 
@@ -272,7 +273,7 @@ async def _recent_purchases(db: AsyncSession, w: dash.Windows) -> dict:
                 "id": p.id,
                 "supplier": supplier_names.get(p.supplier_id, "—"),
                 "occurred_at": p.occurred_at.isoformat(),
-                "total_cash_due": float(p.total_cash_due),
+                "total_cash_due": money(p.total_cash_due),
                 "item_count": len(p.items),
             }
             for p in recent_purchases
@@ -292,7 +293,7 @@ async def _money_pulse(db: AsyncSession, w: dash.Windows) -> dict:
     gl_live = await dash.gl_has_entries(db)
     return {
         "receivables": receivables,
-        "cash_bank_balance": float(await dash.cash_bank_balance(db)) if gl_live else None,
+        "cash_bank_balance": money(await dash.cash_bank_balance(db)) if gl_live else None,
         "vat_position": (await dash.vat_position(db, w.today)) if gl_live else None,
     }
 

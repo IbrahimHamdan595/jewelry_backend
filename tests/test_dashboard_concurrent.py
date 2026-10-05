@@ -8,6 +8,7 @@ run on a file-backed SQLite engine instead: each concurrent session really is a
 separate connection reading the same committed data.
 """
 import asyncio
+import re
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
@@ -408,10 +409,10 @@ async def test_concurrent_payload_is_byte_identical_to_sequential_oracle(shop):
 
     # The fixture is not vacuous: every block carries real figures.
     assert actual["today_orders"] == 3
-    assert actual["week_revenue"] == 2065.34
+    assert actual["week_revenue"] == "2065.34"
     assert len(actual["top_sellers"]) == 4 and len(actual["recent_orders"]) == 5
     assert len(actual["recent_purchases"]) == 5
-    assert actual["receivables"]["total"] > 0 and actual["payables_aging"]["cash_total"] > 0
+    assert D(actual["receivables"]["total"]) > 0 and D(actual["payables_aging"]["cash_total"]) > 0
     assert actual["cash_bank_balance"] is not None and actual["vat_position"] is not None
     assert actual["profitability"] is not None
     assert sum(actual["inventory_aging"].values()) > 0 and actual["dead_stock_count"] > 0
@@ -448,8 +449,8 @@ async def test_active_rate_override_payload_is_byte_identical(shop):
 
     assert _body(actual) == _body(expected)
     assert actual["gold_rate_is_stale"] is False
-    assert actual["inventory_value"]["rate_24k"] == 81.17    # valued at the override
-    assert actual["gold_rate_24k"] == 78.43                  # headline stays the last polled rate
+    assert actual["inventory_value"]["rate_24k"] == "81.17"  # valued at the override
+    assert actual["gold_rate_24k"] == "78.43"                # headline stays the last polled rate
 
 
 # ── one clock read, Beirut-local windows ──────────────────────────────────────
@@ -480,28 +481,28 @@ async def test_day_and_week_boundaries_stay_beirut_local(shop):
 
     # Today is the Beirut 16th: the 21:00:00 UTC order is in, the 20:59:59 one is not.
     assert p["today_orders"] == 3
-    assert p["today_revenue"] == 1234.86
-    assert p["avg_invoice_value_today"] == 411.62
-    assert p["week_revenue"] == 2065.34
-    assert p["prev_week_revenue"] == 1010.01
+    assert p["today_revenue"] == "1234.86"
+    assert p["avg_invoice_value_today"] == "411.62"
+    assert p["week_revenue"] == "2065.34"
+    assert p["prev_week_revenue"] == "1010.01"
     assert p["chart_data"] == [
-        {"date": "2026-06-10", "revenue": 310.07, "is_today": False},
-        {"date": "2026-06-11", "revenue": 0.0, "is_today": False},
-        {"date": "2026-06-12", "revenue": 420.42, "is_today": False},
-        {"date": "2026-06-13", "revenue": 0.0, "is_today": False},
-        {"date": "2026-06-14", "revenue": 0.0, "is_today": False},
-        {"date": "2026-06-15", "revenue": 99.99, "is_today": False},
-        {"date": "2026-06-16", "revenue": 1234.86, "is_today": True},
+        {"date": "2026-06-10", "revenue": "310.07", "is_today": False},
+        {"date": "2026-06-11", "revenue": "0.00", "is_today": False},
+        {"date": "2026-06-12", "revenue": "420.42", "is_today": False},
+        {"date": "2026-06-13", "revenue": "0.00", "is_today": False},
+        {"date": "2026-06-14", "revenue": "0.00", "is_today": False},
+        {"date": "2026-06-15", "revenue": "99.99", "is_today": False},
+        {"date": "2026-06-16", "revenue": "1234.86", "is_today": True},
     ]
     assert {r["karat"]: r["grams"] for r in p["gold_weight_sold_today_by_karat"]} == {
         "K18": 6.25, "K21": 5.583, "K22": 1.111, "K24": 8.0}
-    assert p["making_charges_today"] == 56.08
+    assert p["making_charges_today"] == "56.08"
     assert p["loss_prevention"] == {"order_voids": 3, "rate_overrides": 1, "excess_discount_orders": 2}
     # Aging runs on the same instant: 365 days old is not yet dead stock, 366 is.
     assert p["inventory_aging"] == {"d0_90": 2, "d90_180": 2, "d180_365": 3, "d365_plus": 3}
     assert p["dead_stock_count"] == 2
-    assert p["vat_position"] == {"net_payable": 67.34, "direction": "PAYABLE", "period_label": "Q2 2026"}
-    assert p["cash_bank_balance"] == 17891.06
+    assert p["vat_position"] == {"net_payable": "67.34", "direction": "PAYABLE", "period_label": "Q2 2026"}
+    assert p["cash_bank_balance"] == "17891.06"
 
 
 @pytest.mark.asyncio
@@ -887,6 +888,103 @@ async def test_endpoint_still_requires_admin(client, shop):
     r = await client.get("/api/reports/dashboard")
     assert r.status_code == 403
     assert shop.tracker.opened == 0
+
+
+# ── NEX-54: no monetary value is a JSON number ────────────────────────────────
+# Every leaf of the payload, classified. The walk fails on any leaf that is not
+# listed here, so a new field has to be declared money or not-money before it
+# ships — money cannot slip back in as a number.
+
+_MONEY_PATHS = {
+    "today_revenue", "week_revenue", "prev_week_revenue", "avg_invoice_value_today",
+    "gold_rate_24k", "chart_data[].revenue", "top_sellers[].revenue",
+    "making_charges_today", "making_charges_week", "recent_orders[].total_usd",
+    "inventory_value.total_usd", "inventory_value.pure_gold_usd", "inventory_value.coins_usd",
+    "inventory_value.ounces_usd", "inventory_value.products_usd", "inventory_value.rate_24k",
+    "recent_purchases[].total_cash_due",
+    "receivables.total", "receivables.b0_30", "receivables.b31_60", "receivables.b61_90",
+    "receivables.b90_plus",
+    "payables_aging.cash_total", "payables_aging.b0_30", "payables_aging.b31_60",
+    "payables_aging.b61_90", "payables_aging.b90_plus",
+    "cash_bank_balance", "vat_position.net_payable",
+    "profitability.gross_profit", "profitability.profit_per_gram",
+}
+# Numbers that are not money: counts, gram weights, and one percentage.
+_NUMBER_PATHS = {
+    "today_orders", "top_sellers[].units", "dead_stock_count", "recent_purchases[].item_count",
+    "gold_weight_sold_today_by_karat[].grams", "gold_weight_sold_week_by_karat[].grams",
+    "inventory.pure_gold_by_karat[].grams_remaining", "inventory.pure_gold_by_karat[].lot_count",
+    "inventory.coins.on_hand_total", "inventory.coins.distinct_types",
+    "inventory.ounces.on_hand_total", "inventory.ounces.distinct_types",
+    "inventory.low_stock_alerts",
+    "inventory_aging.d0_90", "inventory_aging.d90_180", "inventory_aging.d180_365",
+    "inventory_aging.d365_plus",
+    "payables_aging.metal_owed_by_karat.{karat}",
+    "loss_prevention.order_voids", "loss_prevention.rate_overrides",
+    "loss_prevention.excess_discount_orders",
+    "profitability.gross_margin_pct",
+}
+# Text, flags and timestamps.
+_OTHER_PATHS = {
+    "gold_rate_is_stale", "gold_rate_fetched_at", "chart_data[].date", "chart_data[].is_today",
+    "top_sellers[].code", "top_sellers[].name", "top_sellers[].karat",
+    "gold_weight_sold_today_by_karat[].karat", "gold_weight_sold_week_by_karat[].karat",
+    "recent_orders[].id", "recent_orders[].order_number", "recent_orders[].status",
+    "recent_orders[].cashier", "recent_orders[].created_at",
+    "inventory.pure_gold_by_karat[].karat", "inventory_value.method",
+    "recent_purchases[].id", "recent_purchases[].supplier", "recent_purchases[].occurred_at",
+    "vat_position.direction", "vat_position.period_label", "profitability.since",
+}
+_MONEY_STRING = re.compile(r"^-?\d+\.\d{2}$")
+
+
+def _leaves(node, path=""):
+    """Yield (path, value) for every scalar; list items share one `[]` path."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if path == "payables_aging.metal_owed_by_karat":
+                key = "{karat}"
+            yield from _leaves(value, f"{path}.{key}" if path else key)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _leaves(value, f"{path}[]")
+    else:
+        yield path, node
+
+
+def _assert_no_money_as_number(payload: dict) -> set:
+    leaves = [(p, v) for p, v in _leaves(payload) if v is not None]
+    for path, value in leaves:
+        if path in _MONEY_PATHS:
+            assert isinstance(value, str) and _MONEY_STRING.match(value), f"{path} = {value!r}"
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            assert path in _NUMBER_PATHS, f"{path} = {value!r}: a JSON number not classified as non-monetary"
+        else:
+            assert path in _OTHER_PATHS, f"{path} = {value!r}: unclassified leaf"
+    return {p for p, _ in leaves}
+
+
+@pytest.mark.asyncio
+async def test_no_monetary_value_in_the_dashboard_payload_is_a_json_number(client):
+    r = await client.get("/api/reports/dashboard")
+    assert r.status_code == 200
+
+    seen = _assert_no_money_as_number(r.json())
+    # The rich fixture exercises every leaf, so nothing above is vacuous.
+    assert seen == _MONEY_PATHS | _NUMBER_PATHS | _OTHER_PATHS
+    # And on the wire the amounts are quoted, cents intact.
+    assert b'"today_revenue":"1234.86"' in r.content
+    assert b'"revenue":"0.00"' in r.content                      # a zero keeps its two decimals
+    assert b'"cash_bank_balance":"17891.06"' in r.content
+
+
+@pytest.mark.asyncio
+async def test_dormant_dashboard_payload_has_no_money_as_number(dormant_shop):
+    payload = await reports.build_dashboard(dormant_shop.sessions, now=NOW)
+    seen = _assert_no_money_as_number(payload)
+    assert payload["today_revenue"] == "0.00" and payload["receivables"]["total"] == "0.00"
+    assert payload["cash_bank_balance"] is None                  # null stays null, not "0.00"
+    assert "cash_bank_balance" not in seen
 
 
 def test_production_session_source_is_the_app_session_factory():
