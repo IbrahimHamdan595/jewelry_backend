@@ -194,11 +194,12 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     original = await find_live_entry(db, SOURCE_ORDER, order.id)
     if original is None:
         return None  # nothing was posted (e.g. flag was off at sale time)
-    # Full void/refund of a sale whose entry is already reversed — by an earlier
-    # void/refund, or by hand from the journal: nothing left to post. Skip, like
-    # the other mappers, so the void/refund itself still completes and the books
-    # are not reversed twice.
-    if refunded_item is None and await gl.find_reversal(db, original.id):
+    # The sale's entry is already reversed in full — by an earlier void/refund,
+    # or by hand from the journal: nothing left to post, for a full void/refund
+    # or a per-item one (a partial entry on top would take the accounts past
+    # zero). Skip, like the other mappers, so the void/refund itself still
+    # completes and the books are not reversed twice.
+    if await gl.find_reversal(db, original.id):
         return None
 
     # Reversals are booked when they happen, not when the original sale was — so

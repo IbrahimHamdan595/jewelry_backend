@@ -428,3 +428,25 @@ async def test_void_after_the_sale_entry_was_reversed_by_hand_skips_the_posting(
     accts = {a["system_key"]: a for a in tb["accounts"]}
     assert accts["CASH"]["net_base"] == D("0.00")
     assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")
+
+
+@pytest.mark.asyncio
+async def test_item_refund_after_the_sale_entry_was_reversed_by_hand_skips_the_posting(db):
+    """Same rule for a per-item refund: the sale's entry is already reversed in
+    full, so a partial refund entry on top would take the accounts past zero."""
+    order, cfg, sale = await _sold_order(db)
+    await gl.reverse_entry(db, original_entry_id=sale.id, actor_user_id="u1",
+                           entry_date=date(2026, 6, 20), memo="reversed by hand")
+    before = await _chain_state(db)
+
+    posted = await glp.post_order_refund(
+        db, order, cfg, "u1", refunded_item=order.items[0],
+        refund_value=D("100"), refund_qty=1, refund_seq=1)
+    assert posted is None
+    assert await _chain_state(db) == before
+
+    tb = await gl.compute_trial_balance(db, as_of=date(2026, 6, 30))
+    accts = {a["system_key"]: a for a in tb["accounts"]}
+    assert accts["CASH"]["net_base"] == D("0.00")
+    assert accts["SALES_REVENUE"]["net_base"] == D("0.00")
+    assert accts["METAL_INVENTORY"]["metal_by_karat"]["K21"]["net_grams"] == D("0.000")

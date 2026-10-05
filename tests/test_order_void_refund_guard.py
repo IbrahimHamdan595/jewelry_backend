@@ -93,6 +93,24 @@ async def test_refund_completes_when_the_sale_entry_was_already_reversed_by_hand
     assert await _reversals(db) == 1
 
 
+@pytest.mark.asyncio
+async def test_item_refund_completes_without_posting_when_the_sale_entry_was_reversed_by_hand(client, db):
+    order_id, coin, sale = await _sell_one_coin(client, db)
+    item_id = (await client.get(f"/api/orders/{order_id}")).json()["items"][0]["id"]
+    r = await client.post(f"/api/accounting/journal-entries/{sale.id}/reverse")
+    assert r.status_code == 200, r.text
+
+    r = await client.post(f"/api/orders/{order_id}/items/{item_id}/refund", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "REFUNDED"      # the order and the stock still change ...
+    assert coin.on_hand_qty == 5
+    assert await _reversals(db) == 1             # ... the books do not go past zero
+    partials = (await db.execute(
+        select(func.count()).select_from(GLJournalEntry)
+        .where(GLJournalEntry.source_type == "ORDER_REFUND"))).scalar_one()
+    assert partials == 0
+
+
 # ── One void wins: the order row is locked and its status re-read ─────────────
 # The real race needs two connections (proved on Postgres, see NEX-49); SQLite
 # has no row locks. These pin the two properties the handlers rely on: the
