@@ -340,3 +340,41 @@ async def test_manual_reversal_without_reverses_entry_id_is_rejected(client):
                           json={**payload, "source_type": "REVERSAL", "source_id": orig["id"]})
     assert r.status_code == 422, r.text
     assert await _entry_total(client) == 1
+
+
+
+# ── NEX-49: a year-close entry cannot be reversed ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_reverse_endpoint_refuses_a_year_close_entry(client):
+    payload = await _manual_payload(client)
+    assert (await client.post("/api/accounting/journal-entries", json=payload)).status_code == 200
+    period = (await client.get("/api/accounting/periods")).json()["items"][0]
+    assert (await client.post(f"/api/accounting/periods/{period['id']}/close")).status_code == 200
+    r = await client.post("/api/accounting/periods/close-year", json={"year": 2026})
+    assert r.status_code == 200, r.text
+    close_id, close_no = r.json()["entry_id"], r.json()["entry_no"]
+
+    # The endpoint books a reversal today: make sure today's period is open, so
+    # the rule is the only thing that can refuse it (whatever the date is).
+    from datetime import date
+    today = date.today()
+    r = await client.post("/api/accounting/periods", json={"year": today.year, "period_no": today.month})
+    if r.status_code == 409:
+        periods = (await client.get("/api/accounting/periods")).json()["items"]
+        pid = next(p["id"] for p in periods if (p["year"], p["period_no"]) == (today.year, today.month))
+        assert (await client.post(f"/api/accounting/periods/{pid}/reopen")).status_code == 200
+
+    r = await client.post(f"/api/accounting/journal-entries/{close_id}/reverse")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert close_no in detail and "2026" in detail
+    assert "cannot be reopened by reversing its closing entry" in detail
+    assert "correcting manual entry in the current period" in detail
+
+    # Nothing posted, chain untouched, and the year is still closed.
+    assert await _entry_total(client) == 2
+    v = (await client.get("/api/accounting/ledger/verify")).json()
+    assert v["status"] == "intact" and v["head_matches"] is True and v["head_row_count"] == 2
+    pv = (await client.get("/api/accounting/periods/year-close-preview?year=2026")).json()
+    assert pv["already_closed"] is True

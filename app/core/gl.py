@@ -34,6 +34,7 @@ ZERO = Decimal("0")
 SOURCE_MANUAL = "MANUAL"
 SOURCE_OPENING = "OPENING"
 SOURCE_REVERSAL = "REVERSAL"
+SOURCE_YEAR_CLOSE = "YEAR_CLOSE"  # posted only by period_close.close_year
 # Future operation sources (M1): ORDER, SUPPLIER_PURCHASE, SUPPLIER_PAYMENT, ...
 
 
@@ -386,7 +387,8 @@ async def reverse_entry(
     An entry is reversed at most once, and a reversal is never itself reversed
     (409 in both cases): a second reversal would leave the trial balance
     balanced but every touched account wrong by the original's full value, in
-    USD and in grams per karat."""
+    USD and in grams per karat. A year-close entry is never reversed either
+    (409): that does not reopen the year."""
     original = (
         await db.execute(select(GLJournalEntry).where(GLJournalEntry.id == original_entry_id))
     ).scalar_one_or_none()
@@ -402,6 +404,17 @@ async def reverse_entry(
             status_code=409,
             detail=f"Entry {original.entry_no} is a reversal and cannot itself be reversed. "
                    f"Post a correcting manual entry instead.",
+        )
+    # Reversing a closing entry does not reopen the year: booked now, it lands
+    # in a later year and leaves the old one closed, and wherever it lands its
+    # lines read as that period's revenue and expenses.
+    if original.source_type == SOURCE_YEAR_CLOSE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} is the closing entry of fiscal year "
+                   f"{original.entry_date.year}. A closed year cannot be reopened by reversing "
+                   f"its closing entry; adjust with a correcting manual entry in the current "
+                   f"period instead.",
         )
     existing = await find_reversal(db, original.id)
     if existing is not None:

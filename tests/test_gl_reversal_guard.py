@@ -346,16 +346,17 @@ async def test_sources_that_legitimately_repeat_are_not_blocked(db):
 @pytest.mark.asyncio
 async def test_year_close_entries_are_not_blocked(db):
     """YEAR_CLOSE posts with source_id NULL into a CLOSED December
-    (allow_closed_period). Neither index may get in the way — including after a
-    close has been reversed and the year is closed again."""
+    (allow_closed_period). Neither index may get in the way — including where a
+    ledger already holds a reversed close and the year is closed again."""
     accts = await _setup(db, months=(6,))
     db.add(GLPeriod(year=2026, period_no=12, status=PeriodStatus.CLOSED))
     await db.flush()
 
     first = await _post(db, accts, source_type="YEAR_CLOSE", source_id=None,
                         entry_date=date(2026, 12, 31), allow_closed_period=True)
-    await gl.reverse_entry(db, original_entry_id=first.id, actor_user_id="u1",
-                           entry_date=date(2026, 6, 30))
+    # A reversal of the close from before reverse_entry refused them.
+    await _post(db, accts, source_type=gl.SOURCE_REVERSAL, source_id=first.id,
+                reverses_entry_id=first.id, entry_date=date(2026, 6, 30))
     second = await _post(db, accts, source_type="YEAR_CLOSE", source_id=None,
                          entry_date=date(2026, 12, 31), allow_closed_period=True)
     assert second.id != first.id and second.source_type == "YEAR_CLOSE"

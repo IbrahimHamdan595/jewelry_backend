@@ -28,7 +28,7 @@ from app.models import (
 )
 
 ZERO = Decimal("0")
-YEAR_CLOSE = "YEAR_CLOSE"
+YEAR_CLOSE = gl.SOURCE_YEAR_CLOSE
 
 
 def period_month_range(year: int, period_no: int) -> tuple[date, date]:
@@ -103,9 +103,10 @@ async def close_readiness(db: AsyncSession, *, year: int, period_no: int) -> dic
 
 
 async def _year_already_closed(db: AsyncSession, year: int) -> bool:
-    """True while `year` has a YEAR_CLOSE entry still in force. One that has been
-    reversed does not count: a reversal cannot itself be reversed, so closing the
-    year again is the only way back from a closing entry reversed by mistake."""
+    """True while `year` has a YEAR_CLOSE entry still in force. gl.reverse_entry
+    now refuses to reverse a closing entry, but a ledger may already hold such a
+    reversal: that close does not count, since a reversal cannot itself be
+    reversed and closing the year again is then the only way back."""
     start, end = date(year, 1, 1), date(year, 12, 31)
     reversal = aliased(GLJournalEntry)
     existing = (await db.execute(
