@@ -202,3 +202,21 @@ async def test_orders_csv_export_writes_exact_amounts(client, db):
     assert cells["VAT"] == "0.00"
     assert cells["Total USD"] == "1234.50"
     assert cells["Total LBP"] == "110487750000.50"
+
+
+# ── Excel exports are the exception: numbers stay numbers ─────────────────────
+
+def test_xlsx_exports_still_write_numeric_cells():
+    """A spreadsheet cell is typed, unlike JSON: money written as text would
+    stop summing in Excel. xlsx.py keeps converting Decimal to a number."""
+    import openpyxl
+
+    from app.core.xlsx import Sheet, build_xlsx_bytes
+
+    body = build_xlsx_bytes([Sheet(name="Money", headers=["Account", "Debit (USD)"],
+                                   rows=[["Cash", D("1234.50")], ["Bank", D("0.10")], ["Total", D("1234.60")]])])
+    ws = openpyxl.load_workbook(io.BytesIO(body))["Money"]
+    amounts = [ws.cell(row=r, column=2) for r in (2, 3, 4)]
+    assert [c.value for c in amounts] == [1234.5, 0.1, 1234.6]
+    assert all(c.data_type == "n" for c in amounts)              # numeric, not "s" (string)
+    assert ws.cell(row=2, column=1).data_type == "s"
