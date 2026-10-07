@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
+from app.core.money import Money
+
 
 class ProductCreate(BaseModel):
     name_en: str
@@ -92,7 +94,7 @@ class ProductLookupOut(BaseModel):
     weight_grams: Decimal
     margin_percent: Decimal
     making_charge: Decimal
-    gold_rate_24k: float
+    gold_rate_24k: Money
     purity_rate: Decimal
     final_price: Decimal
     on_hand_qty: int

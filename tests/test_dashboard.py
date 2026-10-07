@@ -129,10 +129,10 @@ async def test_gl_has_entries_false_when_dormant(db):
 async def test_receivables_payables_shape(db):
     r = await dashboard.receivables(db, as_of=date(2026, 6, 5))
     assert set(r) == {"total", "b0_30", "b31_60", "b61_90", "b90_plus"}
-    assert r["total"] == 0.0
+    assert r["total"] == "0.00"
     p = await dashboard.payables_aging(db, as_of=date(2026, 6, 5))
     assert set(p) == {"cash_total", "b0_30", "b31_60", "b61_90", "b90_plus", "metal_owed_by_karat"}
-    assert p["cash_total"] == 0.0
+    assert p["cash_total"] == "0.00"
 
 
 # ── Phase E ───────────────────────────────────────────────────────────────────
@@ -187,3 +187,109 @@ async def test_profitability_none_when_no_cost_captured(db):
     await _order(db, total=D("300"), when=now, items=[
         {"qty": 1, "karat": Karat.K21, "grams": D("4"), "making": D("25"), "final": D("300")}])
     assert await dashboard.profitability(db, *day_range(date(2026, 6, 5))) is None
+
+
+# ── Phase B — cash & bank balance is one SQL SUM (NEX-53) ─────────────────────
+from sqlalchemy import event
+
+from app.core import gl
+from app.core.bank import adopt_seeded_accounts
+from app.core.coa_seed import seed_chart_of_accounts
+from app.models import BankAccount, GLAccount, GLJournalLine, GLPeriod, PeriodStatus
+
+
+async def _cash_bank_balance_replay(db):
+    """The helper as it was before NEX-53: load every line of every active
+    bank account and sum in Python. Oracle for the SQL aggregate."""
+    accts = (await db.execute(select(BankAccount).where(BankAccount.is_active.is_(True)))).scalars().all()
+    total = D("0")
+    for ba in accts:
+        rows = (await db.execute(
+            select(GLJournalLine).where(GLJournalLine.account_id == ba.gl_account_id))).scalars().all()
+        total += sum((l.base_debit - l.base_credit for l in rows), D("0"))
+    return total.quantize(D("0.01"))
+
+
+@pytest.mark.asyncio
+async def test_cash_bank_balance_matches_python_replay_in_one_statement(db):
+    await _ensure_user(db)
+    await seed_chart_of_accounts(db)
+    await adopt_seeded_accounts(db)
+    db.add(GLPeriod(year=2026, period_no=6, status=PeriodStatus.OPEN))
+    await db.flush()
+
+    async def acct(key):
+        return (await db.execute(select(GLAccount).where(GLAccount.system_key == key))).scalar_one()
+
+    cash, cash_lbp, bank, petty, equity = [
+        await acct(k) for k in ("CASH", "CASH_LBP", "BANK", "CASH_PETTY", "OPENING_BALANCE_EQUITY")]
+    # Petty cash is retired: its lines must not count.
+    (await db.execute(select(BankAccount).where(BankAccount.gl_account_id == petty.id))).scalar_one().is_active = False
+
+    async def post(lines):
+        await gl.post_entry(db, entry_date=date(2026, 6, 5), memo="t", source_type=gl.SOURCE_MANUAL,
+                            source_id=None, actor_user_id="u1", lines=lines)
+
+    def dr(a, amount, **kw):
+        return gl.GLLine(account_id=a.id, denomination="MONEY", base_debit=amount,
+                         money_debit=kw.pop("money", amount), **kw)
+
+    def cr(a, amount):
+        return gl.GLLine(account_id=a.id, denomination="MONEY", base_credit=amount, money_credit=amount)
+
+    await post([dr(cash, D("1000.10")), dr(bank, D("250.05")), dr(petty, D("40.40")),
+                dr(cash_lbp, D("11.17"), money=D("1000000.00"), currency="LBP", fx_rate=D("89500")),
+                cr(equity, D("1301.72"))])
+    await post([dr(bank, D("300.00")), cr(cash, D("300.00"))])       # transfer nets to zero
+    for _ in range(30):                                               # 30 × 0.10 defeats float sums
+        await post([dr(cash, D("0.10")), cr(equity, D("0.10"))])
+    await post([dr(equity, D("75.33")), cr(bank, D("75.33"))])        # a withdrawal
+
+    expected = await _cash_bank_balance_replay(db)
+    assert expected == D("1188.99")
+
+    statements = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db.bind.sync_engine, "before_cursor_execute", _capture)
+    try:
+        actual = await dashboard.cash_bank_balance(db)
+    finally:
+        event.remove(db.bind.sync_engine, "before_cursor_execute", _capture)
+
+    assert actual == expected and str(actual) == "1188.99"
+    assert isinstance(actual, D)
+    assert len(statements) == 1          # was one query per bank account, each fetching every line
+
+
+@pytest.mark.asyncio
+async def test_cash_bank_balance_is_zero_without_accounts_or_lines(db):
+    assert str(await dashboard.cash_bank_balance(db)) == "0.00"       # no bank accounts at all
+    await seed_chart_of_accounts(db)
+    await adopt_seeded_accounts(db)
+    assert str(await dashboard.cash_bank_balance(db)) == "0.00"       # accounts, dormant GL
+
+
+# ── Phase D — the rate reaches the valuation as a float (NEX-54) ──────────────
+
+@pytest.mark.asyncio
+async def test_inventory_valuation_reads_a_float_rate_through_its_exact_text(db):
+    """get_current_gold_rate hands the 24K rate over as a float. 2 g of 18K at
+    84.31 is 126.465 exactly, but Decimal(84.31) is 84.31000000000000227…, which
+    lifts the product just above the half cent and used to give 126.47."""
+    db.add(Product(code="TIE", name_en="Tie", category="rings", karat=Karat.K18, weight_grams=D("2.000"),
+                   margin_percent=D("15"), making_charge=D("25"), on_hand_qty=1,
+                   status=ProductStatus.AVAILABLE))          # no cost basis: valued at market
+    db.add(GoldLot(karat=Karat.K18, weight_grams=D("2.000"), weight_remaining_grams=D("2.000"),
+                   source=LotSource.SEED, cost_basis_usd=D("0"), is_depleted=False))
+    await db.flush()
+
+    from_float = await dashboard.inventory_valuation(db, rate_24k=84.31)
+    from_decimal = await dashboard.inventory_valuation(db, rate_24k=D("84.31"))
+
+    assert from_float == from_decimal                        # the float adds nothing of its own
+    assert from_float["products_usd"] == D("126.46")         # the exact 126.465, not a nudged one
+    assert from_float["pure_gold_usd"] == D("126.46")
+    assert from_float["rate_24k"] == D("84.31")

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -12,23 +13,37 @@ from app.core.ledger import (
     EVENT_GOLD_RATE_REFRESH_TRIGGERED,
     record,
 )
+from app.core.money import money, round_money
 from app.core.permissions import require_admin
+from app.core.pricing import KARAT_PURITY
 from app.deps import get_db
-from app.models import GoldRateHistory, GoldRateOverride, User
+from app.models import GoldRateHistory, GoldRateOverride, Karat, User
 from app.schemas.gold_rate import GoldRateHistoryPoint, GoldRateOut, OverrideRequest
 
 router = APIRouter(prefix="/gold-price", tags=["gold-price"])
 
 
+def _karat_rate(rate_24k: Decimal, karat: Karat, stored: Decimal | None) -> Decimal:
+    """The per-karat rate stored with the 24K rate when there is one, so the live
+    card and the chart can never show different figures for the same row.
+
+    Derived only where nothing is stored — an admin override, or a row from
+    before per-karat storage — using the pricing engine's purity table and its
+    half-up rounding, so the result is the purity rate a sale would be priced at."""
+    if stored is not None:
+        return stored
+    return round_money(rate_24k * KARAT_PURITY[karat])
+
+
 @router.get("", response_model=GoldRateOut)
 async def current_rate(db: AsyncSession = Depends(get_db)):
     info = await get_current_gold_rate(db)
-    r = info["rate"]
+    r = Decimal(str(info["rate"]))
     return GoldRateOut(
         rate_24k=r,
-        rate_22k=round(r * 0.917, 2),
-        rate_21k=round(r * 0.875, 2),
-        rate_18k=round(r * 0.750, 2),
+        rate_22k=_karat_rate(r, Karat.K22, info.get("rate_22k")),
+        rate_21k=_karat_rate(r, Karat.K21, info.get("rate_21k")),
+        rate_18k=_karat_rate(r, Karat.K18, info.get("rate_18k")),
         source=info["source"],
         fetched_at=info["fetched_at"],
         is_stale=info["is_stale"],
@@ -39,12 +54,12 @@ async def current_rate(db: AsyncSession = Depends(get_db)):
 def _history_point(r: GoldRateHistory) -> GoldRateHistoryPoint:
     """Map a row to a per-karat point, deriving any karat that predates the
     Phase 6 backfill (defensive — the migration backfills all existing rows)."""
-    base = float(r.rate_24k)
+    base = r.rate_24k
     return GoldRateHistoryPoint(
         rate_24k=base,
-        rate_22k=float(r.rate_22k) if r.rate_22k is not None else round(base * 0.917, 2),
-        rate_21k=float(r.rate_21k) if r.rate_21k is not None else round(base * 0.875, 2),
-        rate_18k=float(r.rate_18k) if r.rate_18k is not None else round(base * 0.750, 2),
+        rate_22k=_karat_rate(base, Karat.K22, r.rate_22k),
+        rate_21k=_karat_rate(base, Karat.K21, r.rate_21k),
+        rate_18k=_karat_rate(base, Karat.K18, r.rate_18k),
         per_karat_backfilled=bool(r.per_karat_backfilled),
         fetched_at=r.fetched_at,
     )
@@ -103,7 +118,7 @@ async def force_refresh(
         payload={"rate_24k": str(rate.value), "source": rate.source},
     )
     await db.commit()
-    return {"rate": float(rate.value), "source": rate.source}
+    return {"rate": money(rate.value), "source": rate.source}
 
 
 async def _get_active_override_rate(db: AsyncSession) -> str | None:
@@ -154,7 +169,7 @@ async def set_override(
         },
     )
     await db.commit()
-    return {"message": "Override set", "rate_24k": float(body.rate_24k)}
+    return {"message": "Override set", "rate_24k": money(body.rate_24k)}
 
 
 @router.delete("/override")

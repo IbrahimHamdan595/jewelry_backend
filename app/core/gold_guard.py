@@ -26,12 +26,14 @@ is updated (later task) to preserve structured detail; it previously stringified
 it, which would render as "[object Object]".
 """
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Literal
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ledger import EVENT_SALE_ON_STALE_RATE_ACK, record
+from app.core.money import money
 # StaleRateAck is a request DTO; its layer-consistent home is app/schemas/. Kept
 # importable from here too so existing `from app.core.gold_guard import
 # StaleRateAck` call sites (and tests) keep working.
@@ -103,7 +105,7 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
                     f"Gold rate has not refreshed since {fetched_at.isoformat()} "
                     f"({age} minutes ago)."
                 ),
-                "rate_24k": rate_info["rate"],
+                "rate_24k": money(Decimal(str(rate_info["rate"]))),
                 "rate_fetched_at": fetched_at.isoformat(),
                 "age_minutes": age,
             },
@@ -128,7 +130,7 @@ def assert_rate_acceptable(rate_info: dict, ack: StaleRateAck | None) -> None:
                     "The gold rate changed since you confirmed it. "
                     "Please review and confirm again."
                 ),
-                "rate_24k": rate_info["rate"],
+                "rate_24k": money(Decimal(str(rate_info["rate"]))),
                 "rate_fetched_at": fetched_at.isoformat(),
                 "age_minutes": age,
             },

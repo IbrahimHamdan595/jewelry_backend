@@ -20,6 +20,7 @@ from app.core.ledger import (
     EVENT_SALE_PRODUCT,
     record,
 )
+from app.core.money import money
 from app.core.permissions import require_admin
 from app.core.daterange import parse_calendar_filter
 from app.core.pricing import calculate_price, calculate_unit_price, generate_order_number
@@ -87,10 +88,15 @@ async def list_orders(
     total_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(total_q)).scalar_one()
 
-    revenue_q = select(func.coalesce(func.sum(Order.total_usd), 0)).select_from(
-        q.where(Order.status == OrderStatus.COMPLETED).subquery()
-    )
-    total_revenue = (await db.execute(revenue_q)).scalar_one()
+    # Revenue counts COMPLETED orders only, under the same filters as the list.
+    # Aggregate over the subquery's own column — summing Order.total_usd would add
+    # `orders` to FROM a second time (cartesian product).
+    # PARTIALLY_REFUNDED is excluded for now, pending a decision from the shop.
+    completed = q.where(Order.status == OrderStatus.COMPLETED).subquery()
+    revenue_q = select(
+        func.coalesce(func.sum(completed.c.total_usd), 0), func.count()
+    ).select_from(completed)
+    total_revenue, completed_count = (await db.execute(revenue_q)).one()
 
     q = q.order_by(Order.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
     orders = (await db.execute(q)).scalars().all()
@@ -110,7 +116,7 @@ async def list_orders(
             created_at=o.created_at,
         ))
 
-    avg = Decimal(str(total_revenue)) / total if total else Decimal(0)
+    avg = Decimal(str(total_revenue)) / completed_count if completed_count else Decimal(0)
     return OrderListOut(items=summaries, total=total, total_revenue=Decimal(str(total_revenue)), avg_order_value=avg)
 
 
@@ -461,10 +467,10 @@ async def export_orders(
                 o.created_at.isoformat(),
                 o.cashier.name,
                 len(o.items),
-                float(o.subtotal),
-                float(o.vat_amount),
-                float(o.total_usd),
-                float(o.total_lbp),
+                money(o.subtotal),
+                money(o.vat_amount),
+                money(o.total_usd),
+                money(o.total_lbp),
                 o.payment_method.value,
                 o.status.value,
             ])
@@ -521,11 +527,16 @@ async def void_order(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
+    # Lock the order row and judge by the locked row (populate_existing), so a
+    # second concurrent void/refund waits here and is then refused below exactly
+    # like a sequential one — before any stock is restored.
     order = (
         await db.execute(
             select(Order)
             .options(selectinload(Order.cashier), selectinload(Order.items))
             .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if not order:
@@ -647,11 +658,15 @@ async def refund_order(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_admin),
 ):
+    # Same lock as void_order: one of two concurrent void/refund requests wins,
+    # the other sees the new status and is refused.
     order = (
         await db.execute(
             select(Order)
             .options(selectinload(Order.cashier), selectinload(Order.items))
             .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if not order:
@@ -712,11 +727,16 @@ async def refund_order_item(
     one ledger event, and sets the order to PARTIALLY_REFUNDED (or REFUNDED when
     every line is fully refunded).
     """
+    # Same lock as void_order/refund_order: a concurrent void, refund or second
+    # refund of this line waits here, then is judged by the locked row and its
+    # lines (populate_existing) — before any stock is restored.
     order = (
         await db.execute(
             select(Order)
             .options(selectinload(Order.cashier), selectinload(Order.items))
             .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if not order:

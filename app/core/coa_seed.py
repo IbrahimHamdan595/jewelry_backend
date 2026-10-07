@@ -133,6 +133,36 @@ async def seed_chart_of_accounts(db: AsyncSession) -> int:
     return created
 
 
+async def unusable_system_accounts(db: AsyncSession) -> dict[str, str]:
+    """System accounts a posting would trip over, as {system_key: "MISSING" |
+    "INACTIVE"} in chart order. Empty means the chart is ready to post to.
+
+    The single readiness check for anything that is about to rely on the
+    mappers (which resolve accounts by system_key and 422 on a missing or
+    deactivated one): switching auto-posting on, and the historical replay."""
+    active = dict((await db.execute(
+        select(GLAccount.system_key, GLAccount.is_active).where(GLAccount.system_key.is_not(None))
+    )).all())
+    problems: dict[str, str] = {}
+    for *_, key in SYSTEM_ACCOUNTS:
+        if key not in active:
+            problems[key] = "MISSING"
+        elif not active[key]:
+            problems[key] = "INACTIVE"
+    return problems
+
+
+def describe_unusable_accounts(problems: dict[str, str], *, show: int = 5) -> str:
+    """'2 missing (CASH, AR), 1 inactive (BANK)' — names the first `show` of each."""
+    parts = []
+    for status in ("MISSING", "INACTIVE"):
+        keys = [k for k, v in problems.items() if v == status]
+        if keys:
+            names = ", ".join(keys[:show]) + (", …" if len(keys) > show else "")
+            parts.append(f"{len(keys)} {status.lower()} ({names})")
+    return ", ".join(parts)
+
+
 async def _key_to_account_id(db: AsyncSession, system_key: str) -> str:
     acct = (
         await db.execute(select(GLAccount).where(GLAccount.system_key == system_key))

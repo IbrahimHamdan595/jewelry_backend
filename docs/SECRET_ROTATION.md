@@ -30,6 +30,12 @@ service restarts.
 4. Everyone is logged out once. Expected.
 5. Update local `.env`.
 
+After the RS256 cutover (README → "JWT signing keys (RS256)", NEX-54) this
+secret no longer signs or verifies sessions and Vercel does not hold it at
+all. What gets rotated then is the key pair: generate a new one, set
+`JWT_PRIVATE_KEY` + `JWT_PUBLIC_KEY` on Render and `JWT_PUBLIC_KEY` on Vercel
+before either restarts, redeploy the frontend. Everyone is logged out once.
+
 ## 3. Cloudflare R2 keys
 
 1. Cloudflare dashboard → R2 → *Manage API tokens* → create a new token

@@ -91,6 +91,10 @@ EVENT_GL_PERIOD_REOPENED = "GL_PERIOD_REOPENED"
 EVENT_GL_YEAR_CLOSED = "GL_YEAR_CLOSED"
 EVENT_GL_ACCOUNT_CREATED = "GL_ACCOUNT_CREATED"
 EVENT_GL_ACCOUNT_UPDATED = "GL_ACCOUNT_UPDATED"
+# Historical replay (NEX-52) — one marker per run of app/core/gl_replay.py that
+# posted anything, so journal entries dated months before they were written are
+# explainable from the audit trail.
+EVENT_GL_HISTORY_REPLAYED = "GL_HISTORY_REPLAYED"
 
 # Audit phase A3 — sensitive admin actions that previously wrote no ledger row.
 EVENT_SETTINGS_CHANGED = "SETTINGS_CHANGED"
@@ -101,6 +105,8 @@ EVENT_GOLD_RATE_REFRESH_TRIGGERED = "GOLD_RATE_REFRESH_TRIGGERED"
 EVENT_SALE_ON_STALE_RATE_ACK = "SALE_ON_STALE_RATE_ACK"
 EVENT_STAFF_CREATED = "STAFF_CREATED"
 EVENT_STAFF_UPDATED = "STAFF_UPDATED"
+# NEX-54: an admin ended every session of a user (token_version bump).
+EVENT_STAFF_FORCE_LOGOUT = "STAFF_FORCE_LOGOUT"
 
 # Audit phase B2 — stock-take workflow events. These are the workflow
 # wrappers; APPROVE additionally emits a COIN_STOCK_ADJUSTED or
@@ -151,6 +157,20 @@ def field_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[
     return out
 
 
+async def lock_head(db: AsyncSession) -> InventoryLedgerChainHead:
+    """Lock the chain-head row FOR UPDATE (held until the caller's transaction
+    ends) and return it. record() takes it for every append; gl.post_entry
+    takes it up front, so that the ledger head is always locked BEFORE the GL
+    chain head — one order for the two heads, on every path."""
+    return (
+        await db.execute(
+            select(InventoryLedgerChainHead)
+            .where(InventoryLedgerChainHead.id == 1)
+            .with_for_update()
+        )
+    ).scalar_one()
+
+
 async def record(
     db: AsyncSession,
     *,
@@ -171,13 +191,7 @@ async def record(
     # 1. Lock the head row. SELECT ... FOR UPDATE on a single-row table is
     #    the simplest serialization primitive that works on both PG and the
     #    SQLite test fixture (where it's a no-op but writes serialize anyway).
-    head = (
-        await db.execute(
-            select(InventoryLedgerChainHead)
-            .where(InventoryLedgerChainHead.id == 1)
-            .with_for_update()
-        )
-    ).scalar_one()
+    head = await lock_head(db)
 
     # 2. Set the timestamp now so it's part of the hash. Without this, the
     #    DB server_default would set it on INSERT, but at that point the

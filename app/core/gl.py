@@ -16,12 +16,14 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import Index, case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import ledger
 from app.core.audit_chain import compute_gl_entry_hash
 from app.models import (
+    GL_UNIQUE_LIVE_SOURCE_TYPES, GL_UQ_LIVE_SOURCE_INDEX, GL_UQ_REVERSAL_INDEX,
     Denomination, GLAccount, GLEntrySequence, GLJournalChainHead,
     GLJournalEntry, GLJournalLine, GLPeriod, PeriodStatus,
 )
@@ -32,6 +34,7 @@ ZERO = Decimal("0")
 SOURCE_MANUAL = "MANUAL"
 SOURCE_OPENING = "OPENING"
 SOURCE_REVERSAL = "REVERSAL"
+SOURCE_YEAR_CLOSE = "YEAR_CLOSE"  # posted only by period_close.close_year
 # Future operation sources (M1): ORDER, SUPPLIER_PURCHASE, SUPPLIER_PAYMENT, ...
 
 
@@ -198,6 +201,69 @@ def _line_to_hash_dict(ln: GLLine) -> dict:
     }
 
 
+async def find_reversal(db: AsyncSession, entry_id: str) -> GLJournalEntry | None:
+    """The entry that reverses `entry_id`, if any."""
+    return (
+        await db.execute(
+            select(GLJournalEntry).where(GLJournalEntry.reverses_entry_id == entry_id)
+        )
+    ).scalars().first()
+
+
+async def _refuse_duplicate_posting(
+    db: AsyncSession, *, source_type: str, source_id: str | None, reverses_entry_id: str | None,
+) -> None:
+    """409 if this posting would be a second reversal of one entry, or a second
+    live entry for an auto-post source. MUST be called with the chain head
+    locked: postings are serialised by that lock, so whatever a concurrent
+    winner posted is committed and visible by now. reverse_entry and
+    gl_postings.find_live_entry look earlier, before the lock, where two
+    requests can both pass.
+
+    Plain SELECTs on purpose — no FOR UPDATE / FOR SHARE on ledger tables, which
+    would need UPDATE privilege on rows that are append-only."""
+    if reverses_entry_id is not None:
+        existing = await find_reversal(db, reverses_entry_id)
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This entry has already been reversed by {existing.entry_no}.",
+            )
+    elif source_type in GL_UNIQUE_LIVE_SOURCE_TYPES and source_id is not None:
+        existing = (
+            await db.execute(
+                select(GLJournalEntry).where(
+                    GLJournalEntry.source_type == source_type,
+                    GLJournalEntry.source_id == source_id,
+                    GLJournalEntry.reverses_entry_id.is_(None),
+                )
+            )
+        ).scalars().first()
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A journal entry ({existing.entry_no}) has already been posted for this source.",
+            )
+
+
+def _violation_markers(index: Index) -> tuple[str, str]:
+    """How a violation of `index` is spelled in the driver error: Postgres names
+    the index, SQLite names its columns."""
+    cols = ", ".join(f"{index.table.name}.{c.name}" for c in index.columns)
+    return index.name, f"UNIQUE constraint failed: {cols}"
+
+
+def _duplicate_posting_detail(exc: IntegrityError) -> str | None:
+    """409 detail when `exc` is one of the two duplicate-posting indexes, else
+    None (any other integrity failure is a real bug and must stay loud)."""
+    msg = str(exc.orig)
+    if any(m in msg for m in _violation_markers(GL_UQ_REVERSAL_INDEX)):
+        return "This entry has already been reversed."
+    if any(m in msg for m in _violation_markers(GL_UQ_LIVE_SOURCE_INDEX)):
+        return "A journal entry has already been posted for this source."
+    return None
+
+
 async def post_entry(
     db: AsyncSession,
     *,
@@ -214,12 +280,16 @@ async def post_entry(
     """Post a balanced journal entry inside the caller's transaction (no commit).
 
     Order (design §3.4): resolve OPEN period → resolve denominations from DB →
-    validate balance → lock chain head → allocate entry_no → compute hash →
+    validate balance → lock the inventory-ledger head, then the GL chain head →
+    refuse a duplicate reversal/auto-post → allocate entry_no → compute hash →
     insert header+lines → advance head → record GL_ENTRY_POSTED audit event.
 
-    Lock ordering note: the GL chain head is locked BEFORE InventoryLedger's
-    head (inside ledger.record). Always acquire GL-head-then-inventory-head to
-    avoid deadlocks.
+    Lock ordering: InventoryLedger's head FIRST, then the GL chain head — on
+    every path. The sale / void / refund / buyback handlers write their
+    inventory event (ledger.record) before they post, so they arrive here
+    already holding the ledger head; a posting made on its own takes it here,
+    in the same order. Never lock the GL head without the ledger head: the two
+    orders deadlock against each other.
     """
     period = await _resolve_open_period(db, entry_date, allow_closed=allow_closed_period)
     await _resolve_denominations(db, lines)
@@ -233,11 +303,20 @@ async def post_entry(
     if errors:
         raise HTTPException(status_code=422, detail="; ".join(errors))
 
+    # Ledger head before GL head (see the lock-ordering note above). This entry
+    # needs it anyway, for the GL_ENTRY_POSTED event at the end.
+    await ledger.lock_head(db)
     head = (
         await db.execute(
             select(GLJournalChainHead).where(GLJournalChainHead.id == 1).with_for_update()
         )
     ).scalar_one()
+
+    # Under the lock and before anything is written: the loser of a race is
+    # refused cleanly, with no entry_no burned and the caller's transaction intact.
+    await _refuse_duplicate_posting(
+        db, source_type=source_type, source_id=source_id, reverses_entry_id=reverses_entry_id,
+    )
 
     entry_no = await _next_entry_no(db, entry_date)
     occurred = occurred_at or datetime.now(timezone.utc)
@@ -258,7 +337,17 @@ async def post_entry(
         prev_hash=head.latest_entry_hash, entry_hash=entry_hash,
     )
     db.add(entry)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Last resort: the unique indexes caught a duplicate the re-check above
+        # could not see (e.g. a stricter isolation level hiding the winner's
+        # row). The failed flush has already rolled the transaction back (head
+        # and entry_no counter included); answer with a conflict, not a 500.
+        detail = _duplicate_posting_detail(exc)
+        if detail is None:
+            raise
+        raise HTTPException(status_code=409, detail=detail) from exc
 
     for i, ln in enumerate(lines):
         db.add(GLJournalLine(
@@ -299,12 +388,46 @@ async def reverse_entry(
 ) -> GLJournalEntry:
     """Post a reversing entry: every original line's debit/credit swapped, in
     both the money and metal dimensions. Sets reverses_entry_id (design §3.4).
-    Reversal is the ONLY correction mechanism — posted entries are immutable."""
+    Reversal is the ONLY correction mechanism — posted entries are immutable.
+
+    An entry is reversed at most once, and a reversal is never itself reversed
+    (409 in both cases): a second reversal would leave the trial balance
+    balanced but every touched account wrong by the original's full value, in
+    USD and in grams per karat. A year-close entry is never reversed either
+    (409): that does not reopen the year."""
     original = (
         await db.execute(select(GLJournalEntry).where(GLJournalEntry.id == original_entry_id))
     ).scalar_one_or_none()
     if original is None:
         raise HTTPException(status_code=404, detail="Entry to reverse not found")
+
+    # Refuse BEFORE post_entry, so a refused attempt never locks or advances the
+    # chain head and burns no entry_no (post_entry looks again under the lock for
+    # the concurrent case). Deliberately not tied to the period: a reversal is
+    # booked when it happens, often a later month than the original.
+    if original.reverses_entry_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} is a reversal and cannot itself be reversed. "
+                   f"Post a correcting manual entry instead.",
+        )
+    # Reversing a closing entry does not reopen the year: booked now, it lands
+    # in a later year and leaves the old one closed, and wherever it lands its
+    # lines read as that period's revenue and expenses.
+    if original.source_type == SOURCE_YEAR_CLOSE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} is the closing entry of fiscal year "
+                   f"{original.entry_date.year}. A closed year cannot be reopened by reversing "
+                   f"its closing entry; adjust with a correcting manual entry in the current "
+                   f"period instead.",
+        )
+    existing = await find_reversal(db, original.id)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Entry {original.entry_no} has already been reversed by {existing.entry_no}.",
+        )
 
     orig_lines = (
         await db.execute(
@@ -341,19 +464,33 @@ def _q_grams(v: Decimal) -> Decimal:
 
 
 async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
-    """Replay all immutable lines whose entry_date <= as_of into a trial
-    balance (design §3.5). Computes per account: USD-base debit/credit/net,
-    money per currency, and metal grams per karat. Asserts the global TB
-    identity (Σ base_debit == Σ base_credit) and per-karat metal balance.
+    """Trial balance over all immutable lines whose entry_date <= as_of
+    (design §3.5). Computes per account: USD-base debit/credit/net, money per
+    currency, and metal grams per karat. Asserts the global TB identity
+    (Σ base_debit == Σ base_credit) and per-karat metal balance.
 
-    Pure replay from immutable lines — no cached state, mirroring the zakat
-    as-of discipline."""
+    The per-(account, currency, karat) sums are taken in SQL — one GROUP BY
+    round-trip instead of shipping every journal line to Python. Still derived
+    from the immutable lines with no cached state, mirroring the zakat as-of
+    discipline. tests/gl_replay_oracle.py keeps the line-by-line replay this
+    replaced, as the reference it must agree with."""
+    has_metal = or_(GLJournalLine.metal_debit_grams != 0, GLJournalLine.metal_credit_grams != 0)
     rows = (
         await db.execute(
-            select(GLJournalLine, GLJournalEntry, GLAccount)
+            select(
+                GLAccount.id, GLAccount.code, GLAccount.name, GLAccount.type, GLAccount.system_key,
+                GLJournalLine.currency, GLJournalLine.karat,
+                func.sum(GLJournalLine.base_debit), func.sum(GLJournalLine.base_credit),
+                func.sum(GLJournalLine.money_debit), func.sum(GLJournalLine.money_credit),
+                func.sum(GLJournalLine.metal_debit_grams), func.sum(GLJournalLine.metal_credit_grams),
+                func.sum(case((has_metal, 1), else_=0)),
+            )
+            .select_from(GLJournalLine)
             .join(GLJournalEntry, GLJournalLine.entry_id == GLJournalEntry.id)
             .join(GLAccount, GLJournalLine.account_id == GLAccount.id)
             .where(GLJournalEntry.entry_date <= as_of)
+            .group_by(GLAccount.id, GLAccount.code, GLAccount.name, GLAccount.type,
+                      GLAccount.system_key, GLJournalLine.currency, GLJournalLine.karat)
         )
     ).all()
 
@@ -362,39 +499,49 @@ async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
     total_c = ZERO
     metal_totals: dict[str, dict[str, Decimal]] = {}
 
-    for line, entry, acct in rows:
-        a = accounts.setdefault(acct.id, {
-            "account_id": acct.id, "code": acct.code, "name": acct.name,
-            "type": acct.type.value, "system_key": acct.system_key,
+    for (acct_id, code, name, acct_type, system_key, currency, karat,
+         base_d, base_c, money_d, money_c, metal_d, metal_c, metal_lines) in rows:
+        a = accounts.setdefault(acct_id, {
+            "account_id": acct_id, "code": code, "name": name,
+            "type": acct_type.value, "system_key": system_key,
             "base_debit": ZERO, "base_credit": ZERO,
             "money_by_currency": {}, "metal_by_karat": {},
         })
-        a["base_debit"] += line.base_debit
-        a["base_credit"] += line.base_credit
-        total_d += line.base_debit
-        total_c += line.base_credit
+        # SUM() over a Numeric column comes back as an exact Decimal on Postgres;
+        # SQLite sums floats, which SQLAlchemy rounds to the column scale. Either
+        # way re-quantize so every group enters the totals at persisted scale.
+        base_d, base_c = _q_money(base_d), _q_money(base_c)
+        a["base_debit"] += base_d
+        a["base_credit"] += base_c
+        total_d += base_d
+        total_c += base_c
 
-        cur = a["money_by_currency"].setdefault(line.currency, {"debit": ZERO, "credit": ZERO})
-        cur["debit"] += line.money_debit
-        cur["credit"] += line.money_credit
+        cur = a["money_by_currency"].setdefault(currency, {"debit": ZERO, "credit": ZERO})
+        cur["debit"] += _q_money(money_d)
+        cur["credit"] += _q_money(money_c)
 
-        if line.metal_debit_grams or line.metal_credit_grams:
-            k = line.karat or "?"
+        # A karat bucket exists only where a line actually moved metal — a
+        # karat-tagged money-only line must not create one.
+        if metal_lines:
+            metal_d, metal_c = _q_grams(metal_d), _q_grams(metal_c)
+            k = karat or "?"
             mk = a["metal_by_karat"].setdefault(k, {"debit_grams": ZERO, "credit_grams": ZERO})
-            mk["debit_grams"] += line.metal_debit_grams
-            mk["credit_grams"] += line.metal_credit_grams
+            mk["debit_grams"] += metal_d
+            mk["credit_grams"] += metal_c
             mt = metal_totals.setdefault(k, {"debit_grams": ZERO, "credit_grams": ZERO})
-            mt["debit_grams"] += line.metal_debit_grams
-            mt["credit_grams"] += line.metal_credit_grams
+            mt["debit_grams"] += metal_d
+            mt["credit_grams"] += metal_c
 
     out_accounts = []
     for a in sorted(accounts.values(), key=lambda x: x["code"]):
         a["base_debit"] = _q_money(a["base_debit"])
         a["base_credit"] = _q_money(a["base_credit"])
         a["net_base"] = _q_money(a["base_debit"] - a["base_credit"])
+        # GROUP BY returns groups in no particular order; sort the breakdowns so
+        # the payload is stable across engines and runs.
         a["money_by_currency"] = {
             c: {"debit": _q_money(v["debit"]), "credit": _q_money(v["credit"])}
-            for c, v in a["money_by_currency"].items()
+            for c, v in sorted(a["money_by_currency"].items())
         }
         a["metal_by_karat"] = {
             k: {
@@ -402,7 +549,7 @@ async def compute_trial_balance(db: AsyncSession, *, as_of: date) -> dict:
                 "credit_grams": _q_grams(v["credit_grams"]),
                 "net_grams": _q_grams(v["debit_grams"] - v["credit_grams"]),
             }
-            for k, v in a["metal_by_karat"].items()
+            for k, v in sorted(a["metal_by_karat"].items())
         }
         out_accounts.append(a)
 

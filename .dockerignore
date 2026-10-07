@@ -17,4 +17,5 @@ docs
 *.md
 Dockerfile
 .dockerignore
+.github
 package-lock.json

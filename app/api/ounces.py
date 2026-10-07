@@ -139,7 +139,7 @@ async def ounce_price(
     return UnitPriceOut(
         type_id=bar.id,
         code=bar.code,
-        gold_rate_24k=float(rate_24k),
+        gold_rate_24k=rate_24k,
         effective_rate=priced["effective_rate"],
         metal_value=priced["metal_value"],
         margin_amount=priced["margin_amount"],

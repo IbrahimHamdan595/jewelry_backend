@@ -184,7 +184,7 @@ class _RefundItemView:
 
 async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_user_id: str,
                             *, refunded_item=None, refund_value=None, refund_qty=None,
-                            refund_seq: int = 0):
+                            refund_seq: int = 0, entry_date: date | None = None):
     """Full void/refund → reverse the original ORDER entry. Per-item refund →
     a targeted reversing entry for only the units refunded in THIS event, using
     the explicit incremental `refund_value` (pre-VAT) and `refund_qty` (so a
@@ -194,18 +194,25 @@ async def post_order_refund(db: AsyncSession, order, settings: Settings, actor_u
     original = await find_live_entry(db, SOURCE_ORDER, order.id)
     if original is None:
         return None  # nothing was posted (e.g. flag was off at sale time)
+    # The sale's entry is already reversed in full — by an earlier void/refund,
+    # or by hand from the journal: nothing left to post, for a full void/refund
+    # or a per-item one (a partial entry on top would take the accounts past
+    # zero). Skip, like the other mappers, so the void/refund itself still
+    # completes and the books are not reversed twice.
+    if await gl.find_reversal(db, original.id):
+        return None
 
     # Reversals are booked when they happen, not when the original sale was — so
     # they can land in a month that has no period row yet. Every other posting
     # path calls ensure_period; this one didn't, which made the first void of a
     # new month 422 while an identical sale succeeded. A CLOSED period is still
     # refused downstream by gl.post_entry — this only auto-opens a MISSING one.
-    entry_date = date.today()
+    # `entry_date` is only passed by the historical replay (app/core/gl_replay.py),
+    # which knows the day the void/refund really happened; live callers omit it.
+    entry_date = entry_date or date.today()
     await ensure_period(db, entry_date)
 
     if refunded_item is None:
-        if await find_live_entry(db, SOURCE_ORDER_REFUND, order.id):
-            return None
         return await gl.reverse_entry(
             db, original_entry_id=original.id, actor_user_id=actor_user_id,
             entry_date=entry_date, memo=f"Void {order.order_number}",

@@ -217,7 +217,7 @@ async def reconcile(
             f"⚠️ Supplier-balance drift detected ({len(drifts)} row(s)).\n"
             + "\n".join(
                 f"  • {d['supplier_name']} ({d['unit']}"
-                + (f" K{d['karat']}" if d['karat'] else "")
+                + (f" {d['karat']}" if d['karat'] else "")
                 + f"): stored={d['stored']}, expected={d['computed']}, drift={d['drift']}"
                 for d in drifts[:10]
             )

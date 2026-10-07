@@ -1,10 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.ledger import EVENT_STAFF_CREATED, EVENT_STAFF_UPDATED, field_diff, record
+from app.core.auth_audit import get_client_ip
+from app.core.ledger import (
+    EVENT_STAFF_CREATED,
+    EVENT_STAFF_FORCE_LOGOUT,
+    EVENT_STAFF_UPDATED,
+    field_diff,
+    record,
+)
+from app.core.login_lockout import record_unlock
 from app.core.permissions import require_admin
-from app.core.security import hash_password
+from app.core.security import hash_password, revoke_sessions
 from app.deps import get_db
 from app.models import Role, User
 from app.schemas.settings import StaffCreate, StaffOut, StaffUpdate
@@ -37,7 +47,8 @@ async def create_staff(
     user = User(
         email=body.email,
         name=body.name,
-        password_hash=hash_password(body.password),
+        # bcrypt in a worker thread, so hashing never holds the event loop.
+        password_hash=await asyncio.to_thread(hash_password, body.password),
         role=Role.CASHIER,
     )
     db.add(user)
@@ -77,6 +88,14 @@ async def update_staff(
     if not user:
         raise HTTPException(status_code=404, detail="Staff not found")
 
+    # Hash first: a password that cannot be stored is refused (422, see
+    # hash_password) before anything on the user has been touched, so the
+    # rest of the request cannot be half-applied. In a worker thread, so
+    # bcrypt never holds the event loop.
+    new_password_hash = (
+        await asyncio.to_thread(hash_password, body.password) if body.password is not None else None
+    )
+
     # Snapshot the auditable fields before mutation. password_hash is
     # tracked but masked in the payload.
     before = {
@@ -87,9 +106,18 @@ async def update_staff(
 
     if body.name is not None:
         user.name = body.name
-    if body.password is not None:
-        user.password_hash = hash_password(body.password)
+    if new_password_hash is not None:
+        user.password_hash = new_password_hash
+        # NEX-54: a reset is a password change — whoever was signed in with
+        # the old password is signed out.
+        await revoke_sessions(db, user)
     if body.is_active is not None:
+        if user.is_active and not body.is_active:
+            # NEX-54: deactivating ends the user's sessions for good. The
+            # is_active check in get_current_user already refuses them while
+            # the account is off, but without the bump their old tokens would
+            # start working again the moment the account is switched back on.
+            await revoke_sessions(db, user)
         user.is_active = body.is_active
 
     after = {
@@ -129,6 +157,9 @@ async def delete_staff(
     AUDIT: records STAFF_UPDATED (not a separate "deleted" event) because
     this IS just an update to is_active — the row stays. Idempotent on
     already-disabled users (no ledger row if nothing changed).
+
+    Also ends every session the user has, permanently: re-enabling the
+    account later does not bring old tokens back (NEX-54).
     """
     user = (await db.execute(select(User).where(User.id == user_id, User.role == Role.CASHIER))).scalar_one_or_none()
     if not user:
@@ -136,6 +167,9 @@ async def delete_staff(
 
     if user.is_active:
         user.is_active = False
+        # NEX-54: and their sessions stay dead if they are ever re-enabled
+        # (see update_staff).
+        await revoke_sessions(db, user)
         await db.flush()
         await record(
             db,
@@ -145,4 +179,78 @@ async def delete_staff(
             ref_id=user.id,
             payload={"diff": {"is_active": {"from": True, "to": False}}},
         )
+    await db.commit()
+
+
+@router.post("/{user_id}/unlock", status_code=204)
+async def unlock_staff(
+    user_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    """Lift a login lockout now instead of waiting it out (NEX-47).
+
+    Ten wrong passwords lock an email for fifteen minutes, and anyone who
+    knows the address can send them — so the lockout is also a way to keep a
+    cashier out of the till. This releases the account at once and clears
+    its failure count. It is not an exemption: ten more failures lock it
+    again. Harmless (still 204) when the account is not locked.
+
+    Unlike the rest of this router this is not limited to cashiers: the
+    owner's and the accountant's emails can be locked the same way.
+
+    AUDIT: ACCOUNT_UNLOCKED in the auth audit log, naming the admin. That
+    row is what releases the lock (see `app/core/login_lockout.py`), so it
+    is written in this request's transaction, not best-effort.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    await record_unlock(
+        db,
+        user=user,
+        actor=actor,
+        client_ip=get_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    await db.commit()
+
+
+@router.post("/{user_id}/force-logout", status_code=204)
+async def force_logout_staff(
+    user_id: str,
+    db: AsyncSession = Depends(get_db),
+    actor: User = Depends(require_admin),
+):
+    """End every session of a user, on every device, from their next request.
+
+    For a lost or stolen device, or a token that may have leaked. NOT a ban:
+    the account stays usable and the person can sign straight back in — to
+    keep someone out, deactivate them (DELETE) or reset their password.
+
+    Unlike the rest of this router this is not limited to cashiers: a stolen
+    accountant or admin session has to be revocable too.
+
+    AUDIT: STAFF_FORCE_LOGOUT carries the target's email and the
+    token_version step, in the same transaction as the bump itself.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    await revoke_sessions(db, user)
+    await record(
+        db,
+        event_type=EVENT_STAFF_FORCE_LOGOUT,
+        actor_user_id=actor.id,
+        ref_type="user",
+        ref_id=user.id,
+        payload={
+            "email": user.email,
+            # This request's own step, read back after the increment.
+            "token_version": {"from": user.token_version - 1, "to": user.token_version},
+        },
+    )
     await db.commit()
